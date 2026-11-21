@@ -7,7 +7,7 @@ import {promisify} from 'node:util';
 const run = promisify(execFile);
 const epoch = Date.UTC(2001, 0, 1);
 
-const sendScript = `
+export const messagesSendScript = `
 on run argv
     set recipientAddress to item 1 of argv
     set messageText to item 2 of argv
@@ -22,7 +22,7 @@ end run
 export async function macMessages(method, args, {
     enabled = process.env.CHORD_MACOS_MESSAGES === '1',
     database = path.join(homedir(), 'Library/Messages/chat.db'),
-    send = (address, text) => run('/usr/bin/osascript', ['-e', sendScript, address, text], {timeout: 30_000}),
+    send = (address, text) => run('/usr/bin/osascript', ['-e', messagesSendScript, address, text], {timeout: 30_000}),
 } = {}) {
     if (!enabled) {
         if (method === 'GetStatus') return {map: false, connectivity_detail: 'Enable Messages when starting the Mac backend'};

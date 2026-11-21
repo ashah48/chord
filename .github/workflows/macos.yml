@@ -47,6 +47,12 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: false
+      - run: node --test test/macos-messages.test.mjs
+      - name: Compile the Messages automation script
+        run: |
+          script=$(mktemp)
+          node --input-type=module -e 'import {messagesSendScript} from "./macos-messages.mjs"; process.stdout.write(messagesSendScript)' > "$script"
+          osacompile -o "$RUNNER_TEMP/chord-send.scpt" "$script"
       - run: npm install --global pnpm@10.25.0
       - run: bash scripts/bootstrap-macos.sh
       - run: bash scripts/test-macos-backend.sh

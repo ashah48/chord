@@ -58,7 +58,7 @@ impl Gui {
                 .push("emoji".into());
         }
         ctx.set_fonts(fonts);
-        let settings_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("private/ui.json");
+        let settings_path = settings_path();
         let settings: Value = std::fs::read(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
@@ -108,6 +108,9 @@ impl Gui {
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
+            }
+            if let Some(dir) = self.settings_path.parent() {
+                std::fs::create_dir_all(dir)?;
             }
             opts.open(&self.settings_path)?
                 .write_all(value.to_string().as_bytes())
@@ -2471,6 +2474,18 @@ fn initials(name: &str) -> String {
     } else {
         result
     }
+}
+// Where UI preferences (the chosen theme) persist between launches. A release build's
+// CARGO_MANIFEST_DIR is the build machine's checkout, which does not exist on the user's
+// Mac, so a packaged app must store settings under its per-user Application Support folder.
+// Other platforms and source checkouts keep using private/ui.json next to the source.
+fn settings_path() -> PathBuf {
+    if cfg!(all(target_os = "macos", not(test)))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join("Library/Application Support/Chord/ui.json");
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("private/ui.json")
 }
 pub fn run(app: App) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {

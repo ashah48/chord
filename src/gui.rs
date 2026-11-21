@@ -583,7 +583,7 @@ impl Gui {
             }
         }
         // Account color rings the profile image. A group rings each face.
-        let account_ring = egui::Stroke::new(3., color);
+        let account_ring = egui::Stroke::new(3.0_f32, color);
         if !multi {
             ui.painter()
                 .circle_stroke(avatar_rect.center(), 24., account_ring);

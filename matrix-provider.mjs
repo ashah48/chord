@@ -6,6 +6,9 @@ import {ArchiveStore,accountNamespace,digest,DAY,RETENTION_DAYS} from './archive
 import {readHistory,writeHistory} from './history-file.mjs';
 
 const enc=encodeURIComponent;
+// Room state (names, bridge info, membership) re-sent by a bridge is not conversation activity.
+const MESSAGE_TYPES=['m.room.message','m.room.encrypted','m.sticker'];
+const isMessageEvent=e=>!!e&&e.state_key===undefined&&(!e.type||MESSAGE_TYPES.includes(e.type));
 const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'iPhone':'Matrix';
 const page=(items,limit=200,offset=0)=>({items:items.slice(offset,offset+limit),hasMore:items.length>offset+limit,oldestCursor:String(offset+limit),newestCursor:null});
 
@@ -23,8 +26,23 @@ export class MatrixProvider{
  }
  async start(){
   if(this.started)return;await this.client.boot();
-  if(this.persist){const saved=await readHistory(this.dataDir).catch(e=>{if(e.code!=='ENOENT')throw e;return null});if(saved){this.chats=new Map(saved.chats||[]);this.timelines=new Map(saved.timelines||[]);this.reactions=new Map(saved.reactions||[]);this.mediaFiles=new Map(saved.mediaFiles||[]);if(saved.syncToken)this.syncToken=saved.syncToken}}
+  if(this.persist){const saved=await readHistory(this.dataDir).catch(e=>{if(e.code!=='ENOENT')throw e;return null});if(saved){this.chats=new Map(saved.chats||[]);this.timelines=new Map(saved.timelines||[]);this.reactions=new Map(saved.reactions||[]);this.mediaFiles=new Map(saved.mediaFiles||[]);if(saved.syncToken)this.syncToken=saved.syncToken;await this.repairActivity()}}
   await this.refreshRooms();this.subscription=await this.client.subscribe(undefined,e=>this.onEvent(e));this.subscription.done.catch(e=>{this.error=e.message});this.started=true;
+ }
+ // Earlier versions dated rooms by any timeline event, so bridge restarts that re-sent room
+ // state made untouched chats look active. Re-date each room once from its newest real message.
+ async repairActivity(){
+  for(const [id,c] of this.chats){
+   if(c.activityVersion===3)continue;
+   const timeline=Date.parse(this.timelines.get(id)?.at(-1)?.timestamp)||0;
+   let latest=Math.max(timeline,this.archive?.latestMessageAt?.('matrix:'+id)||0);
+   if(!latest)latest=await this.latestMessageOnServer(id).catch(()=>0);
+   this.chats.set(id,{...c,activityVersion:3,...(latest?{lastActivity:new Date(latest).toISOString()}:{})});
+  }
+ }
+ async latestMessageOnServer(roomId){
+  const page=await this.raw('GET',`/_matrix/client/v3/rooms/${enc(roomId)}/messages`,undefined,{dir:'b',limit:'1',filter:JSON.stringify({types:MESSAGE_TYPES})});
+  return page.chunk?.[0]?.origin_server_ts||0;
  }
  async refreshRooms(){
   if(this.roomRefresh)return this.roomRefresh;
@@ -62,7 +80,7 @@ export class MatrixProvider{
    if(bridge||freshRoom){accountID=bridge?.protocol?.id||'matrix';accountID=/slack/i.test(accountID)?'slack':/discord/i.test(accountID)?'discord':/whatsapp/i.test(accountID)?'whatsapp':accountID;network=bridge?.protocol?.displayname||networkFor(accountID)}
    const people=state.filter(e=>e.type==='m.room.member'&&e.content?.membership==='join').map(e=>({id:e.state_key,fullName:e.content.displayname||e.state_key,isSelf:e.state_key===this.account.userId}));
    const prefs=room.account_data?.events?.find(e=>e.type==='org.chord.chat')?.content||{};const marked=room.account_data?.events?.find(e=>e.type==='m.marked_unread')?.content?.unread;
-   const latest=room.timeline?.events?.at(-1);const summaryCount=room.summary?.['m.joined_member_count'];
+   const latest=room.timeline?.events?.findLast(isMessageEvent);const summaryCount=room.summary?.['m.joined_member_count'];
    let title,description,type,participants;
    if(freshRoom){
     title=find('m.room.name')?.name||bridge?.channel?.displayname||people.filter(p=>!p.isSelf).map(p=>p.fullName).slice(0,3).join(', ')||roomId;
@@ -80,7 +98,7 @@ export class MatrixProvider{
    const locallyRead=old.localReadAt&&Number(latest?.origin_server_ts||Date.parse(old.lastActivity)||0)<=old.localReadAt;
    const notes=room.unread_notifications,rawHighlights=(notes||freshRoom)?(notes?.highlight_count||0):(old.rawHighlightCount||0),notificationCount=(notes||freshRoom)?(notes?.notification_count||0):(old.unreadCount||0);
    const readHighlightBaseline=old.localReadAt?Math.min(old.readHighlightBaseline??rawHighlights,rawHighlights):0;
-   this.chats.set(roomId,{...old,id:roomId,accountID,network:network||networkFor(accountID||'matrix'),title,description,type,participants,lastActivity:new Date(Math.max(latest?.origin_server_ts||0,Date.parse(old.lastActivity)||0)).toISOString(),rawHighlightCount:rawHighlights,readHighlightBaseline,highlightCount:locallyRead?0:Math.max(0,rawHighlights-readHighlightBaseline),unreadCount:locallyRead?0:notificationCount,isMarkedUnread:old.localMarkedUnread?true:locallyRead?false:marked??old.isMarkedUnread??false,isArchived:prefs.archived??old.isArchived??false,isMuted:old.isMuted||false,isReadOnly:false,capabilities:{reply:2,reaction:2,edit:2,archive:true,markAsUnread:true},preview:latest?.content?.body?{text:latest.content.body}:old.preview});
+   this.chats.set(roomId,{...old,activityVersion:3,id:roomId,accountID,network:network||networkFor(accountID||'matrix'),title,description,type,participants,lastActivity:new Date(Math.max(latest?.origin_server_ts||0,Date.parse(old.lastActivity)||0)).toISOString(),rawHighlightCount:rawHighlights,readHighlightBaseline,highlightCount:locallyRead?0:Math.max(0,rawHighlights-readHighlightBaseline),unreadCount:locallyRead?0:notificationCount,isMarkedUnread:old.localMarkedUnread?true:locallyRead?false:marked??old.isMarkedUnread??false,isArchived:prefs.archived??old.isArchived??false,isMuted:old.isMuted||false,isReadOnly:false,capabilities:{reply:2,reaction:2,edit:2,archive:true,markAsUnread:true},preview:latest?.content?.body?{text:latest.content.body}:old.preview});
   }
   if(snapshot.next_batch)this.syncToken=snapshot.next_batch;
   this.scheduleSave();

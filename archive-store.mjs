@@ -48,6 +48,7 @@ export class ArchiveStore {
   return value;
  }
  getConversation(id){const r=this.db.prepare('SELECT payload FROM conversations WHERE namespace=? AND id=?').get(this.namespace,id);return r?JSON.parse(r.payload):null}
+ latestMessageAt(id){return this.db.prepare('SELECT max(event_at) AS at FROM current_messages WHERE namespace=? AND conversation_id=?').get(this.namespace,id)?.at||0}
  message(id,messageID){if(typeof messageID!=='string')return null;const r=this.db.prepare('SELECT r.payload,r.codec FROM current_messages c JOIN records r ON r.seq=c.seq WHERE c.namespace=? AND c.conversation_id=? AND c.message_id=?').get(this.namespace,id,messageID);return r?unpackJSON(r.payload,r.codec):null}
  recordMessages(conversationID,items,conversation={}, {historical=false}={}){
   if(!items?.length)return;

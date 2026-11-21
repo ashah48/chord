@@ -47,6 +47,7 @@ impl Gui {
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or(Value::Null);
+        app.pins = serde_json::from_value(settings["pins"].clone()).unwrap_or_default();
         let theme = Theme::from_setting(settings["theme"].as_str());
         theme.apply(ctx);
         Self::apply_fonts(ctx, theme);
@@ -156,11 +157,14 @@ impl Gui {
     }
     fn save_theme(&mut self, ctx: &egui::Context) {
         self.theme.apply(ctx);
-        let value = json!({"theme": self.theme.setting()});
+        self.save_settings();
+    }
+    fn save_settings(&mut self) {
+        let value = json!({"theme": self.theme.setting(), "pins": self.app.pins});
         let result = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -169,11 +173,17 @@ impl Gui {
             if let Some(dir) = self.settings_path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            opts.open(&self.settings_path)?
-                .write_all(value.to_string().as_bytes())
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_nanos();
+            let temporary = self.settings_path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+            let mut file = opts.open(&temporary)?;
+            file.write_all(value.to_string().as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(temporary, &self.settings_path)
         })();
         if let Err(e) = result {
-            self.app.notice = format!("Could not save theme: {e}");
+            self.app.notice = format!("Could not save settings: {e}");
         }
     }
     fn switch_source(&mut self, index: usize) {
@@ -528,8 +538,25 @@ impl Gui {
                             if self.app.discord_scope.is_some() { self.app.server_focus = false; } else { self.app.focus_view = false; }
                             self.app.refresh(false);
                         }
+                        let pinned = self.app.pinned_count();
+                        let mut rows = Vec::with_capacity(chats.len());
+                        let mut divider = None;
+                        let mut drag = None;
                         for (chat_index, chat) in chats.iter().enumerate() {
+                            if pinned > 0 && chat_index == 0 {
+                                ui.label(RichText::new("Pinned").small().color(p.muted));
+                            }
+                            if pinned > 0 && chat_index == pinned {
+                                divider = Some(ui.separator().rect.center().y);
+                            }
                             let response = self.conversation_row(ui, chat, p);
+                            rows.push(response.rect);
+                            if response.dragged() || response.drag_stopped() {
+                                drag = ui
+                                    .ctx()
+                                    .input(|i| i.pointer.latest_pos())
+                                    .map(|pos| (chat.id.clone(), pos, response.drag_stopped()));
+                            }
                             let pointer_on_row = response.interact_pointer_pos().is_some_and(|pos| {
                                 ui.ctx().layer_id_at(pos) == Some(response.layer_id)
                             });
@@ -538,6 +565,12 @@ impl Gui {
                                 self.choose_chat(chat.clone());
                                 ctx.request_repaint();
                             }
+                        }
+                        if pinned > 0 && pinned == chats.len() {
+                            divider = Some(ui.separator().rect.center().y);
+                        }
+                        if let Some((id, pos, dropped)) = drag {
+                            self.drag_chat(ui, &chats, &rows, divider, pinned, &id, pos, dropped, p);
                         }
                         if !self.app.inbox_cursors.is_null()
                             && self
@@ -551,6 +584,79 @@ impl Gui {
                         }
                     });
             });
+    }
+    // Dropping above the pinned divider pins the chat at that spot; below it unpins.
+    #[allow(clippy::too_many_arguments)]
+    fn drag_chat(
+        &mut self,
+        ui: &mut egui::Ui,
+        chats: &[Conversation],
+        rows: &[egui::Rect],
+        divider: Option<f32>,
+        pinned: usize,
+        id: &str,
+        pos: egui::Pos2,
+        dropped: bool,
+        p: Palette,
+    ) {
+        let Some(first) = rows.first() else {
+            return;
+        };
+        let gap = rows.iter().filter(|r| r.center().y < pos.y).count();
+        let pin = gap < pinned || (gap == pinned && divider.is_none_or(|y| pos.y < y));
+        let position = chats[..gap]
+            .iter()
+            .filter(|c| c.id != id && self.app.is_pinned(&c.id))
+            .count();
+        let was_pinned = self.app.is_pinned(id);
+        if dropped {
+            if !ui.clip_rect().contains(pos) {
+                return;
+            }
+            if pin {
+                self.pin_chat(id, position);
+            } else if was_pinned {
+                self.app.move_pin(id, None);
+                self.save_settings();
+                self.app.refresh(false);
+            }
+            return;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let clip = ui.clip_rect();
+        if pos.y < clip.top() + 40. {
+            ui.scroll_with_delta(egui::vec2(0., 10.));
+        } else if pos.y > clip.bottom() - 40. {
+            ui.scroll_with_delta(egui::vec2(0., -10.));
+        }
+        if pin {
+            let y = if gap == 0 {
+                first.top()
+            } else {
+                rows[gap - 1].bottom()
+            };
+            ui.painter()
+                .hline(first.x_range(), y, egui::Stroke::new(2.5_f32, p.accent));
+        }
+        let title = chats
+            .iter()
+            .find(|c| c.id == id)
+            .map_or("", |c| c.title.as_str());
+        let label = match (pin, was_pinned) {
+            (true, _) => format!("Pin {title}"),
+            (false, true) => format!("Unpin {title}"),
+            (false, false) => title.to_owned(),
+        };
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("chat-drag"),
+        ));
+        let galley = painter.layout_no_wrap(label, egui::FontId::proportional(14.), p.text);
+        let rect = egui::Rect::from_min_size(pos + egui::vec2(14., -10.), galley.size())
+            .expand2(egui::vec2(10., 6.));
+        painter.rect_filled(rect, 6., p.raised);
+        painter.galley(rect.min + egui::vec2(10., 6.), galley, p.text);
+        ui.ctx().request_repaint();
     }
     fn conversation_row(
         &mut self,
@@ -567,8 +673,10 @@ impl Gui {
         chat: &Conversation,
         p: Palette,
     ) -> egui::Response {
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 90.), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 90.),
+            egui::Sense::click_and_drag(),
+        );
         if !ui.is_rect_visible(rect) {
             return response;
         }
@@ -763,8 +871,26 @@ impl Gui {
             response.on_hover_text(format!("{}\n{}", chat.title, context))
         }
     }
+    fn pin_chat(&mut self, id: &str, position: usize) {
+        self.app.move_pin(id, Some(position));
+        self.save_settings();
+        self.app.refresh(false);
+    }
     fn channel_rules(&mut self, ui: &mut egui::Ui, chat: &Conversation) {
         let id = chat.id.clone();
+        let pinned = self.app.is_pinned(&id);
+        if ui.button(if pinned { "Unpin" } else { "Pin" }).clicked() {
+            if pinned {
+                self.app.move_pin(&id, None);
+                self.save_settings();
+                self.app.refresh(false);
+            } else {
+                let position = self.app.pinned_count();
+                self.pin_chat(&id, position);
+            }
+            ui.close();
+        }
+        ui.separator();
         let priority = if chat.local_priority.is_empty() {
             "auto"
         } else {
@@ -3263,6 +3389,107 @@ mod tests {
         gui.app.apply_channel_rule(&chat.id, None, Some(Some(60)));
         assert!(!gui.app.conversations[0].unread);
         assert!(gui.app.conversations[0].mute_until.is_some());
+    }
+    #[test]
+    fn dragging_a_chat_to_the_top_pins_it_and_dragging_it_back_down_unpins_it() {
+        type Titles = Vec<(String, egui::Pos2)>;
+        let ctx = egui::Context::default();
+        let mut gui = Gui::new(App::new(None, true), &ctx);
+        let settings = std::env::temp_dir().join(format!("chord-pins-{}.json", std::process::id()));
+        gui.settings_path = settings.clone();
+        let mut time = 0.;
+        let mut frame = |gui: &mut Gui, events: Vec<egui::Event>| {
+            time += 0.05;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 900.),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| gui.inbox(ctx, gui.theme.palette(ctx.theme())),
+            );
+            let mut titles = Vec::new();
+            for shape in output.shapes {
+                if let egui::epaint::Shape::Text(text) = shape.shape {
+                    titles.push((
+                        text.galley.job.text.clone(),
+                        text.pos + text.galley.rect.center().to_vec2(),
+                    ));
+                }
+            }
+            titles
+        };
+        let find = |titles: &[(String, egui::Pos2)], title: &str| {
+            titles
+                .iter()
+                .find(|(t, _)| t.starts_with(&format!("{title} · ")))
+                .map(|(_, pos)| *pos)
+                .unwrap_or_else(|| panic!("{title:?} not in {titles:?}"))
+        };
+        let drag = |gui: &mut Gui,
+                    frame: &mut dyn FnMut(&mut Gui, Vec<egui::Event>) -> Titles,
+                    from: egui::Pos2,
+                    to: egui::Pos2| {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(gui, vec![egui::Event::PointerMoved(from)]);
+            frame(gui, vec![button(from, true)]);
+            for step in 1..=8 {
+                frame(
+                    gui,
+                    vec![egui::Event::PointerMoved(
+                        from + (to - from) * (step as f32 / 8.),
+                    )],
+                );
+            }
+            frame(gui, vec![button(to, false)]);
+            frame(gui, vec![]);
+        };
+        frame(&mut gui, vec![]);
+        let titles = frame(&mut gui, vec![]);
+        let chats: Vec<Conversation> = gui.app.visible().into_iter().cloned().collect();
+        let (first, third) = (
+            find(&titles, &chats[0].title),
+            find(&titles, &chats[3].title),
+        );
+        drag(&mut gui, &mut frame, third, first - egui::vec2(0., 12.));
+        assert_eq!(gui.app.visible()[0].id, chats[3].id);
+        assert!(gui.app.is_pinned(&chats[3].id));
+        assert!(
+            gui.app
+                .conversations
+                .iter()
+                .any(|c| c.id == chats[3].id && c.local_priority == chats[3].local_priority)
+        );
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains(&chats[3].id)
+        );
+        let titles = frame(&mut gui, vec![]);
+        let (pinned, low) = (
+            find(&titles, &chats[3].title),
+            find(&titles, &chats[2].title),
+        );
+        drag(&mut gui, &mut frame, pinned, low + egui::vec2(0., 20.));
+        assert!(!gui.app.is_pinned(&chats[3].id));
+        assert_eq!(
+            gui.app
+                .visible()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
+            chats.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_file(settings);
     }
     #[test]
     fn sidebar_rows_are_colored_by_account_and_slack_workspace() {

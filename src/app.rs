@@ -256,6 +256,8 @@ pub struct App {
     pub login_field: usize,
     pub login_values: HashMap<String, String>,
     pub login_busy: bool,
+    // Per-tab (SOURCES key) conversation IDs the user dragged into a pinned group, in order.
+    pub pins: HashMap<String, Vec<String>>,
     pub request_seq: u64,
     pub last_refresh: Instant,
     pub last_message_refresh: Instant,
@@ -352,6 +354,7 @@ impl App {
             login_field: 0,
             login_values: HashMap::new(),
             login_busy: false,
+            pins: HashMap::new(),
             request_seq: 0,
             last_refresh: Instant::now(),
             last_message_refresh: Instant::now(),
@@ -424,13 +427,62 @@ impl App {
         }
     }
     pub fn visible(&self) -> Vec<&Conversation> {
-        self.conversations
+        let mut chats: Vec<&Conversation> = self
+            .conversations
             .iter()
             .filter(|c| {
                 (self.source == 0 || c.source == SOURCES[self.source].0)
                     && (!self.unread || c.unread)
             })
-            .collect()
+            .collect();
+        let pins = self.tab_pins();
+        // Stable, so unpinned chats keep the inbox's most-recent-first order.
+        chats.sort_by_key(|c| pins.iter().position(|id| *id == c.id).unwrap_or(usize::MAX));
+        chats
+    }
+    // An app tab shows its own pins first, then anything pinned in All accounts.
+    fn tab_pins(&self) -> Vec<String> {
+        let key = SOURCES[self.source].0;
+        let mut pins = self.pins.get(key).cloned().unwrap_or_default();
+        if key != SOURCES[0].0 {
+            for id in self.pins.get(SOURCES[0].0).into_iter().flatten() {
+                if !pins.contains(id) {
+                    pins.push(id.clone());
+                }
+            }
+        }
+        pins
+    }
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.tab_pins().iter().any(|p| p == id)
+    }
+    pub fn pinned_count(&self) -> usize {
+        self.visible()
+            .iter()
+            .filter(|c| self.is_pinned(&c.id))
+            .count()
+    }
+    // Reorder within the stored tab, preserving hidden rows and inherited pins.
+    pub fn move_pin(&mut self, id: &str, position: Option<usize>) {
+        let global = SOURCES[0].0;
+        let tab = SOURCES[self.source].0;
+        let owns = |key: &str| self.pins.get(key).is_some_and(|pins| pins.iter().any(|pin| pin == id));
+        let owner = if !owns(tab) && owns(global) { global } else { tab };
+        let shown = self.visible().into_iter().filter(|c| c.id != id && self.is_pinned(&c.id))
+            .map(|c| c.id.clone()).collect::<Vec<_>>();
+        let order = self.pins.entry(owner.into()).or_default();
+        order.retain(|pin| pin != id);
+        if let Some(position) = position {
+            let index = shown.iter().skip(position).find_map(|anchor| order.iter().position(|pin| pin == anchor))
+                .unwrap_or(order.len());
+            order.insert(index, id.into());
+        }
+        let active = self.active.as_ref().map(|c| c.id.clone());
+        if let Some(active) = active
+            && let Some(index) = self.visible().iter().position(|c| c.id == active)
+        {
+            self.selection = index;
+        }
     }
     pub fn selected(&self) -> Option<Conversation> {
         self.visible().get(self.selection).map(|c| (*c).clone())
@@ -689,6 +741,7 @@ impl App {
                 "all"
             };
             let unread = self.unread;
+            let pins = if view == "focus" { self.tab_pins() } else { Vec::new() };
             let server = self.discord_scope.clone();
             let cursor = if append {
                 self.inbox_cursors
@@ -708,6 +761,7 @@ impl App {
                         unread,
                         cursor.as_deref(),
                         server.as_deref(),
+                        &pins,
                     )
                     .await;
                 let refreshing = r.as_ref().is_ok_and(|v| v["_cache"]["refreshing"] == true);
@@ -722,6 +776,7 @@ impl App {
                             unread,
                             cursor.as_deref(),
                             server.as_deref(),
+                        &pins,
                         )
                         .await;
                     let _ = tx.send(Response::Inbox(seq, result(r), append));
@@ -2457,6 +2512,59 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pinned_chats_lead_their_tab_in_dragged_order_and_unpin_back_to_recency() {
+        let mut app = App::new(None, true);
+        app.source = 0;
+        let ids: Vec<String> = app.visible().iter().map(|c| c.id.clone()).collect();
+        assert!(ids.len() >= 4);
+        let order = |app: &App| {
+            app.visible()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        };
+        app.move_pin(&ids[2], Some(0));
+        app.move_pin(&ids[3], Some(0));
+        assert_eq!(order(&app)[..2], [ids[3].clone(), ids[2].clone()]);
+        assert_eq!(app.pinned_count(), 2);
+        app.move_pin(&ids[2], Some(0));
+        assert_eq!(order(&app)[..2], [ids[2].clone(), ids[3].clone()]);
+        app.move_pin(&ids[2], None);
+        let mut rest = ids.clone();
+        rest.retain(|id| *id != ids[3]);
+        assert_eq!(order(&app), [vec![ids[3].clone()], rest].concat());
+    }
+    #[test]
+    fn pins_from_all_accounts_carry_into_each_app_tab() {
+        let mut app = App::new(None, true);
+        let slack = SOURCES.iter().position(|s| s.0 == "slack").unwrap();
+        let chat = app
+            .conversations
+            .iter()
+            .find(|c| c.source == "slack")
+            .unwrap()
+            .id
+            .clone();
+        app.source = 0;
+        app.move_pin(&chat, Some(0));
+        app.source = slack;
+        assert!(app.is_pinned(&chat));
+        assert_eq!(app.visible()[0].id, chat);
+        app.move_pin(&chat, None);
+        assert!(!app.is_pinned(&chat));
+        app.source = 0;
+        assert!(!app.is_pinned(&chat));
+        app.source = slack;
+        app.move_pin(&chat, Some(0));
+        app.source = 0;
+        assert!(!app.is_pinned(&chat));
+        app.move_pin(&chat, Some(0));
+        app.move_pin(&chat, None);
+        app.source = slack;
+        assert!(app.is_pinned(&chat));
+    }
+
     use super::*;
     #[test]
     fn unimportant_and_mute_stop_counting_as_unread_immediately() {

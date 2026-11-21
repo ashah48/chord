@@ -1,6 +1,6 @@
 mod emoji;
 mod icons;
-mod links;
+pub(crate) mod links;
 mod media;
 mod theme;
 
@@ -2179,8 +2179,12 @@ impl Gui {
                         open = false;
                     }
                     ui.add_enabled_ui(ready, |ui| {
-                        if icons::gallery_button(ui, icons::GalleryIcon::External, "Open in Brave")
-                            .clicked()
+                        if icons::gallery_button(
+                            ui,
+                            icons::GalleryIcon::External,
+                            "Open in browser",
+                        )
+                        .clicked()
                             && let Err(error) = self.media.save(&target, true)
                         {
                             self.app.notice = error;
@@ -2341,7 +2345,7 @@ impl eframe::App for Gui {
         });
         for url in urls {
             if let Err(error) = links::open(&url) {
-                self.app.notice = format!("Could not open Brave: {error}");
+                self.app.notice = format!("Could not open the link: {error}");
             }
         }
         ctx.request_repaint_after(Duration::from_millis(250));

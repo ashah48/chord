@@ -246,13 +246,7 @@ impl Media {
         };
         let file = images::save(data, target.name()).map_err(|e| e.to_string())?;
         if brave {
-            std::process::Command::new("brave")
-                .arg(&file)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| e.to_string())?;
+            crate::gui::links::open(&file).map_err(|e| e.to_string())?;
         }
         Ok(file)
     }

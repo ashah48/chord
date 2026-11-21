@@ -74,21 +74,22 @@ export async function macMessages(method, args, {
         const limit = Math.min(500, Math.max(1, Number(args[0]) || 200));
         const chats = db.prepare(`
             SELECT c.ROWID AS id, c.chat_identifier AS address, c.service_name AS service,
-                c.style, c.display_name AS name, max(cm.message_date) AS latest
+                c.style, c.display_name AS name, max(m.date) / 1000000 AS latest
             FROM chat c JOIN chat_message_join cm ON cm.chat_id = c.ROWID
+            JOIN message m ON m.ROWID = cm.message_id
             WHERE c.service_name = 'iMessage'
             GROUP BY c.ROWID ORDER BY latest DESC, c.ROWID DESC LIMIT ?
         `).all(limit);
         const messages = db.prepare(`
-            SELECT m.ROWID AS id, m.text, m.date, m.is_from_me, h.id AS sender
+            SELECT m.ROWID AS id, m.text, m.date / 1000000 AS date, m.is_from_me, h.id AS sender
             FROM chat_message_join cm JOIN message m ON m.ROWID = cm.message_id
             LEFT JOIN handle h ON h.ROWID = m.handle_id
             WHERE cm.chat_id = ? AND m.text IS NOT NULL AND m.text <> ''
-            ORDER BY cm.message_date DESC, m.ROWID DESC LIMIT 50
+            ORDER BY m.date DESC, m.ROWID DESC LIMIT 50
         `);
         return chats.map(chat => {
             const handles = participants.all(chat.id).map(handle => handle.id);
-            const timestamp = value => new Date(epoch + Math.trunc(value / 1_000_000)).toISOString();
+            const timestamp = value => new Date(epoch + value).toISOString();
             return {
                 key: 'mac-' + chat.id,
                 name: chat.name || handles.join(', ') || chat.address,

@@ -1,108 +1,98 @@
 # Install Chord on a Mac
 
-Requires macOS 15 Sequoia or later. Open **Apple menu → About This Mac** and
+Use macOS 15 Sequoia or later. Open **Apple menu → About This Mac** and
 choose the disk image that matches your Mac.
 
 | About This Mac shows | Disk image |
 | --- | --- |
-| Chip: Apple M1, M2, M3, or another Apple M-series chip | `Chord-macOS-arm64.dmg` |
-| Processor: Intel | `Chord-macOS-x86_64.dmg` |
+| Apple M-series chip | `Chord-macOS-arm64.dmg` |
+| Intel processor | `Chord-macOS-x86_64.dmg` |
 
-1. Download the matching file from [Chord's GitHub releases](https://github.com/maxlang7/chord/releases). If there is no disk image, see the build instructions below.
-2. Double-click the downloaded disk image. Drag **Chord** onto **Applications**.
-3. Open **Applications → Chord**. With no backend configuration, Chord opens with sample conversations.
-4. If macOS cannot verify the developer, confirm the download came from the official release before deciding whether to allow it. These preview builds are ad hoc signed and have no Apple notarization. [Apple's instructions for allowing an individual app](https://support.apple.com/en-us/102445)
+Open the matching [Chord release](https://github.com/maxlang7/chord/releases)
+disk image, drag Chord onto Applications, and open it. The preview uses an ad
+hoc signature. If macOS asks you to approve the app, verify that you downloaded
+it from the official release first. [Apple's instructions](https://support.apple.com/en-us/102445)
 
-## Live accounts
+## Set up live accounts on this Mac
 
-Run the backend on a dedicated NixOS machine or VM reachable by SSH from
-the Mac. Use a fresh checkout with your dad's own account data. Chord stores
-message history on the backend and uses fixed ports. If the host already runs
-your Chord instance, give his instance its own VM.
+Run the setup while logged into the Mac user account that will use Chord.
+It creates a fresh local Synapse and bridge profile. It will ask you to
+connect your own Slack and WhatsApp accounts from Chord. Keep Chord's local
+data directory private because it contains session credentials and message
+history.
 
-### Start the backend on NixOS
+### One-time setup
 
-Run these commands as the backend owner on a NixOS machine with Git and SSH
-access from the Mac.
+You need Apple's command-line developer tools and Homebrew. If the tools
+are missing, run `xcode-select --install` and finish Apple's installer before
+continuing. [Homebrew installation](https://brew.sh/)
 
-```sh
-git clone --branch v0.3.0-macos-preview https://github.com/maxlang7/chord.git "$HOME/chord"
-cd "$HOME/chord"
-nix-shell shell.nix --run 'bash scripts/bootstrap.sh'
-nix-shell shell.nix --run 'python3 scripts/launch-client.py --backend-only'
-```
-
-Keep the last command running. The first startup can take several minutes.
-If startup fails, check `private/desktop-runtime.log` and
-`private/desktop-api.log` on NixOS. Keep the backend's `private` directory on
-that machine.
-
-### Connect the Mac
-
-Download [connect-macos-backend.sh](../packaging/connect-macos-backend.sh)
-from the repository using **Download raw file**. Quit Chord. In Mac Terminal,
-replace `dad@chord-host` with your SSH login and run the script.
+In Terminal, install the build dependencies, then clone and set up Chord.
 
 ```sh
-sh "$HOME/Downloads/connect-macos-backend.sh" dad@chord-host
+brew install node@24 python@3.13 go
+export PATH="$(brew --prefix node@24)/bin:$(brew --prefix python@3.13)/libexec/bin:$PATH"
+npm install -g pnpm@10.25.0
+git clone --branch v0.3.0-macos-local https://github.com/maxlang7/chord.git "$HOME/chord-macos"
+cd "$HOME/chord-macos"
+bash scripts/bootstrap-macos.sh
 ```
 
-The script assumes the backend checkout is at `~/chord` on NixOS. On the
-first run it copies the API key over SSH into
-`~/Library/Application Support/Chord/config.json`. It leaves an existing
-configuration alone. It then opens an SSH tunnel on the Mac's loopback
-interface, so the Chord API can stay private on the backend.
+### Start Chord
 
-Keep the tunnel terminal open and launch Chord from Applications. To check
-the tunnel from another terminal, run this command. Expect `401` because
-the probe omits the API key.
+Run this in Terminal each time you want to start the backend. Keep that
+window open and launch Chord from Applications once Terminal says
+`Chord backend started`. Quit and reopen Chord if it was in demo mode.
 
 ```sh
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:4789/api/status
+cd "$HOME/chord-macos"
+export PATH="$(brew --prefix node@24)/bin:$(brew --prefix python@3.13)/libexec/bin:$PATH"
+sh scripts/start-macos.sh
 ```
 
-Run the same script after a reboot or whenever you close the tunnel. If you
-switch to a different backend, move the existing Mac config aside first so
-the script fetches the new key.
+Chord connects on `127.0.0.1:4789` and reads its generated config from
+`~/Library/Application Support/Chord/local/config.json`. Press Ctrl+C
+in Terminal to stop the backend. Its logs are in the `runtime` directory
+next to the config. If the start command reports an occupied port, check for
+an older Chord backend or SSH tunnel before trying again.
 
-### Connect his accounts
+### Connect Slack and WhatsApp
 
-- **Slack.** Open **Accounts → Slack → Connect** and follow Chord's sign-in
-  prompts for his workspace. The bridge uses a Slack web session. If Chord
-  asks for session credentials, enter them in its sign-in dialog. Workspace
-  policy may prevent the bridge from connecting. Check for **Connected**,
-  then open the Slack inbox.
-- **WhatsApp, if he uses it.** Open **Accounts → WhatsApp → Connect**.
-  On his phone, open WhatsApp's **Linked devices → Link a device** and scan
-  Chord's QR code. Check for **Connected** in Chord.
-- **iMessage.** Use Apple's Messages app on the Mac for iMessage. Chord's
-  iPhone integration uses BlueFerry over Bluetooth on Linux and cannot
-  access the Mac's Messages history.
+- **Slack.** Open **Accounts → Slack → Connect**. Follow Chord's prompts for
+  your own Slack workspace. The bridge uses your Slack web session and
+  workspace policy can affect sign-in. Check for **Connected**, then open
+  the Slack inbox.
+- **WhatsApp, if you use it.** Open **Accounts → WhatsApp → Connect**,
+  then open **Linked devices → Link a device** in WhatsApp on your phone
+  and scan the QR code in Chord.
+- Confirm the account names are yours before sending anything. The local
+  setup starts with neither service connected and does not import account
+  files from another installation.
 
-## Build or verify the preview
+### Enable iMessage
 
-An assistant can use `sw_vers -productVersion` to check the OS and
-`sysctl -n hw.optional.arm64` to detect Apple silicon. A result of `1` means
-Apple silicon, including when Terminal runs under Rosetta. Otherwise use the
-Intel image on an Intel Mac.
+Sign into the Messages app on this Mac with your own Apple Account and
+check that your conversations appear there. Grant Full Disk Access to the
+Terminal app you use to run the backend in **System Settings → Privacy &
+Security → Full Disk Access**, then quit and reopen Terminal. This
+permission gives Terminal broad access to protected files. Chord reads the
+Messages database only when you start the backend with `--messages`.
+[Apple's Full Disk Access guide](https://support.apple.com/en-us/149699)
 
-A repository maintainer can run **Actions → macOS disk images → Run workflow**
-and download either DMG from the successful run's artifacts. To build on a Mac
-with stable Rust and Apple's command-line tools, run these from the repository
-root in a native Terminal session.
+Run the same start commands above, replacing the last line with
+`sh scripts/start-macos.sh --messages`. Open the **iPhone** inbox in Chord
+to view recent iMessage text. On the first reply to a one-to-one iMessage
+conversation, macOS may ask whether Terminal can control Messages.
+Group sending, attachments, and messages stored only in rich-text form
+are outside this preview. Keep using the Messages app for those.
 
-```sh
-export MACOSX_DEPLOYMENT_TARGET=15.0
-cargo build --locked --release --bin chord
-bash packaging/macos-dmg.sh target/release/chord "$(uname -m)" dist
-```
+## Checks for an assistant
 
-Open the installed app and check that sample conversations appear. To test
-without opening a window, run the following from Terminal. The file should
-contain a rendered inbox.
-
-```sh
-scratch=$(mktemp -d)
-/Applications/Chord.app/Contents/MacOS/Chord --demo --snapshot "$scratch/inbox.txt"
-test -s "$scratch/inbox.txt"
-```
+- `sw_vers -productVersion` checks macOS. `sysctl -n hw.optional.arm64`
+  returns `1` on Apple silicon, including under Rosetta.
+- Run `curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:4789/api/status`.
+  Expect `401` without a key. Avoid printing the live config or copying
+  your own backend's config to this Mac.
+- Check each connected account in Chord. To verify iMessage without
+  sending anything, open an existing text conversation in Apple Messages
+  and compare it with what appears in Chord.

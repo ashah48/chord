@@ -181,6 +181,8 @@ pub struct App {
     pub login_field: usize,
     pub login_values: HashMap<String, String>,
     pub login_busy: bool,
+    // Per-tab (SOURCES key) conversation IDs the user dragged into a pinned group, in order.
+    pub pins: HashMap<String, Vec<String>>,
     pub request_seq: u64,
     pub last_refresh: Instant,
     pub last_message_refresh: Instant,
@@ -273,6 +275,7 @@ impl App {
             login_field: 0,
             login_values: HashMap::new(),
             login_busy: false,
+            pins: HashMap::new(),
             request_seq: 0,
             last_refresh: Instant::now(),
             last_message_refresh: Instant::now(),
@@ -345,13 +348,58 @@ impl App {
         }
     }
     pub fn visible(&self) -> Vec<&Conversation> {
-        self.conversations
+        let mut chats: Vec<&Conversation> = self
+            .conversations
             .iter()
             .filter(|c| {
                 (self.source == 0 || c.source == SOURCES[self.source].0)
                     && (!self.unread || c.unread)
             })
-            .collect()
+            .collect();
+        if let Some(pins) = self.pins.get(SOURCES[self.source].0) {
+            // Stable, so unpinned chats keep the inbox's most-recent-first order.
+            chats.sort_by_key(|c| pins.iter().position(|id| *id == c.id).unwrap_or(usize::MAX));
+        }
+        chats
+    }
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.pins
+            .get(SOURCES[self.source].0)
+            .is_some_and(|pins| pins.iter().any(|p| p == id))
+    }
+    pub fn pinned_count(&self) -> usize {
+        self.visible()
+            .iter()
+            .filter(|c| self.is_pinned(&c.id))
+            .count()
+    }
+    // Pin `id` at `position` among the visible pinned chats of this tab, or unpin it with None.
+    // Pinned chats that are not loaded right now keep their place after the visible ones.
+    pub fn move_pin(&mut self, id: &str, position: Option<usize>) {
+        let shown: Vec<String> = self
+            .visible()
+            .into_iter()
+            .filter(|c| self.is_pinned(&c.id) && c.id != id)
+            .map(|c| c.id.clone())
+            .collect();
+        let active = self.active.as_ref().map(|c| c.id.clone());
+        let pins = self.pins.entry(SOURCES[self.source].0.into()).or_default();
+        let hidden: Vec<String> = pins
+            .iter()
+            .filter(|p| *p != id && !shown.contains(p))
+            .cloned()
+            .collect();
+        let mut order = shown;
+        if let Some(position) = position {
+            order.insert(position.min(order.len()), id.to_owned());
+        }
+        order.extend(hidden);
+        *pins = order;
+        if let Some(active) = active
+            && let Some(index) = self.visible().iter().position(|c| c.id == active)
+        {
+            self.selection = index;
+        }
     }
     pub fn selected(&self) -> Option<Conversation> {
         self.visible().get(self.selection).map(|c| (*c).clone())
@@ -2002,6 +2050,32 @@ fn base64_encode(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pinned_chats_lead_their_tab_in_dragged_order_and_unpin_back_to_recency() {
+        let mut app = App::new(None, true);
+        app.source = 0;
+        let ids: Vec<String> = app.visible().iter().map(|c| c.id.clone()).collect();
+        assert!(ids.len() >= 4);
+        let order = |app: &App| {
+            app.visible()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        };
+        app.move_pin(&ids[2], Some(0));
+        app.move_pin(&ids[3], Some(0));
+        assert_eq!(order(&app)[..2], [ids[3].clone(), ids[2].clone()]);
+        assert_eq!(app.pinned_count(), 2);
+        app.move_pin(&ids[2], Some(0));
+        assert_eq!(order(&app)[..2], [ids[2].clone(), ids[3].clone()]);
+        app.move_pin(&ids[2], None);
+        let mut rest = ids.clone();
+        rest.retain(|id| *id != ids[3]);
+        assert_eq!(order(&app), [vec![ids[3].clone()], rest].concat());
+        app.source = 1;
+        assert!(!app.is_pinned(&ids[3]));
+    }
+
     use super::*;
     #[test]
     fn unimportant_and_mute_stop_counting_as_unread_immediately() {

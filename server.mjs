@@ -20,6 +20,7 @@ import {avatarService} from './avatars.mjs';
 import {applyLocalRules,rankInbox} from './importance.mjs';
 import {bridgeInfo,startBridgeLogin,submitBridgeLogin,loginState,guilds,enableGuild} from './bridge-manager.mjs';
 
+import {macMessages} from './macos-messages.mjs';
 export const root=path.dirname(fileURLToPath(import.meta.url));
 const run=promisify(execFile),port=Number(process.env.PORT||4789),dataDir=process.env.CHORD_DATA_DIR||path.join(root,'private'),file=path.join(dataDir,'config.json');
 process.umask(0o077);await mkdir(dataDir,{recursive:true,mode:0o700});
@@ -88,6 +89,7 @@ async function input(req){let raw='';for await(const chunk of req){raw+=chunk;if
 function json(res,value,status=200){res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(value))}
 export async function blue(method,signature='',args=[]){
  if(process.env.CHORD_TEST_TRANSPORT_URL)return method==='GetStatus'?{map:false}:[];
+ if(process.platform==='darwin' && process.env.CHORD_MACOS_LOCAL==='1')return macMessages(method,args);
  const {stdout}=await run('busctl',['--user','--json=short','call','io.weirdware.BlueFerry','/io/weirdware/BlueFerry','io.weirdware.BlueFerry.Messages1',method,...(signature?[signature,...args.map(String)]:[])],{timeout:30000,maxBuffer:12*1024*1024});
  const data=JSON.parse(stdout).data,value=data?.[0];if(typeof value!=='string')return value;try{return JSON.parse(value)}catch{return value}
 }

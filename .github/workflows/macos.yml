@@ -29,3 +29,24 @@ jobs:
           name: Chord-macOS-${{ matrix.arch }}
           path: dist/*.dmg
           if-no-files-found: error
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: false
+      - run: npm install --global pnpm@10.25.0
+      - run: bash scripts/bootstrap-macos.sh
+      - run: bash scripts/test-macos-backend.sh

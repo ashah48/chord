@@ -4,14 +4,16 @@ import {promisify} from 'node:util';
 import {createHmac,randomBytes} from 'node:crypto';
 import path from 'node:path';
 import YAML from 'yaml';
-const run=promisify(execFile),root=path.resolve(import.meta.dirname,'..'),dir=path.join(root,'private/runtime');
+const run=promisify(execFile),root=path.resolve(import.meta.dirname,'..'),dataDir=process.env.CHORD_DATA_DIR||path.join(root,'private'),dir=path.join(dataDir,'runtime');
+const macLocal=process.env.CHORD_MACOS_LOCAL==='1';
+const owner=macLocal?'chord':'max';
 await mkdir(dir,{recursive:true,mode:0o700});process.umask(0o077);
 const random=()=>randomBytes(32).toString('hex');
 const secretsFile=path.join(dir,'secrets.json');
 const secrets=await readFile(secretsFile,'utf8').then(JSON.parse).catch(()=>({registration:random(),password:random(),macaroon:random(),form:random(),bridges:{}}));
 for(const id of ['whatsapp','slack','discord'])secrets.bridges[id]??={as:random(),hs:random(),provisioning:random()};
 await writeFile(secretsFile,JSON.stringify(secrets,null,2),{mode:0o600});
-const networks=[{id:'whatsapp',name:'WhatsApp',port:4811},{id:'slack',name:'Slack',port:4812},{id:'discord',name:'Discord',port:4813}];
+const networks=[{id:'whatsapp',name:'WhatsApp',port:4811},{id:'slack',name:'Slack',port:4812},{id:'discord',name:'Discord',port:4813}].filter(n=>!macLocal||n.id!=='discord');
 for(const n of networks){
  const directory=path.join(dir,n.id);await mkdir(directory,{recursive:true,mode:0o700});const cfg=path.join(directory,'config.yaml');
  let exists=true;try{await readFile(cfg)}catch{exists=false}
@@ -23,7 +25,7 @@ for(const n of networks){
  c.appservice={...c.appservice,address:'http://127.0.0.1:'+n.port,hostname:'127.0.0.1',port:n.port,id:'chord-'+n.id,as_token:secrets.bridges[n.id].as,hs_token:secrets.bridges[n.id].hs};
  c.appservice.bot={...c.appservice.bot,username:n.id+'bot',displayname:'Chord '+n.name,avatar:'remove'};
  const database={type:'sqlite3-fk-wal',uri:'file:'+path.join(directory,'bridge.db')+'?_txlock=immediate',max_open_conns:5,max_idle_conns:1};
- c.bridge??={};c.bridge.permissions={'@max:chord.local':'admin'};c.bridge.bridge_matrix_leave=false;c.bridge.delete_guild_on_leave=false;
+ c.bridge??={};c.bridge.permissions={[`@${owner}:chord.local`]:'admin'};c.bridge.bridge_matrix_leave=false;c.bridge.delete_guild_on_leave=false;
  if(c.logging)c.logging.min_level='info';
  if(n.id==='discord'){
   c.appservice.database=database;c.bridge.provisioning={...c.bridge.provisioning,prefix:'/_matrix/provision',shared_secret:secrets.bridges[n.id].provisioning,debug_endpoints:false};
@@ -49,19 +51,27 @@ for(const n of networks){
 const hs={server_name:'chord.local',public_baseurl:'http://127.0.0.1:4808/',pid_file:path.join(dir,'synapse.pid'),listeners:[{port:4808,bind_addresses:['127.0.0.1'],type:'http',tls:false,x_forwarded:false,resources:[{names:['client'],compress:false}]}],database:{name:'sqlite3',args:{database:path.join(dir,'homeserver.db')}},media_store_path:path.join(dir,'media'),signing_key_path:path.join(dir,'chord.local.signing.key'),registration_shared_secret:secrets.registration,macaroon_secret_key:secrets.macaroon,form_secret:secrets.form,enable_registration:false,report_stats:false,trusted_key_servers:[],federation_domain_whitelist:[],app_service_config_files:networks.map(n=>path.join(dir,n.id,'registration.yaml')),max_upload_size:'25M',suppress_key_server_warning:true,rc_message:{per_second:100,burst_count:1000},rc_joins:{local:{per_second:50,burst_count:500}},experimental_features:{msc2409_to_device_messages_enabled:true,msc3202_device_masquerading:true}};
 const hsConfig=path.join(dir,'homeserver.yaml');await writeFile(hsConfig,YAML.stringify(hs),{mode:0o600});
 const children=[],logHandles=[];
-async function start(name,command,args,cwd=dir){const log=await open(path.join(dir,name+'.log'),'a',0o600);logHandles.push(log);const child=spawn(command,args,{cwd,stdio:['ignore',log.fd,log.fd]});children.push(child);child.on('exit',code=>console.error(name+' exited '+code));return child}
-for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>{for(const child of children)child.kill('SIGTERM');setTimeout(()=>process.exit(),1000).unref()});
+async function start(name,command,args,cwd=dir){const log=await open(path.join(dir,name+'.log'),'a',0o600);logHandles.push(log);const child=spawn(command,args,{cwd,stdio:['ignore',log.fd,log.fd]});children.push(child);child.on('error',fail);child.on('exit',code=>{console.error(name+' exited '+code);if(macLocal&&!stopping)fail(new Error(name+' stopped'))});return child}
+let stopping=false;
+function stop(status){
+ if(stopping)return;
+ stopping=true;
+ for(const child of children)child.kill('SIGTERM');
+ setTimeout(()=>process.exit(status),1000);
+}
+function fail(error){console.error(error.message);stop(1)}
+for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>stop(0));
 await start('synapse','synapse_homeserver',['-c',hsConfig]);
 let ready=false;for(let i=0;i<90;i++){try{const r=await fetch('http://127.0.0.1:4808/_matrix/client/versions');if(r.ok){ready=true;break}}catch{}await new Promise(r=>setTimeout(r,1000))}
 if(!ready)throw new Error('Local homeserver did not start. See private/runtime/synapse.log');
 const registrationURL='http://127.0.0.1:4808/_synapse/admin/v1/register';
 const {nonce}=await fetch(registrationURL).then(r=>r.json());
-const mac=createHmac('sha1',secrets.registration).update([nonce,'max',secrets.password,'admin'].join('\0')).digest('hex');
-const registrationResponse=await fetch(registrationURL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nonce,username:'max',password:secrets.password,admin:true,mac})});
+const mac=createHmac('sha1',secrets.registration).update([nonce,owner,secrets.password,'admin'].join('\0')).digest('hex');
+const registrationResponse=await fetch(registrationURL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nonce,username:owner,password:secrets.password,admin:true,mac})});
 const registered=await registrationResponse.json();if(!registrationResponse.ok&&registered.errcode!=='M_USER_IN_USE')throw new Error('Local account registration failed: '+registered.error);
-const configFile=path.join(root,'private/config.json'),config=await readFile(configFile,'utf8').then(JSON.parse).catch(()=>({apiKey:random()}));
+const configFile=path.join(dataDir,'config.json'),config=await readFile(configFile,'utf8').then(JSON.parse).catch(()=>({apiKey:random()}));
 if(!config.matrixAccount){
- const response=await fetch('http://127.0.0.1:4808/_matrix/client/v3/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'m.login.password',identifier:{type:'m.id.user',user:'max'},password:secrets.password,initial_device_display_name:'Chord'})});const account=await response.json();if(!response.ok)throw new Error('Local Matrix device login failed: '+account.error);
+ const response=await fetch('http://127.0.0.1:4808/_matrix/client/v3/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:'m.login.password',identifier:{type:'m.id.user',user:owner},password:secrets.password,initial_device_display_name:'Chord'})});const account=await response.json();if(!response.ok)throw new Error('Local Matrix device login failed: '+account.error);
  config.matrixAccount={homeserver:'http://127.0.0.1:4808',userId:account.user_id,deviceId:account.device_id,accessToken:account.access_token};config.pickleKey=random();
 }else if(config.matrixAccount.homeserver!=='http://127.0.0.1:4808')throw new Error('Another Matrix account exists. Refusing to overwrite its device.');
 // Previous compatibility credentials are retained in an owner-only backup, never used by Chord.
@@ -69,5 +79,6 @@ if(config.access_token){await writeFile(path.join(dir,'unused-compatibility-conf
 config.bridges=networks.map(n=>({...n,url:'http://127.0.0.1:'+n.port,version:n.id==='discord'?1:3,secret:secrets.bridges[n.id].provisioning}));
 await writeFile(configFile,JSON.stringify(config,null,2),{mode:0o600});
 for(const n of networks)await start(n.id,'mautrix-'+n.id,['-c',path.join(dir,n.id,'config.yaml')],path.join(dir,n.id));
-console.log('Independent local homeserver and all three network bridges started. No Beeper services are configured.');
+if(macLocal)await start('api',process.execPath,[path.join(root,'server.mjs')]);
+console.log('Chord backend started: '+networks.map(n=>n.name).join(', '));
 await new Promise(()=>{});

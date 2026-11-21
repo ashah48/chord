@@ -3,9 +3,13 @@ set -eu
 
 app_dir=$(dirname "$0")
 config="$HOME/Library/Application Support/Chord/config.json"
+local_config="$HOME/Library/Application Support/Chord/local/config.json"
 
 if [ "$#" -gt 0 ]; then
     exec "$app_dir/chord-client" "$@"
+fi
+if [ -f "$local_config" ]; then
+    exec "$app_dir/chord-client" --config "$local_config"
 fi
 if [ -f "$config" ]; then
     exec "$app_dir/chord-client" --config "$config"

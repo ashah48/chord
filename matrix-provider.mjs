@@ -6,9 +6,13 @@ import {ArchiveStore,accountNamespace,digest,DAY,RETENTION_DAYS} from './archive
 import {readHistory,writeHistory} from './history-file.mjs';
 
 const enc=encodeURIComponent;
+// Room state (names, bridge info, membership) re-sent by a bridge is not conversation activity.
+const MESSAGE_TYPES=['m.room.message','m.room.encrypted','m.sticker'];
+const isMessageEvent=e=>!!e&&e.state_key===undefined&&(!e.type||MESSAGE_TYPES.includes(e.type));
 const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'iPhone':'Matrix';
 const page=(items,limit=200,offset=0)=>({items:items.slice(offset,offset+limit),hasMore:items.length>offset+limit,oldestCursor:String(offset+limit),newestCursor:null});
 const threadEvent=event=>event?.content?.['m.relates_to']?.rel_type==='m.thread';
+const isChannelEvent=e=>isMessageEvent(e)&&!threadEvent(e)&&e.content?.['m.relates_to']?.rel_type!=='m.replace';
 const threadMessage=message=>!!(message?.threadRootID&&message.threadRootID!==message.id);
 export function reactionRecord(source){
  const content=source?.content||source?.raw?.content||{};
@@ -57,11 +61,43 @@ export class MatrixProvider{
  async start(){
   if(this.started)return;await this.client.boot();
   if(this.persist){const saved=await readHistory(this.dataDir).catch(e=>{if(e.code!=='ENOENT')throw e;return null});if(saved){this.chats=new Map(saved.chats||[]);this.timelines=new Map(saved.timelines||[]);this.reactions=new Map(saved.reactions||[]);this.mediaFiles=new Map(saved.mediaFiles||[]);if(saved.syncToken)this.syncToken=saved.syncToken}}
-  await this.refreshRooms();this.subscription=await this.client.subscribe(undefined,e=>this.onEvent(e));this.subscription.done.catch(e=>{this.error=e.message});this.started=true;
+  await this.refreshRooms();this.subscription=await this.client.subscribe(undefined,e=>this.onEvent(e));this.subscription.done.catch(e=>{this.error=e.message});this.started=true;this.scheduleActivityRepair();
+ }
+ // Repair existing summaries without delaying the first inbox response.
+ scheduleActivityRepair(){
+  if(!this.persist||this.closing||this.activityRepair||Date.now()<(this.nextActivityRepair||0))return;
+  this.nextActivityRepair=Date.now()+60000;
+  this.activityRepair=this.repairActivity().catch(e=>{this.error=e.message}).finally(()=>{this.activityRepair=null});
+ }
+ async repairActivity(){
+  const pending=[...this.chats.keys()].filter(id=>this.chats.get(id).activityVersion!==3);
+  for(let i=0;i<pending.length&&!this.closing;i+=4){
+   await Promise.all(pending.slice(i,i+4).map(async id=>{
+    const room=this.chats.get(id),previous=room.lastActivity;
+    const timeline=Date.parse(this.timelines.get(id)?.findLast(m=>!threadMessage(m))?.timestamp)||0;
+    let latest=Math.max(timeline,this.archive?.latestMessageAt?.('matrix:'+id)||0);
+    if(!latest){try{latest=await this.latestMessageOnServer(id)}catch{return}}
+    const current=this.chats.get(id);
+    if(this.closing||!current||current.lastActivity!==previous)return;
+    this.chats.set(id,{...current,activityVersion:3,...(latest?{lastActivity:new Date(latest).toISOString()}:{})});
+    this.scheduleSave();
+   }));
+  }
+ }
+ async latestMessageOnServer(roomId){
+  let from;
+  for(let i=0;i<3;i++){
+   const page=await this.raw('GET',`/_matrix/client/v3/rooms/${enc(roomId)}/messages`,undefined,{dir:'b',limit:'20',filter:JSON.stringify({types:MESSAGE_TYPES}),...(from?{from}:{})});
+   const latest=page.chunk?.find(isChannelEvent)?.origin_server_ts;
+   if(latest)return latest;
+   if(!page.end||page.end===from)return 0;
+   from=page.end;
+  }
+  return 0;
  }
  async refreshRooms(){
   if(this.roomRefresh)return this.roomRefresh;
-  this.roomRefresh=this.refreshRoomsNow().finally(()=>{this.roomRefresh=null});
+  this.roomRefresh=this.refreshRoomsNow().then(()=>this.scheduleActivityRepair()).finally(()=>{this.roomRefresh=null});
   return this.roomRefresh;
  }
  async refreshRoomsNow(){
@@ -95,7 +131,7 @@ export class MatrixProvider{
    if(bridge||freshRoom){accountID=bridge?.protocol?.id||'matrix';accountID=/slack/i.test(accountID)?'slack':/discord/i.test(accountID)?'discord':/whatsapp/i.test(accountID)?'whatsapp':accountID;network=bridge?.protocol?.displayname||networkFor(accountID)}
    const people=state.filter(e=>e.type==='m.room.member'&&e.content?.membership==='join').map(e=>({id:e.state_key,fullName:e.content.displayname||e.state_key,isSelf:e.state_key===this.account.userId}));
    const prefs=room.account_data?.events?.find(e=>e.type==='org.chord.chat')?.content||{};const marked=room.account_data?.events?.find(e=>e.type==='m.marked_unread')?.content?.unread;
-   const events=room.timeline?.events||[],latest=events.at(-1);const summaryCount=room.summary?.['m.joined_member_count'];
+   const events=room.timeline?.events||[],channelEvent=events.findLast(isChannelEvent);const summaryCount=room.summary?.['m.joined_member_count'];
    let title,description,type,participants;
    if(freshRoom){
     title=find('m.room.name')?.name||bridge?.channel?.displayname||people.filter(p=>!p.isSelf).map(p=>p.fullName).slice(0,3).join(', ')||roomId;
@@ -110,17 +146,16 @@ export class MatrixProvider{
     const items=[...merged.values()],total=summaryCount!==undefined?summaryCount:(old.participants?.total||items.length);
     participants={items,total,hasMore:total>items.length};
    }
-   const channelEvent=[...events].reverse().find(e=>e.content?.body&&!threadEvent(e));
    const threadOnly=events.some(threadEvent)&&!channelEvent;
    const notes=room.unread_notifications;
    let rawHighlights=(notes||freshRoom)?(notes?.highlight_count||0):(old.rawHighlightCount||0),notificationCount=(notes||freshRoom)?(notes?.notification_count||0):(old.unreadCount||0);
    // A sync batch that is only thread replies must not raise the badge, even
    // when the homeserver still folds those replies into its notification totals.
    if(threadOnly){if(notificationCount>(old.unreadCount||0))notificationCount=old.unreadCount||0;if(rawHighlights>(old.rawHighlightCount||0))rawHighlights=old.rawHighlightCount||0}
-   const readBasis=channelEvent?.origin_server_ts??(threadOnly?(Date.parse(old.lastActivity)||0):Number(latest?.origin_server_ts||Date.parse(old.lastActivity)||0));
+   const readBasis=Math.max(channelEvent?.origin_server_ts||0,Date.parse(old.lastActivity)||0);
    const locallyRead=old.localReadAt&&readBasis<=old.localReadAt;
    const readHighlightBaseline=old.localReadAt?Math.min(old.readHighlightBaseline??rawHighlights,rawHighlights):0;
-   const lastActivity=channelEvent?.origin_server_ts?new Date(Math.max(channelEvent.origin_server_ts,Date.parse(old.lastActivity)||0)).toISOString():(old.lastActivity||new Date(latest?.origin_server_ts||Date.now()).toISOString());
+   const lastActivity=channelEvent?.origin_server_ts?new Date(Math.max(channelEvent.origin_server_ts,Date.parse(old.lastActivity)||0)).toISOString():(old.lastActivity||new Date(0).toISOString());
    const preview=channelEvent?.content?.body?{text:channelEvent.content.body,senderID:channelEvent.sender}:old.preview;
    this.chats.set(roomId,{...old,id:roomId,accountID,network:network||networkFor(accountID||'matrix'),title,description,type,participants,lastActivity,rawHighlightCount:rawHighlights,readHighlightBaseline,highlightCount:locallyRead?0:Math.max(0,rawHighlights-readHighlightBaseline),unreadCount:locallyRead?0:notificationCount,isMarkedUnread:old.localMarkedUnread?true:locallyRead?false:marked??old.isMarkedUnread??false,isArchived:prefs.archived??old.isArchived??false,isMuted:old.isMuted||false,isReadOnly:false,capabilities:{reply:2,reaction:2,edit:2,archive:true,markAsUnread:true},preview});
   }
@@ -158,7 +193,7 @@ export class MatrixProvider{
   const room=this.chats.get(event.roomId);
   if(event.kind==='message'){
    const message=this.normalizeMessage(event);const timeline=this.timelines.get(event.roomId)||[];const index=timeline.findIndex(m=>m.id===message.id);if(index>=0)timeline[index]=message;else timeline.push(message);timeline.sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));this.timelines.set(event.roomId,timeline);
-   if(room&&!message.threadRootID){room.preview={text:message.text,senderName:message.senderName,senderID:message.senderID};room.lastActivity=message.timestamp;}
+   if(room&&!threadMessage(message)&&Date.parse(message.timestamp)>=(Date.parse(room.lastActivity)||0)){room.preview={text:message.text,senderName:message.senderName,senderID:message.senderID};room.lastActivity=message.timestamp;}
   }else if(event.kind==='reaction'){
    const key=event.roomId+'|'+event.relatesTo;this.relationVersions.set(key,(this.relationVersions.get(key)||0)+1);const current=this.reactions.get(key)||this.archive?.message('matrix:'+event.roomId,event.relatesTo)?.reactions||[];const filtered=current.filter(r=>r.id!==event.eventId);if(event.added){const record=reactionRecord(event);if(record)filtered.push(record)}this.reactions.set(key,filtered);
   }else if(event.kind==='event'&&event.type==='m.room.redaction'){
@@ -303,4 +338,4 @@ export async function getMatrix({config,dataDir}){
  })().catch(e=>{boot=null;throw e});return boot;
 }
 export async function matrixRequest(context,endpoint,method,body){return (await getMatrix(context)).request(endpoint,method,body)}
-export async function closeMatrix(){const provider=instance||await boot?.catch(()=>null);if(!provider)return;clearTimeout(provider.flushTimer);if(provider.subscription)await provider.subscription.stop();await provider.client.close();clearTimeout(provider.flushTimer);await provider.save();provider.store?.close();provider.archive?.close();instance=null;boot=null;}
+export async function closeMatrix(){const provider=instance||await boot?.catch(()=>null);if(!provider)return;provider.closing=true;await provider.activityRepair;clearTimeout(provider.flushTimer);if(provider.subscription)await provider.subscription.stop();await provider.client.close();clearTimeout(provider.flushTimer);await provider.save();provider.store?.close();provider.archive?.close();instance=null;boot=null;}

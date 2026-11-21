@@ -2473,12 +2473,23 @@ fn initials(name: &str) -> String {
     }
 }
 pub fn run(app: App) -> anyhow::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Chord")
+        .with_app_id("dev.chord.Chord")
+        .with_inner_size([1240., 820.])
+        .with_min_inner_size([760., 520.]);
+    // Without an explicit icon, eframe replaces the bundle's Dock icon with the egui logo.
+    if cfg!(target_os = "macos") {
+        let icon =
+            image::load_from_memory(include_bytes!("../assets/macos/icon.png"))?.into_rgba8();
+        viewport = viewport.with_icon(egui::IconData {
+            width: icon.width(),
+            height: icon.height(),
+            rgba: icon.into_raw(),
+        });
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Chord")
-            .with_app_id("dev.chord.Chord")
-            .with_inner_size([1240., 820.])
-            .with_min_inner_size([760., 520.]),
+        viewport,
         renderer: eframe::Renderer::Glow,
         // Wayland already schedules presentation. Waiting for a swap interval can
         // block the event loop when a scratchpad surface is hidden.

@@ -1,5 +1,6 @@
-// Regenerate assets/macos/Chord.icns from assets/chord.svg:
+// Regenerate assets/macos/Chord.icns and icon.png (the runtime Dock icon) from assets/chord.svg:
 //   swift packaging/macos-icon.swift assets/chord.svg /tmp/Chord.iconset && iconutil -c icns /tmp/Chord.iconset -o assets/macos/Chord.icns
+//   cp /tmp/Chord.iconset/icon_512x512@2x.png assets/macos/icon.png
 import AppKit
 
 let args = CommandLine.arguments

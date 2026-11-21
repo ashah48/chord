@@ -39,6 +39,8 @@ struct Args {
     height: u16,
     #[arg(long)]
     connect: Option<String>,
+    #[arg(long, hide = true, requires = "demo", conflicts_with_all = ["snapshot", "tui", "mcp", "connect"])]
+    appearance_smoke_test: Option<gui::AppearanceSmokeTest>,
 }
 struct Restore;
 impl Drop for Restore {
@@ -115,7 +117,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if !args.tui {
-        return gui::run(app);
+        return gui::run(app, args.appearance_smoke_test);
     }
     let mut terminal = ratatui::init();
     let _restore = Restore;

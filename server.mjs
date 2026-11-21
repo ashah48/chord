@@ -45,11 +45,15 @@ async function seedInbox(url){
   const id='matrix:'+c.id;
   if(!known.has(id))known.set(id,{...c,id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||'',unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,direct:c.type==='single',participants:(c.participants?.items||[]).map(p=>p.id),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly});
  }
- let items=[...known.values()].filter(c=>!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query))).map(c=>directory.enrichConversation(c));
+ const pins=url.searchParams.getAll('pin'),pinned=new Set(pins);
+ const candidates=[...known.values()].filter(c=>!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query)));
+ candidates.sort((a,b)=>(Date.parse(b.timestamp)||0)-(Date.parse(a.timestamp)||0));
+ let matrixCount=0;
+ let items=candidates.filter(c=>!c.id.startsWith('matrix:')||matrixCount++<200||pinned.has(c.id)).map(c=>directory.enrichConversation(c));
  if(!items.length)return undefined;
  items=applyLocalRules(applyAttention(items,config.discordAttention,{server,query}),directory.book);
  if(unread)items=items.filter(c=>c.unread);if(server)items=items.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));
- return {...rankInbox(items,directory.book,{view:url.searchParams.get('view')||'all',pins:url.searchParams.getAll('pin')}),errors:[],cursors:{},hasMore:false};
+ return {...rankInbox(items,directory.book,{view:url.searchParams.get('view')||'all',pins}),errors:[],cursors:{},hasMore:false};
 }
 
 async function cachedMessages(id,url){
@@ -100,13 +104,53 @@ export async function matrix(endpoint,method='GET',body){
 }
 async function inbox(url){
  await directory.refresh();
- const view=url.searchParams.get('view')||'all';
- const source=url.searchParams.get('source')||'all',query=url.searchParams.get('query')||'',cursor=url.searchParams.get('cursor'),unread=url.searchParams.get('unread')==='true';let items=[],errors=[],cursors={};
- const jobs=[];
- if(source==='all'||['slack','discord','whatsapp','matrix'].includes(source))jobs.push((async()=>{try{const q=new URLSearchParams({limit:'200'});if(source!=='all')q.append('accountIDs',source);if(cursor)q.set('cursor',cursor);if(query)q.set('query',query);let d=await matrix('/v1/chats'+(query?'/search':'')+'?'+q);if(!cursor){const all=[...(d.items||[])];while(d.hasMore){q.set('cursor',d.oldestCursor);d=await matrix('/v1/chats'+(query?'/search':'')+'?'+q);all.push(...(d.items||[]))}d={...d,items:all}}items.push(...(d.items||[]).filter(c=>!c.accountID?.includes('blueferry')).map(c=>({...c,id:'matrix:'+c.id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||c.network||'',previewSenderName:c.preview?.senderName||'',previewSenderID:c.preview?.senderID,unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,participants:(Array.isArray(c.participants)?c.participants:(c.participants?.items||[])).map(p=>typeof p==='string'?p:p.id).filter(Boolean),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly})));if(d.hasMore)cursors.matrix=d.oldestCursor}catch(e){errors.push({source:'matrix',error:e?.message||String(e)})}})());
- if(source==='all'||source==='iphone')jobs.push((async()=>{try{const threads=presentThreads(await blueCached('ListThreads','u',[200]));items.push(...threads.filter(t=>!query||t.name.toLowerCase().includes(query.toLowerCase())).map(t=>({id:'blueferry:'+t.key,remoteId:t.key,kind:'phone',source:'iphone',title:t.name,preview:t.messages?.at(-1)?.body||'',unread:!!t.unread,timestamp:t.last_ts,participants:t.recipients||[],canReply:false,canReact:false,canSend:!!t.reply_ready,blue:t})))}catch(e){errors.push({source:'iphone',error:e?.message||String(e)})}})());
- for(const a of mailAccounts())if(source==='all'||source==='mail:'+a.id)jobs.push((async()=>{try{const d=await listMail(a.id,{query:query||'in:inbox',cursor:source==='all'?undefined:cursor,limit:source==='all'?12:35});items.push(...d.items.map(m=>({...m,id:'mail:'+a.id+':'+m.id,remoteId:m.id,kind:'email',source:'mail:'+a.id,title:m.subject,preview:m.from+' · '+m.snippet,timestamp:m.date,canReply:true,canReact:false,canSend:true})));if(d.hasMore)cursors['mail:'+a.id]=d.oldestCursor}catch(e){errors.push({source:'mail:'+a.id,error:e?.message||String(e)})}})());
- await Promise.all(jobs);items=items.filter(c=>!c.isArchived&&!isStatusConversation(c,config.matrixAccount?.userId));const server=url.searchParams.get('server');if(server&&!/^(all|dm|[0-9]+)$/.test(server))throw Object.assign(new Error('Invalid Discord server'),{status:400});let enriched=applyLocalRules(applyAttention(items.map(c=>directory.enrichConversation(c)),config.discordAttention,{server,query}),directory.book);if(unread)enriched=enriched.filter(c=>c.unread);if(server)enriched=enriched.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));const ranked=rankInbox(enriched,directory.book,{view,pins:url.searchParams.getAll('pin')});await directory.book.save();return {...ranked,errors,cursors,hasMore:Object.keys(cursors).length>0};
+ const params=url.searchParams,view=params.get('view')||'all';
+ const source=params.get('source')||'all',query=params.get('query')||'',cursor=params.get('cursor'),unread=params.get('unread')==='true';
+ const server=params.get('server');
+ if(server&&!/^(all|dm|[0-9]+)$/.test(server))throw Object.assign(new Error('Invalid Discord server'),{status:400});
+ const pins=params.getAll('pin'),pinSet=new Set(pins),items=[],errors=[],cursors={},jobs=[];
+ let continuation;
+ if(cursor?.startsWith('{')){
+  try{continuation=JSON.parse(cursor)}catch{throw Object.assign(new Error('Invalid inbox cursor'),{status:400})}
+   if(!continuation||Array.isArray(continuation)||typeof continuation!=='object')throw Object.assign(new Error('Invalid inbox cursor'),{status:400});
+ }else if(cursor)continuation={[source.startsWith('mail:')?source:'matrix']:cursor};
+ const wants=key=>!continuation||(Object.hasOwn(continuation,key)&&typeof continuation[key]==='string'&&continuation[key].length>0);
+ const load=(key,job)=>jobs.push(job().catch(e=>{
+  errors.push({source:key,error:e?.message||String(e)});
+  if(continuation?.[key])cursors[key]=continuation[key];
+ }));
+
+ if((source==='all'||['slack','discord','whatsapp','matrix'].includes(source))&&wants('matrix'))load('matrix',async()=>{
+  const q=new URLSearchParams({limit:'200',inbox:'inbox'});
+  if(source!=='all')q.append('accountIDs',source);
+  if(continuation?.matrix)q.set('cursor',continuation.matrix);
+  if(query)q.set('query',query);
+  if(!continuation)for(const id of pinSet)if(id.startsWith('matrix:'))q.append('includeRoom',id.slice(7));
+  const d=await matrix('/v1/chats'+(query?'/search':'')+'?'+q);
+  items.push(...(d.items||[]).filter(c=>!c.accountID?.includes('blueferry')).map(c=>({...c,id:'matrix:'+c.id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||c.network||'',previewSenderName:c.preview?.senderName||'',previewSenderID:c.preview?.senderID,unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,participants:(Array.isArray(c.participants)?c.participants:(c.participants?.items||[])).map(p=>typeof p==='string'?p:p.id).filter(Boolean),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly})));
+  if(d.hasMore&&d.oldestCursor)cursors.matrix=d.oldestCursor;
+ });
+ if(!continuation&&(source==='all'||source==='iphone'))load('iphone',async()=>{
+  const threads=presentThreads(await blueCached('ListThreads','u',[200]));
+  items.push(...threads.filter(t=>!query||t.name.toLowerCase().includes(query.toLowerCase())).map(t=>({id:'blueferry:'+t.key,remoteId:t.key,kind:'phone',source:'iphone',title:t.name,preview:t.messages?.at(-1)?.body||'',unread:!!t.unread,timestamp:t.last_ts,participants:t.recipients||[],canReply:false,canReact:false,canSend:!!t.reply_ready,blue:t})));
+ });
+ for(const a of mailAccounts()){
+  const key='mail:'+a.id;
+  if((source==='all'||source===key)&&wants(key))load(key,async()=>{
+   const d=await listMail(a.id,{query:query||'in:inbox',cursor:continuation?.[key],limit:source==='all'?12:35,
+    includeThreads:!continuation&&!query?[...pinSet].filter(id=>id.startsWith(key+':')).map(id=>id.slice(key.length+1)):[]});
+   items.push(...d.items.map(m=>({...m,id:key+':'+m.id,remoteId:m.id,kind:'email',source:key,title:m.subject,preview:m.from+' · '+m.snippet,timestamp:m.date,canReply:true,canReact:false,canSend:true})));
+   if(d.hasMore&&d.oldestCursor)cursors[key]=d.oldestCursor;
+  });
+ }
+ await Promise.all(jobs);
+ const candidates=items.filter(c=>!c.isArchived&&!isStatusConversation(c,config.matrixAccount?.userId)).map(c=>directory.enrichConversation(c));
+ let enriched=applyLocalRules(applyAttention(candidates,config.discordAttention,{server,query}),directory.book);
+ if(unread)enriched=enriched.filter(c=>c.unread);
+ if(server)enriched=enriched.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));
+ const ranked=rankInbox(enriched,directory.book,{view,pins});
+ await directory.book.save();
+ return {...ranked,errors,cursors,hasMore:Object.keys(cursors).length>0};
 }
 function parseConversation(id){const thread=id.match(/^matrix-thread:([^:]+):([^:]+)$/);if(thread){const remote=decodeURIComponent(thread[1]),threadRoot=decodeURIComponent(thread[2]);if(!remote.startsWith('!')||!threadRoot.startsWith('$'))throw Object.assign(new Error('Invalid thread identity'),{status:400});return {kind:'matrix',remote,threadRoot}};if(id.startsWith('archive:'))return {kind:'archive',...archive.store.decodeToken(id)};if(id.startsWith('matrix:'))return {kind:'matrix',remote:id.slice(7)};if(id.startsWith('blueferry:'))return {kind:'blueferry',remote:id.slice(10)};const m=id.match(/^mail:(home|cmu):(.+)$/);if(m)return {kind:'mail',account:m[1],remote:m[2]};throw Object.assign(new Error('Unknown conversation ID'),{status:400})}
 async function conversation(id,url){const c=parseConversation(id);
@@ -132,7 +176,7 @@ export const server=http.createServer(async(req,res)=>{try{
   return json(res,archive.store.search(url.searchParams.get('query')||'',{limit:url.searchParams.get('limit')||60,offset:url.searchParams.get('offset')||0}));
  }
  if(p==='/api/connections'&&req.method==='GET')return json(res,await connections(url.searchParams.get('refresh')==='true'));
- if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:human-v2:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
+ if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:human-v3:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
  if(p==='/api/discord/servers'&&req.method==='GET'){await directory.refresh();const rooms=[...directory.catalog.rooms.values()].filter(r=>r.network==='discord');return json(res,{items:directory.catalog.servers.map(g=>({...g,preferred:!config.discordAttention||(config.discordAttention.visibleServerIDs||[]).includes(g.id),channelCount:rooms.filter(r=>r.serverID===g.id).length})).sort((a,b)=>a.name.localeCompare(b.name)),directMessageCount:rooms.filter(r=>!r.serverID).length})}
  if(p==='/api/contacts'&&req.method==='GET'){directory.refresh().catch(()=>{});return json(res,{items:directory.book.list(url.searchParams.get('query')||''),errors:directory.catalog.errors})}
  if(p==='/api/slack/cache-profiles'&&req.method==='POST'){const b=await input(req);return json(res,await cacheSlackProfiles(b.workspace,{dataDir,directory,cache:readCache,photos:b.photos!==false}))}

@@ -41,3 +41,26 @@ ln -s /Applications "$stage/Applications"
 hdiutil create -volname Chord -format UDZO -srcfolder "$stage" -ov -quiet \
     "$output/Chord-macOS-$arch.dmg"
 hdiutil verify "$output/Chord-macOS-$arch.dmg"
+
+# Exercise the same signed bundle from a separate Applications directory.
+# The temporary HOME keeps the test away from existing profiles and settings.
+installed="$work/Applications/Chord.app"
+mkdir -p "$work/Applications" "$work/home"
+ditto "$app" "$installed"
+python3 - "$installed/Contents/MacOS/Chord" "$work/home" <<'PYTHON'
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+binary, home = sys.argv[1:]
+env = dict(os.environ, HOME=home)
+subprocess.run([binary, "--demo", "--appearance-smoke-test", "write"],
+               env=env, check=True, timeout=30)
+settings = Path(home) / "Library/Application Support/Chord/ui.json"
+if json.loads(settings.read_text())["theme"] != "macos":
+    raise RuntimeError("Chord did not save its appearance settings")
+subprocess.run([binary, "--demo", "--appearance-smoke-test", "check"],
+               env=env, check=True, timeout=30)
+PYTHON

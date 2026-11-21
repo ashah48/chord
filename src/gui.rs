@@ -16,6 +16,18 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use theme::{Palette, Theme};
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum AppearanceSmokeTest {
+    Write,
+    Check,
+}
+
+struct AppearanceSmoke {
+    mode: AppearanceSmokeTest,
+    rendered: bool,
+    complete: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
 pub struct Gui {
     pub app: App,
     media: Media,
@@ -27,6 +39,7 @@ pub struct Gui {
     profile_name: String,
     profile_id: String,
     settings_path: PathBuf,
+    appearance_smoke: Option<AppearanceSmoke>,
     scroll_to: Option<String>,
     unread_marker: Option<String>,
     search_focus: bool,
@@ -62,6 +75,7 @@ impl Gui {
             profile_name: String::new(),
             profile_id: String::new(),
             settings_path,
+            appearance_smoke: None,
             scroll_to: None,
             unread_marker: None,
             search_focus: false,
@@ -156,6 +170,9 @@ impl Gui {
         ));
     }
     fn save_theme(&mut self, ctx: &egui::Context) {
+        if cfg!(target_os = "macos") {
+            Self::apply_fonts(ctx, self.theme);
+        }
         self.theme.apply(ctx);
         self.save_settings();
     }
@@ -361,11 +378,6 @@ impl Gui {
                         }
                     }
                     if old != self.theme {
-                        if cfg!(target_os = "macos")
-                            && (old == Theme::MacOs || self.theme == Theme::MacOs)
-                        {
-                            Self::apply_fonts(ui.ctx(), self.theme);
-                        }
                         self.save_theme(ui.ctx());
                     }
                     ui.separator();
@@ -517,7 +529,7 @@ impl Gui {
                     }
                 });
                 if let (Some(total), Some(important)) = (self.app.inbox_summary["total"].as_u64(), self.app.inbox_summary["important"].as_u64()) {
-                    ui.label(RichText::new(format!("{important} in Focus · {total} total")).small().color(p.muted));
+                    ui.label(RichText::new(format!("{important} in Focus · {total} on page")).small().color(p.muted));
                 }
                 ui.add_space(10.);
                 ui.separator();
@@ -538,7 +550,7 @@ impl Gui {
                             );
                         }
                         if chats.is_empty() && !self.app.loading && self.app.focus_enabled() && self.app.inbox_summary["total"].as_u64().unwrap_or(0) > 0
-                            && ui.button(format!("Show all {} conversations", self.app.inbox_summary["total"].as_u64().unwrap_or(0))).clicked() {
+                            && ui.button("Switch to All").clicked() {
                             if self.app.discord_scope.is_some() { self.app.server_focus = false; } else { self.app.focus_view = false; }
                             self.app.refresh(false);
                         }
@@ -576,13 +588,8 @@ impl Gui {
                         if let Some((id, pos, dropped)) = drag {
                             self.drag_chat(ui, &chats, &rows, divider, pinned, &id, pos, dropped, p);
                         }
-                        if !self.app.inbox_cursors.is_null()
-                            && self
-                                .app
-                                .inbox_cursors
-                                .as_object()
-                                .is_some_and(|o| !o.is_empty())
-                            && ui.button("Load more conversations").clicked()
+                        if self.app.has_more_inbox()
+                            && ui.add_enabled(!self.app.loading, egui::Button::new("Load more conversations")).clicked()
                         {
                             self.app.refresh(true);
                         }
@@ -1206,7 +1213,9 @@ impl Gui {
         index: usize,
         p: Palette,
     ) {
-        let has_thread = chat.source == "slack"
+        let synced = !m.is_local_outgoing();
+        let has_thread = synced
+            && chat.source == "slack"
             && chat.thread_root_id.is_none()
             && m.thread_root_id.is_none()
             && (m.reply_count > 0
@@ -1271,7 +1280,8 @@ impl Gui {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             ui.menu_button("•••", |ui| {
-                                                if chat.source == "slack"
+                                                if synced
+                                                    && chat.source == "slack"
                                                     && chat.kind == "chat"
                                                     && chat.thread_root_id.is_none()
                                                     && ui.button("View full thread").clicked()
@@ -1279,18 +1289,22 @@ impl Gui {
                                                     self.app.open_thread(m);
                                                     ui.close();
                                                 }
-                                                if chat.can_react {
+                                                if synced && chat.can_react {
                                                     self.reaction_menu(ui, chat, m, p);
                                                 }
                                                 if ui.button("Copy message").clicked() {
                                                     ui.ctx().copy_text(m.text.clone());
                                                     ui.close();
                                                 }
-                                                if chat.can_reply && ui.button("Reply").clicked() {
+                                                if synced
+                                                    && chat.can_reply
+                                                    && ui.button("Reply").clicked()
+                                                {
                                                     self.reply_to(index);
                                                     ui.close();
                                                 }
-                                                if m.is_sender
+                                                if synced
+                                                    && m.is_sender
                                                     && chat.kind == "chat"
                                                     && ui.button("Edit message").clicked()
                                                 {
@@ -1372,11 +1386,31 @@ impl Gui {
                                         });
                                 }
                                 if let Some(error) = &m.send_error {
-                                    ui.label(
-                                        RichText::new(format!("Not sent · {error}"))
-                                            .small()
-                                            .color(p.accent),
-                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("Not sent · {error}"))
+                                                .small()
+                                                .color(p.accent),
+                                        );
+                                        if ui.small_button("Retry").clicked() {
+                                            thread_clicked = true;
+                                            self.app.retry_outgoing(&m.id);
+                                        }
+                                        if ui.small_button("Dismiss").clicked() {
+                                            thread_clicked = true;
+                                            self.app.dismiss_outgoing(&m.id);
+                                        }
+                                    });
+                                } else if let Some(status) = &m.send_status {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(status).small().color(p.muted));
+                                        if status == "Sent · awaiting sync"
+                                            && ui.small_button("Dismiss").clicked()
+                                        {
+                                            thread_clicked = true;
+                                            self.app.dismiss_outgoing(&m.id);
+                                        }
+                                    });
                                 }
                                 if has_thread {
                                     let count = m.reply_count.max(
@@ -1416,7 +1450,9 @@ impl Gui {
                                         index: attachment_index,
                                         attachment: a.clone(),
                                     };
-                                    if crate::images::is_image(a) {
+                                    if !synced {
+                                        ui.label(a["fileName"].as_str().unwrap_or("Attachment"));
+                                    } else if crate::images::is_image(a) {
                                         if self
                                             .image(
                                                 ui,
@@ -1526,7 +1562,7 @@ impl Gui {
                 }
             }
         }
-        if chat.can_react {
+        if synced && chat.can_react {
             let activation_pos = ui.input(|input| {
                 input.pointer.interact_pos().filter(|pos| {
                     response.rect.contains(*pos)
@@ -2770,6 +2806,22 @@ impl eframe::App for Gui {
                 self.app.notice = format!("Could not open the link: {error}");
             }
         }
+        if let Some(mut smoke) = self.appearance_smoke.take() {
+            if smoke.rendered {
+                let matches = self.theme == Theme::MacOs
+                    && ctx.style().visuals.text_color() == self.theme.palette(ctx.theme()).text;
+                smoke.complete.set(matches);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                if matches!(smoke.mode, AppearanceSmokeTest::Write) {
+                    self.theme = Theme::MacOs;
+                    self.save_theme(ctx);
+                }
+                smoke.rendered = true;
+                self.appearance_smoke = Some(smoke);
+                ctx.request_repaint();
+            }
+        }
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
@@ -2970,7 +3022,7 @@ fn settings_path() -> PathBuf {
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("private/ui.json")
 }
-pub fn run(app: App) -> anyhow::Result<()> {
+pub fn run(app: App, smoke: Option<AppearanceSmokeTest>) -> anyhow::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Chord")
         .with_app_id("dev.chord.Chord")
@@ -2994,12 +3046,27 @@ pub fn run(app: App) -> anyhow::Result<()> {
         vsync: std::env::var_os("WAYLAND_DISPLAY").is_none(),
         ..Default::default()
     };
+    let complete = std::rc::Rc::new(std::cell::Cell::new(false));
+    let result = complete.clone();
     eframe::run_native(
         "Chord",
         options,
-        Box::new(move |cc| Ok(Box::new(Gui::new(app, &cc.egui_ctx)))),
+        Box::new(move |cc| {
+            let mut gui = Gui::new(app, &cc.egui_ctx);
+            gui.appearance_smoke = smoke.map(|mode| AppearanceSmoke {
+                mode,
+                rendered: false,
+                complete,
+            });
+            Ok(Box::new(gui))
+        }),
     )
-    .map_err(|e| anyhow::anyhow!("Could not open Chord: {e}"))
+    .map_err(|e| anyhow::anyhow!("Could not open Chord: {e}"))?;
+    anyhow::ensure!(
+        smoke.is_none() || result.get(),
+        "macOS theme did not render"
+    );
+    Ok(())
 }
 #[cfg(test)]
 mod tests {

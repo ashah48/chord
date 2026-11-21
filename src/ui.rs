@@ -176,6 +176,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_inbox(frame, app, list, t);
     render_thread(frame, app, content, t);
     let hint = match app.mode {
+        Mode::Browse if app.has_more_inbox() => "L load more conversations · ? help",
         Mode::Compose => "esc back    ctrl+s send    enter newline",
         Mode::Search => "enter search    esc clear",
         Mode::Accounts => "j/k select    enter connect    esc back",
@@ -589,6 +590,18 @@ fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
             lines.push(
                 Line::from(Span::styled(format!("   {l}"), Style::new().fg(t.text))).style(style),
             );
+        }
+        if let Some(error) = &m.send_error {
+            lines.push(
+                Line::from(format!("   Not sent · {error} · y retry · D dismiss")).style(style),
+            );
+        } else if let Some(status) = &m.send_status {
+            let hint = if status == "Sent · awaiting sync" {
+                " · D dismiss"
+            } else {
+                ""
+            };
+            lines.push(Line::from(format!("   {status}{hint}")).style(style));
         }
         for a in &m.attachments {
             lines.push(

@@ -538,11 +538,9 @@ impl Gui {
         let was_pinned = self.app.is_pinned(id);
         if dropped {
             if pin {
-                self.app.move_pin(id, Some(position));
+                self.pin_chat(id, position);
             } else if was_pinned {
                 self.app.move_pin(id, None);
-            }
-            if pin || was_pinned {
                 self.save_settings();
             }
             return;
@@ -795,13 +793,35 @@ impl Gui {
             response.on_hover_text(format!("{}\n{}", chat.title, context))
         }
     }
+    // Pinned chats are marked Important so Focus, which hides automatic chats, keeps showing them.
+    fn pin_chat(&mut self, id: &str, position: usize) {
+        self.app.move_pin(id, Some(position));
+        self.save_settings();
+        let important = self
+            .app
+            .conversations
+            .iter()
+            .any(|c| c.id == id && c.local_priority == "important");
+        if !important {
+            self.app.apply_channel_rule(id, Some("important"), None);
+            self.app.operation(
+                "Channel updated",
+                "/api/preferences/conversation".into(),
+                json!({"conversationID": id, "priority": "important"}),
+            );
+        }
+    }
     fn channel_rules(&mut self, ui: &mut egui::Ui, chat: &Conversation) {
         let id = chat.id.clone();
         let pinned = self.app.is_pinned(&id);
         if ui.button(if pinned { "Unpin" } else { "Pin" }).clicked() {
-            let position = (!pinned).then(|| self.app.pinned_count());
-            self.app.move_pin(&id, position);
-            self.save_settings();
+            if pinned {
+                self.app.move_pin(&id, None);
+                self.save_settings();
+            } else {
+                let position = self.app.pinned_count();
+                self.pin_chat(&id, position);
+            }
             ui.close();
         }
         ui.separator();
@@ -3055,6 +3075,12 @@ mod tests {
         drag(&mut gui, &mut frame, third, first - egui::vec2(0., 12.));
         assert_eq!(gui.app.visible()[0].id, chats[3].id);
         assert!(gui.app.is_pinned(&chats[3].id));
+        assert!(
+            gui.app
+                .conversations
+                .iter()
+                .any(|c| c.id == chats[3].id && c.local_priority == "important")
+        );
         assert!(
             std::fs::read_to_string(&settings)
                 .unwrap()

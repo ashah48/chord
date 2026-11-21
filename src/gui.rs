@@ -2808,13 +2808,19 @@ impl eframe::App for Gui {
         }
         if let Some(mut smoke) = self.appearance_smoke.take() {
             if smoke.rendered {
-                let matches = self.theme == Theme::MacOs
+                let matches = self.theme == Theme::Light
                     && ctx.style().visuals.text_color() == self.theme.palette(ctx.theme()).text;
                 smoke.complete.set(matches);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
                 if matches!(smoke.mode, AppearanceSmokeTest::Write) {
-                    self.theme = Theme::MacOs;
+                    if self.theme != Theme::MacOs
+                        || ctx.style().visuals.text_color() != self.theme.palette(ctx.theme()).text
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    self.theme = Theme::Light;
                     self.save_theme(ctx);
                 }
                 smoke.rendered = true;
@@ -2861,7 +2867,10 @@ fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui
         } else {
             p.raised
         })
-        .stroke(egui::Stroke::new(if mine { 2. } else { 0. }, p.accent))
+        .stroke(egui::Stroke::new(
+            if mine { 2.0_f32 } else { 0.0 },
+            p.accent,
+        ))
         .corner_radius(10)
 }
 
@@ -3064,7 +3073,7 @@ pub fn run(app: App, smoke: Option<AppearanceSmokeTest>) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("Could not open Chord: {e}"))?;
     anyhow::ensure!(
         smoke.is_none() || result.get(),
-        "macOS theme did not render"
+        "Default macOS appearance or saved theme did not render"
     );
     Ok(())
 }

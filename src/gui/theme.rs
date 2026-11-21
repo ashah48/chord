@@ -1,10 +1,11 @@
 use eframe::egui::{self, Color32, FontId, TextStyle};
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Theme {
-    #[default]
+    #[cfg_attr(not(target_os = "macos"), default)]
     Gruvbox,
     Dark,
     Light,
+    #[cfg_attr(target_os = "macos", default)]
     MacOs,
 }
 #[derive(Clone, Copy)]
@@ -273,6 +274,12 @@ mod tests {
     #[test]
     fn macos_follows_system_appearance_and_explicit_themes_keep_their_style() {
         let ctx = egui::Context::default();
+        let expected_default = if cfg!(target_os = "macos") {
+            Theme::MacOs
+        } else {
+            Theme::Gruvbox
+        };
+        assert!(Theme::from_setting(None) == expected_default);
         for theme in Theme::OPTIONS {
             assert!(Theme::from_setting(Some(theme.setting())) == theme);
             theme.apply(&ctx);

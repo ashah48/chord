@@ -5,9 +5,9 @@ app_dir=$(dirname "$0")
 config="$HOME/Library/Application Support/Chord/config.json"
 
 if [ "$#" -gt 0 ]; then
-    exec "$app_dir/chord" "$@"
+    exec "$app_dir/chord-client" "$@"
 fi
 if [ -f "$config" ]; then
-    exec "$app_dir/chord" --config "$config"
+    exec "$app_dir/chord-client" --config "$config"
 fi
-exec "$app_dir/chord" --demo
+exec "$app_dir/chord-client" --demo

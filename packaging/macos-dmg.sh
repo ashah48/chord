@@ -10,7 +10,7 @@ work=$(mktemp -d)
 stage="$work/image"
 app="$stage/Chord.app"
 mkdir -p "$app/Contents/MacOS"
-install -m 755 "$binary" "$app/Contents/MacOS/chord"
+install -m 755 "$binary" "$app/Contents/MacOS/chord-client"
 install -m 755 packaging/macos-launcher "$app/Contents/MacOS/Chord"
 cp LICENSE assets/*-LICENSE.txt "$app/Contents/"
 cat > "$app/Contents/Info.plist" <<PLIST
@@ -30,7 +30,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 plutil -lint "$app/Contents/Info.plist"
-codesign --force --sign - "$app/Contents/MacOS/chord"
+codesign --force --sign - "$app/Contents/MacOS/chord-client"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
 "$app/Contents/MacOS/Chord" --demo --snapshot "$work/demo.txt"

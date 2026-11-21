@@ -9,10 +9,10 @@ version=${version#chord }
 work=$(mktemp -d)
 stage="$work/image"
 app="$stage/Chord.app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 install -m 755 "$binary" "$app/Contents/MacOS/chord-client"
 install -m 755 packaging/macos-launcher "$app/Contents/MacOS/Chord"
-cp LICENSE assets/*-LICENSE.txt "$app/Contents/"
+cp LICENSE assets/*-LICENSE.txt "$app/Contents/Resources/"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">

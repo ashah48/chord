@@ -11,7 +11,7 @@ fi
 bin="$PWD/.venv/bin"
 python3 -m venv .venv
 "$bin/python" -m pip install 'matrix-synapse==1.150.0'
-git submodule update --init vendor/pickle
+git submodule update --init vendor/pickle vendor/ai-bridge
 patch="$PWD/patches/pickle-local-history.patch"
 if ! git -C vendor/pickle apply --reverse --check "$patch"; then
     git -C vendor/pickle apply "$patch"

@@ -34,7 +34,9 @@ export async function macMessages(method, args, {
     try {
         db = new DatabaseSync(database, {readOnly: true, timeout: 1500});
     } catch {
-        throw new Error('Cannot read Messages. Grant Full Disk Access to the terminal running Chord, then restart it.');
+        const detail = 'Cannot read Messages. Grant Full Disk Access to the terminal running Chord, then restart it.';
+        if (method === 'GetStatus') return {map: false, connectivity_detail: detail};
+        throw new Error(detail);
     }
     try {
         if (method === 'GetStatus') {

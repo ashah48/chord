@@ -30,7 +30,7 @@ continuing. [Homebrew installation](https://brew.sh/)
 In Terminal, install the build dependencies, then clone and set up Chord.
 
 ```sh
-brew install node@24 python@3.13 go
+brew install node@24 python@3.13 go rust
 export PATH="$(brew --prefix node@24)/bin:$(brew --prefix python@3.13)/libexec/bin:$PATH"
 npm install -g pnpm@10.25.0
 git clone --branch v0.3.0-macos-local https://github.com/maxlang7/chord.git "$HOME/chord-macos"

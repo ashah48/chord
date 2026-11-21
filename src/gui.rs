@@ -173,9 +173,13 @@ impl Gui {
             if let Some(dir) = self.settings_path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_nanos();
-            let temporary = self.settings_path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let temporary =
+                self.settings_path
+                    .with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
             let mut file = opts.open(&temporary)?;
             file.write_all(value.to_string().as_bytes())?;
             file.sync_all()?;
@@ -1573,7 +1577,7 @@ impl Gui {
             .cloned()
             .unwrap_or(detail.message.clone());
         let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
-        let p = self.theme.palette();
+        let p = self.theme.palette(ctx.theme());
         let mut open = true;
         let mut picked = false;
         let below = detail.anchor.y + 360. <= ctx.content_rect().bottom();
@@ -1761,7 +1765,7 @@ impl Gui {
                         let button = paint_reaction(
                             emoji::button(ui, key, if mine { "you" } else { "" }),
                             mine,
-                            self.theme.palette(),
+                            self.theme.palette(ctx.theme()),
                         );
                         if ui.add(button).clicked() {
                             self.react(&chat, &message, key, mine);
@@ -1955,7 +1959,7 @@ impl Gui {
                             && (!self.app.editor.text.trim().is_empty()
                                 || self.app.pending_attachment.is_some())
                             && self.app.mode != Mode::Confirm;
-                        if ui
+                        let clicked = ui
                             .add_enabled(
                                 can_send,
                                 egui::Button::new(
@@ -1969,12 +1973,11 @@ impl Gui {
                                 .fill(p.accent)
                                 .corner_radius(7),
                             )
-                            .clicked()
-                            || (can_send && send_key)
+                            .clicked();
+                        if (clicked || (can_send && send_key))
+                            && let Some(id) = self.app.prepare_send()
                         {
-                            if let Some(id) = self.app.prepare_send() {
-                                self.scroll_to = Some(id);
-                            }
+                            self.scroll_to = Some(id);
                         }
                     });
                 });

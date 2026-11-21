@@ -178,3 +178,13 @@ test('group photos use at most three distinct humans and exclude phone conversat
  const phone=directory.enrichConversation({id:'phone',kind:'phone',source:'iphone',participants:keys,blue:{is_group:true}});
  assert.deepEqual(phone.avatarContacts,[]);
 });
+
+test('pins surface quiet conversations in Focus without enabling their badges',async()=>{
+ const book=memoryBook();
+ const chat={id:'matrix:!quiet',timestamp:new Date().toISOString(),unread:true,unreadCount:3};
+ await book.setPreference(chat.id,{priority:'quiet'});
+ const {items}=rankInbox([chat],book,{view:'focus',pins:[chat.id]});
+ assert.equal(items.length,1);
+ assert.equal(items[0].importance.rule,'quiet');
+ assert.equal(items[0].unread,false);
+});

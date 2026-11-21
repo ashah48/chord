@@ -15,6 +15,17 @@ static IMAGE_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new
 const MAX_IMAGES: usize = 96;
 const MAX_IMAGE_BYTES: usize = 48 * 1024 * 1024;
 const MAX_AVATARS: usize = 2048;
+const MAX_EMOJI: usize = 512;
+
+fn media_group(key: &str) -> usize {
+    if key.starts_with("avatar:") {
+        1
+    } else if key.starts_with("emoji:") {
+        2
+    } else {
+        0
+    }
+}
 
 pub enum Request {
     Image(Target),
@@ -142,7 +153,7 @@ impl Media {
                             data.image = image::DynamicImage::new_rgba8(0, 0);
                             // Avatars are only ever drawn from their texture, so keeping the
                             // original encoded bytes just wastes the shared byte budget.
-                            if key.starts_with("avatar:") {
+                            if media_group(&key) != 0 {
                                 data.bytes = Vec::new();
                             }
                             self.cache.insert(
@@ -183,30 +194,27 @@ impl Media {
     // do not compete with full-size images.
     fn evict(&mut self) {
         loop {
-            let (mut bytes, mut images, mut avatars) = (0usize, 0usize, 0usize);
-            for (k, v) in &self.cache {
-                if let Entry::Ready { data, .. } = v {
-                    if k.starts_with("avatar:") {
-                        avatars += 1;
-                    } else {
-                        images += 1;
-                        bytes += data.bytes.len();
-                    }
+            let mut bytes = 0;
+            let mut counts = [0; 3];
+            for (key, entry) in &self.cache {
+                if let Entry::Ready { data, .. } = entry {
+                    counts[media_group(key)] += 1;
+                    bytes += data.bytes.len();
                 }
             }
-            let evict_avatar = if images <= MAX_IMAGES && bytes <= MAX_IMAGE_BYTES {
-                if avatars <= MAX_AVATARS {
-                    return;
-                }
-                true
-            } else {
-                false
+            let over_limit = [
+                counts[0] > MAX_IMAGES || bytes > MAX_IMAGE_BYTES,
+                counts[1] > MAX_AVATARS,
+                counts[2] > MAX_EMOJI,
+            ];
+            let Some(group) = over_limit.iter().position(|over| *over) else {
+                return;
             };
             let oldest = self
                 .cache
                 .iter()
                 .filter_map(|(k, v)| match v {
-                    Entry::Ready { used, .. } if k.starts_with("avatar:") == evict_avatar => {
+                    Entry::Ready { used, .. } if media_group(k) == group => {
                         Some((k.clone(), *used))
                     }
                     _ => None,

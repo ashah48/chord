@@ -75,11 +75,12 @@ export class MatrixProvider{
    await Promise.all(pending.slice(i,i+4).map(async id=>{
     const room=this.chats.get(id),previous=room.lastActivity;
     const timeline=Date.parse(this.timelines.get(id)?.findLast(m=>!threadMessage(m))?.timestamp)||0;
-    let latest=Math.max(timeline,this.archive?.latestMessageAt?.('matrix:'+id)||0);
+    let latest=Math.max(timeline,this.observedActivity?.get(id)||0,this.archive?.latestMessageAt?.('matrix:'+id)||0);
     if(!latest){try{latest=await this.latestMessageOnServer(id)}catch{return}}
     const current=this.chats.get(id);
     if(this.closing||!current||current.lastActivity!==previous)return;
     this.chats.set(id,{...current,activityVersion:3,...(latest?{lastActivity:new Date(latest).toISOString()}:{})});
+    this.observedActivity?.delete(id);
     this.scheduleSave();
    }));
   }
@@ -147,6 +148,10 @@ export class MatrixProvider{
     participants={items,total,hasMore:total>items.length};
    }
    const threadOnly=events.some(threadEvent)&&!channelEvent;
+   if(old.activityVersion!==3&&channelEvent?.origin_server_ts){
+    const observed=this.observedActivity??=new Map();
+    observed.set(roomId,Math.max(observed.get(roomId)||0,channelEvent.origin_server_ts));
+   }
    const notes=room.unread_notifications;
    let rawHighlights=(notes||freshRoom)?(notes?.highlight_count||0):(old.rawHighlightCount||0),notificationCount=(notes||freshRoom)?(notes?.notification_count||0):(old.unreadCount||0);
    // A sync batch that is only thread replies must not raise the badge, even

@@ -26,3 +26,14 @@ test('custom emoji downloads reject non-images and unsafe ids before fetching',a
  const html=async()=>new Response('<html>',{status:200,headers:{'content-type':'text/html'}});
  await assert.rejects(downloadEmoji(account,'mxc://chord.local/abc',html),{status:415});
 });
+
+test('custom emoji stop reading when the streamed body crosses the byte limit',async()=>{
+ let canceled=false;
+ const body=new ReadableStream({
+  pull(controller){controller.enqueue(new Uint8Array(1024*1024))},
+  cancel(){canceled=true},
+ });
+ const fetcher=async()=>new Response(body,{headers:{'content-type':'image/png'}});
+ await assert.rejects(downloadEmoji(account,'mxc://chord.local/abc',fetcher),{status:413});
+ assert.equal(canceled,true);
+});

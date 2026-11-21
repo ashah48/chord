@@ -466,14 +466,29 @@ impl App {
     pub fn move_pin(&mut self, id: &str, position: Option<usize>) {
         let global = SOURCES[0].0;
         let tab = SOURCES[self.source].0;
-        let owns = |key: &str| self.pins.get(key).is_some_and(|pins| pins.iter().any(|pin| pin == id));
-        let owner = if !owns(tab) && owns(global) { global } else { tab };
-        let shown = self.visible().into_iter().filter(|c| c.id != id && self.is_pinned(&c.id))
-            .map(|c| c.id.clone()).collect::<Vec<_>>();
+        let owns = |key: &str| {
+            self.pins
+                .get(key)
+                .is_some_and(|pins| pins.iter().any(|pin| pin == id))
+        };
+        let owner = if !owns(tab) && owns(global) {
+            global
+        } else {
+            tab
+        };
+        let shown = self
+            .visible()
+            .into_iter()
+            .filter(|c| c.id != id && self.is_pinned(&c.id))
+            .map(|c| c.id.clone())
+            .collect::<Vec<_>>();
         let order = self.pins.entry(owner.into()).or_default();
         order.retain(|pin| pin != id);
         if let Some(position) = position {
-            let index = shown.iter().skip(position).find_map(|anchor| order.iter().position(|pin| pin == anchor))
+            let index = shown
+                .iter()
+                .skip(position)
+                .find_map(|anchor| order.iter().position(|pin| pin == anchor))
                 .unwrap_or(order.len());
             order.insert(index, id.into());
         }
@@ -741,7 +756,11 @@ impl App {
                 "all"
             };
             let unread = self.unread;
-            let pins = if view == "focus" { self.tab_pins() } else { Vec::new() };
+            let pins = if view == "focus" {
+                self.tab_pins()
+            } else {
+                Vec::new()
+            };
             let server = self.discord_scope.clone();
             let cursor = if append {
                 self.inbox_cursors
@@ -776,7 +795,7 @@ impl App {
                             unread,
                             cursor.as_deref(),
                             server.as_deref(),
-                        &pins,
+                            &pins,
                         )
                         .await;
                     let _ = tx.send(Response::Inbox(seq, result(r), append));
@@ -1076,18 +1095,17 @@ impl App {
         if self.editor.text.trim().is_empty() && self.pending_attachment.is_none() {
             return None;
         }
-        let Some(c) = self.active.clone() else {
-            return None;
-        };
+        let c = self.active.clone()?;
         if self.reply.is_some() && self.pending_attachment.is_some() && c.kind == "chat" {
             self.notice = "Send the text reply and attachment separately. This bridge cannot attach a native reply to media yet.".into();
             return None;
         }
         let mut body = json!({"text":self.editor.text});
         if c.kind == "email" {
-            let Some(m) = self.reply.clone().or_else(|| self.messages.last().cloned()) else {
-                return None;
-            };
+            let m = self
+                .reply
+                .clone()
+                .or_else(|| self.messages.last().cloned())?;
             body["to"] = json!(if m.is_sender {
                 m.to.clone()
             } else {
@@ -1132,6 +1150,7 @@ impl App {
             b["messageID"] = json!(id)
         }
         let shown = self.stage_outgoing(&c, &b);
+        self.drafts.remove(&c.id);
         self.editor = Editor::default();
         self.reply = None;
         self.edit_message = None;
@@ -1229,10 +1248,9 @@ impl App {
                     .messages
                     .iter_mut()
                     .find(|message| &message.id == edit_id)
+                    && let Some(previous) = &item.previous_text
                 {
-                    if let Some(previous) = &item.previous_text {
-                        message.text = previous.clone();
-                    }
+                    message.text = previous.clone();
                 }
             } else if let Some(local_id) = &item.local_message_id {
                 self.messages.retain(|message| &message.id != local_id);
@@ -1323,11 +1341,10 @@ impl App {
             let Some(local_id) = &item.local_message_id else {
                 continue;
             };
-            let server_hit = item.server_id.as_ref().is_some_and(|id| {
-                self.messages
-                    .iter()
-                    .any(|message| &message.id == id && message.text == item.text)
-            });
+            let server_hit = item
+                .server_id
+                .as_ref()
+                .is_some_and(|id| self.messages.iter().any(|message| &message.id == id));
             let text_hit = (item.accepted && item.server_id.is_none())
                 .then(|| {
                     self.messages.iter().find(|message| {
@@ -1668,7 +1685,6 @@ impl App {
                                 item.accepted = true;
                                 item.server_id = server_id;
                             }
-                            self.drafts.remove(&id);
                             if self.active.as_ref().is_some_and(|chat| chat.id == id) {
                                 self.load_messages(false);
                             }

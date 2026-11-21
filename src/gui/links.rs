@@ -1,6 +1,6 @@
 use crate::model::Emote;
-use std::collections::{HashMap, HashSet};
 use eframe::egui::{self};
+use std::collections::{HashMap, HashSet};
 
 fn ranges(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut links = Vec::new();
@@ -187,9 +187,10 @@ pub fn rich_text(
     emotes: &[Emote],
     mut texture: impl FnMut(&str) -> Option<egui::TextureHandle>,
 ) -> bool {
-    let images = emotes.iter().filter_map(|emote| {
-        texture(&emote.mxc).map(|image| (emote.name.as_str(), image))
-    }).collect::<HashMap<_, _>>();
+    let images = emotes
+        .iter()
+        .filter_map(|emote| texture(&emote.mxc).map(|image| (emote.name.as_str(), image)))
+        .collect::<HashMap<_, _>>();
     let ready = images.keys().copied().collect::<HashSet<_>>();
     let render = |ui: &mut egui::Ui, body: &str| paragraph(ui, &inline(body), &images, &ready);
     let blocks = blocks(text);
@@ -273,11 +274,18 @@ fn paragraph(
             job.append(" ", 0., pad);
             chars += span.text.chars().count() + 2;
         } else {
-            let bare = span.url.as_deref().is_some_and(|url| span.text == url || span.text.starts_with("www."));
+            let bare = span
+                .url
+                .as_deref()
+                .is_some_and(|url| span.text == url || span.text.starts_with("www."));
             let format = if span.url.is_some() {
                 egui::TextFormat {
                     color: link,
-                    underline: if bare { egui::Stroke::new(1.0_f32, link) } else { egui::Stroke::NONE },
+                    underline: if bare {
+                        egui::Stroke::new(1.0_f32, link)
+                    } else {
+                        egui::Stroke::NONE
+                    },
                     ..normal.clone()
                 }
             } else {
@@ -286,10 +294,14 @@ fn paragraph(
             if bare {
                 job.append(&span.text, 0., format);
             } else {
-                slots.extend(super::emoji::custom_spans(&span.text, ready).into_iter().filter_map(|(range, name)| {
-                    let image = images.get(name)?.clone();
-                    Some((start + span.text[..range.start].chars().count(), image))
-                }));
+                slots.extend(
+                    super::emoji::custom_spans(&span.text, ready)
+                        .into_iter()
+                        .filter_map(|(range, name)| {
+                            let image = images.get(name)?.clone();
+                            Some((start + span.text[..range.start].chars().count(), image))
+                        }),
+                );
                 super::emoji::append_ready(&mut job, &span.text, format, ready);
             }
             chars += span.text.chars().count();
@@ -438,7 +450,10 @@ mod tests {
     }
     #[test]
     fn inline_markup_falls_back_to_text_when_malformed() {
-        assert_eq!(inline("<https://example.org|Two words>")[0].text, "Two words");
+        assert_eq!(
+            inline("<https://example.org|Two words>")[0].text,
+            "Two words"
+        );
         assert_eq!(
             inline("`code` and <not a link>"),
             vec![

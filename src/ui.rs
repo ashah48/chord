@@ -616,7 +616,7 @@ fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
         let self_id = app.status["userID"].as_str().unwrap_or("");
         for r in &m.reactions {
             let key = r["reactionKey"].as_str().unwrap_or("?").to_owned();
-            let label = reaction_label(&r);
+            let label = reaction_label(r);
             let mine = crate::app::reaction_is_users(r, &key, self_id);
             let entry = reactions.entry(key.clone()).or_insert((label, 0, false));
             if mine {

@@ -12,7 +12,19 @@ export async function downloadEmoji(account,mxc,fetcher=fetch){
  if(!response.ok)throw Object.assign(new Error('Custom emoji unavailable'),{status:response.status||502});
  const mimeType=(response.headers.get('content-type')||'').split(';')[0].trim().toLowerCase();
  if(!mimeType.startsWith('image/'))throw Object.assign(new Error('Custom emoji is not an image'),{status:415});
- const bytes=Buffer.from(await response.arrayBuffer());
- if(!bytes.length||bytes.length>MAX_BYTES)throw Object.assign(new Error('Custom emoji is too large'),{status:413});
+ const rejectSize=()=>Object.assign(new Error('Custom emoji is empty or exceeds 2 MB'),{status:413});
+ if(!response.body)throw rejectSize();
+ const reader=response.body.getReader(),chunks=[];
+ let size=0;
+ try{
+  while(true){
+   const {value,done}=await reader.read();if(done)break;
+   size+=value.byteLength;
+   if(size>MAX_BYTES)throw rejectSize();
+   chunks.push(value);
+  }
+ }finally{await reader.cancel().catch(()=>{})}
+ if(!size)throw rejectSize();
+ const bytes=Buffer.concat(chunks,size);
  return {data:bytes.toString('base64url'),mimeType,size:bytes.length};
 }

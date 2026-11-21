@@ -1155,7 +1155,7 @@ impl Gui {
                                     );
                                 }
                                 if !m.text.is_empty() {
-                                    thread_clicked |= links::text(ui, &m.text);
+                                    thread_clicked |= links::message(ui, &m.text);
                                 }
                                 if has_thread {
                                     let count = m.reply_count.max(

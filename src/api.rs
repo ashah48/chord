@@ -71,6 +71,7 @@ impl Api {
     pub fn conversation(id: &str, action: &str) -> String {
         format!("/api/conversations/{}/{}", urlencoding::encode(id), action)
     }
+    #[allow(clippy::too_many_arguments)]
     pub async fn inbox(
         &self,
         source: &str,
@@ -79,6 +80,7 @@ impl Api {
         unread: bool,
         cursor: Option<&str>,
         server: Option<&str>,
+        pins: &[String],
     ) -> Result<Value> {
         let mut route = format!(
             "/api/inbox?source={}&view={}&query={}&unread={}",
@@ -92,6 +94,9 @@ impl Api {
         }
         if let Some(server) = server {
             route.push_str(&format!("&server={}", urlencoding::encode(server)));
+        }
+        for id in pins {
+            route.push_str(&format!("&pin={}", urlencoding::encode(id)));
         }
         self.get(&route).await
     }

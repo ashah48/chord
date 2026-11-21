@@ -256,6 +256,7 @@ async fn call(api: &Api, name: &str, mut args: Value) -> Result<Value> {
                 args["unread"].as_bool().unwrap_or(false),
                 args["cursor"].as_str(),
                 args["server"].as_str(),
+                &[],
             )
             .await
         }

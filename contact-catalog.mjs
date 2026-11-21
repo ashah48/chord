@@ -4,7 +4,7 @@ import path from 'node:path';
 // Read bridge-owned databases through read-only handles. Select only names,
 // identifiers, and activity counts; authentication columns are never read.
 export function readContactCatalog(dataDir, owner='@max:chord.local') {
- const identities=[],servers=[],rooms=new Map(),selfIds=new Set([owner]);
+ const identities=[],servers=[],rooms=new Map(),selfIds=new Set([owner]),slackEmoji=new Map();
  const errors=[];
  for(const network of ['slack','discord','whatsapp']){
   let db;
@@ -23,6 +23,14 @@ export function readContactCatalog(dataDir, owner='@max:chord.local') {
     for(const p of query('SELECT id,name,is_bot,identifiers FROM ghost')){
      let aliases=[];try{aliases=JSON.parse(p.identifiers)||[]}catch{}
      identities.push({key:`@${network}_${p.id}:chord.local`,source:network,name:p.name,rank:network==='slack'?80:50,isBot:!!p.is_bot,label:workspaces.get(p.id.split('-')[0].toLowerCase()),aliases:aliases.filter(x=>typeof x==='string')});
+    }
+    if(network==='slack'){
+     // A missing emoji table is an older bridge database. Names and rooms still load.
+     try{for(const e of query('SELECT team_id,emoji_id,image_mxc FROM emoji')){
+      if(typeof e.image_mxc!=='string'||!e.image_mxc.startsWith('mxc://')||!e.team_id||!e.emoji_id)continue;
+      let bucket=slackEmoji.get(e.team_id);if(!bucket){bucket=new Map();slackEmoji.set(e.team_id,bucket)}
+      bucket.set(e.emoji_id,e.image_mxc);
+     }}catch{}
     }
     for(const r of query("SELECT id,receiver,mxid,name,room_type,other_user_id FROM portal WHERE mxid IS NOT NULL AND mxid!='' AND room_type!='space'")){
      const team=String(r.id||'').split('-')[0];
@@ -71,5 +79,5 @@ export function readContactCatalog(dataDir, owner='@max:chord.local') {
    }
   }catch(e){errors.push({source:network,error:e.code||e.name})}finally{db?.close()}
  }
- return {identities,servers,rooms,selfIds,errors};
+ return {identities,servers,rooms,selfIds,errors,slackEmoji};
 }

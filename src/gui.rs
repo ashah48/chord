@@ -6,7 +6,7 @@ mod theme;
 
 use crate::{
     api::Api,
-    app::{App, Mode, REACTIONS},
+    app::{App, Mode, REACTIONS, keeps_failure, reaction_is_users, user_has_reaction},
     images::Target,
     model::{Conversation, Message, day_label, one_line, source_label, time_label},
 };
@@ -32,14 +32,50 @@ pub struct Gui {
     search_focus: bool,
     message_search: bool,
     reaction_target: Option<(Conversation, Message)>,
+    reaction_detail: Option<ReactionDetail>,
     expanded_thread: Option<(String, String)>,
     search_busy: bool,
     search_seq: u64,
     search_results: Value,
+    logo: Option<egui::TextureHandle>,
 }
 impl Gui {
     pub fn new(mut app: App, ctx: &egui::Context) -> Self {
         app.native_ui = true;
+        let settings_path = settings_path();
+        let settings: Value = std::fs::read(&settings_path)
+            .ok()
+            .and_then(|s| serde_json::from_slice(&s).ok())
+            .unwrap_or(Value::Null);
+        app.pins = serde_json::from_value(settings["pins"].clone()).unwrap_or_default();
+        let theme = Theme::from_setting(settings["theme"].as_str());
+        theme.apply(ctx);
+        Self::apply_fonts(ctx, theme);
+        Self {
+            app,
+            media: Media::default(),
+            theme,
+            search: String::new(),
+            gallery: vec![],
+            gallery_index: 0,
+            file_busy: false,
+            profile_name: String::new(),
+            profile_id: String::new(),
+            settings_path,
+            scroll_to: None,
+            unread_marker: None,
+            search_focus: false,
+            message_search: false,
+            reaction_target: None,
+            reaction_detail: None,
+            expanded_thread: None,
+            search_busy: false,
+            search_seq: 0,
+            search_results: Value::Null,
+            logo: None,
+        }
+    }
+    fn apply_fonts(ctx: &egui::Context, theme: Theme) {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "emoji".into(),
@@ -57,38 +93,60 @@ impl Gui {
                 .or_default()
                 .push("emoji".into());
         }
+        if cfg!(target_os = "macos") && theme == Theme::MacOs {
+            for (name, path, family) in [
+                (
+                    "sf",
+                    "/System/Library/Fonts/SFNS.ttf",
+                    egui::FontFamily::Proportional,
+                ),
+                (
+                    "sf-mono",
+                    "/System/Library/Fonts/SFNSMono.ttf",
+                    egui::FontFamily::Monospace,
+                ),
+            ] {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        name.into(),
+                        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                    );
+                    fonts
+                        .families
+                        .entry(family)
+                        .or_default()
+                        .insert(0, name.into());
+                }
+            }
+        }
         ctx.set_fonts(fonts);
-        let settings_path = settings_path();
-        let settings: Value = std::fs::read(&settings_path)
-            .ok()
-            .and_then(|s| serde_json::from_slice(&s).ok())
-            .unwrap_or(Value::Null);
-        let theme = match settings["theme"].as_str() {
-            Some("light") => Theme::Light,
-            Some("dark") => Theme::Dark,
-            _ => Theme::Gruvbox,
-        };
-        theme.apply(ctx);
-        Self {
-            app,
-            media: Media::default(),
-            theme,
-            search: String::new(),
-            gallery: vec![],
-            gallery_index: 0,
-            file_busy: false,
-            profile_name: String::new(),
-            profile_id: String::new(),
-            settings_path,
-            scroll_to: None,
-            unread_marker: None,
-            search_focus: false,
-            message_search: false,
-            reaction_target: None,
-            expanded_thread: None,
-            search_busy: false,
-            search_seq: 0,
-            search_results: Value::Null,
+    }
+    fn show_logo(&mut self, ui: &mut egui::Ui, size: f32, fallback: RichText) {
+        if self.theme == Theme::MacOs
+            && self.logo.is_none()
+            && let Ok(icon) = image::load_from_memory(include_bytes!("../assets/macos/icon.png"))
+        {
+            let side = icon.width() * 824 / 1024;
+            let margin = (icon.width() - side) / 2;
+            let icon = icon
+                .crop_imm(margin, margin, side, side)
+                .thumbnail(192, 192)
+                .into_rgba8();
+            self.logo = Some(ui.ctx().load_texture(
+                "chord-logo",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width() as usize, icon.height() as usize],
+                    icon.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        if self.theme == Theme::MacOs
+            && let Some(logo) = &self.logo
+        {
+            ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(size)));
+        } else {
+            ui.label(fallback);
         }
     }
     fn key(&mut self, code: crossterm::event::KeyCode) {
@@ -99,11 +157,14 @@ impl Gui {
     }
     fn save_theme(&mut self, ctx: &egui::Context) {
         self.theme.apply(ctx);
-        let value = json!({"theme":match self.theme{Theme::Gruvbox=>"gruvbox",Theme::Dark=>"dark",Theme::Light=>"light"}});
+        self.save_settings();
+    }
+    fn save_settings(&mut self) {
+        let value = json!({"theme": self.theme.setting(), "pins": self.app.pins});
         let result = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -112,11 +173,21 @@ impl Gui {
             if let Some(dir) = self.settings_path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            opts.open(&self.settings_path)?
-                .write_all(value.to_string().as_bytes())
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let temporary =
+                self.settings_path
+                    .with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+            let mut file = opts.open(&temporary)?;
+            file.write_all(value.to_string().as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(temporary, &self.settings_path)
         })();
         if let Err(e) = result {
-            self.app.notice = format!("Could not save theme: {e}");
+            self.app.notice = format!("Could not save settings: {e}");
         }
     }
     fn switch_source(&mut self, index: usize) {
@@ -132,6 +203,7 @@ impl Gui {
     }
     fn choose_chat(&mut self, chat: Conversation) {
         self.expanded_thread = None;
+        self.reaction_detail = None;
         self.app.mode = Mode::Browse;
         self.app.open(chat);
         self.scroll_to = None;
@@ -149,7 +221,11 @@ impl Gui {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("c·").size(30.).color(p.accent).strong());
+                    self.show_logo(
+                        ui,
+                        30.,
+                        RichText::new("c·").size(30.).color(p.accent).strong(),
+                    );
                     if !compact {
                         ui.label(RichText::new("chord").size(23.).strong());
                     }
@@ -276,7 +352,7 @@ impl Gui {
                 ui.menu_button("⚙", |ui| {
                     ui.label(RichText::new("Appearance").small().color(p.muted));
                     let old = self.theme;
-                    for theme in [Theme::Gruvbox, Theme::Dark, Theme::Light] {
+                    for theme in Theme::OPTIONS {
                         if ui
                             .selectable_value(&mut self.theme, theme, theme.name())
                             .clicked()
@@ -285,6 +361,11 @@ impl Gui {
                         }
                     }
                     if old != self.theme {
+                        if cfg!(target_os = "macos")
+                            && (old == Theme::MacOs || self.theme == Theme::MacOs)
+                        {
+                            Self::apply_fonts(ui.ctx(), self.theme);
+                        }
                         self.save_theme(ui.ctx());
                     }
                     ui.separator();
@@ -461,8 +542,25 @@ impl Gui {
                             if self.app.discord_scope.is_some() { self.app.server_focus = false; } else { self.app.focus_view = false; }
                             self.app.refresh(false);
                         }
+                        let pinned = self.app.pinned_count();
+                        let mut rows = Vec::with_capacity(chats.len());
+                        let mut divider = None;
+                        let mut drag = None;
                         for (chat_index, chat) in chats.iter().enumerate() {
+                            if pinned > 0 && chat_index == 0 {
+                                ui.label(RichText::new("Pinned").small().color(p.muted));
+                            }
+                            if pinned > 0 && chat_index == pinned {
+                                divider = Some(ui.separator().rect.center().y);
+                            }
                             let response = self.conversation_row(ui, chat, p);
+                            rows.push(response.rect);
+                            if response.dragged() || response.drag_stopped() {
+                                drag = ui
+                                    .ctx()
+                                    .input(|i| i.pointer.latest_pos())
+                                    .map(|pos| (chat.id.clone(), pos, response.drag_stopped()));
+                            }
                             let pointer_on_row = response.interact_pointer_pos().is_some_and(|pos| {
                                 ui.ctx().layer_id_at(pos) == Some(response.layer_id)
                             });
@@ -471,6 +569,12 @@ impl Gui {
                                 self.choose_chat(chat.clone());
                                 ctx.request_repaint();
                             }
+                        }
+                        if pinned > 0 && pinned == chats.len() {
+                            divider = Some(ui.separator().rect.center().y);
+                        }
+                        if let Some((id, pos, dropped)) = drag {
+                            self.drag_chat(ui, &chats, &rows, divider, pinned, &id, pos, dropped, p);
                         }
                         if !self.app.inbox_cursors.is_null()
                             && self
@@ -484,6 +588,79 @@ impl Gui {
                         }
                     });
             });
+    }
+    // Dropping above the pinned divider pins the chat at that spot; below it unpins.
+    #[allow(clippy::too_many_arguments)]
+    fn drag_chat(
+        &mut self,
+        ui: &mut egui::Ui,
+        chats: &[Conversation],
+        rows: &[egui::Rect],
+        divider: Option<f32>,
+        pinned: usize,
+        id: &str,
+        pos: egui::Pos2,
+        dropped: bool,
+        p: Palette,
+    ) {
+        let Some(first) = rows.first() else {
+            return;
+        };
+        let gap = rows.iter().filter(|r| r.center().y < pos.y).count();
+        let pin = gap < pinned || (gap == pinned && divider.is_none_or(|y| pos.y < y));
+        let position = chats[..gap]
+            .iter()
+            .filter(|c| c.id != id && self.app.is_pinned(&c.id))
+            .count();
+        let was_pinned = self.app.is_pinned(id);
+        if dropped {
+            if !ui.clip_rect().contains(pos) {
+                return;
+            }
+            if pin {
+                self.pin_chat(id, position);
+            } else if was_pinned {
+                self.app.move_pin(id, None);
+                self.save_settings();
+                self.app.refresh(false);
+            }
+            return;
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let clip = ui.clip_rect();
+        if pos.y < clip.top() + 40. {
+            ui.scroll_with_delta(egui::vec2(0., 10.));
+        } else if pos.y > clip.bottom() - 40. {
+            ui.scroll_with_delta(egui::vec2(0., -10.));
+        }
+        if pin {
+            let y = if gap == 0 {
+                first.top()
+            } else {
+                rows[gap - 1].bottom()
+            };
+            ui.painter()
+                .hline(first.x_range(), y, egui::Stroke::new(2.5_f32, p.accent));
+        }
+        let title = chats
+            .iter()
+            .find(|c| c.id == id)
+            .map_or("", |c| c.title.as_str());
+        let label = match (pin, was_pinned) {
+            (true, _) => format!("Pin {title}"),
+            (false, true) => format!("Unpin {title}"),
+            (false, false) => title.to_owned(),
+        };
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("chat-drag"),
+        ));
+        let galley = painter.layout_no_wrap(label, egui::FontId::proportional(14.), p.text);
+        let rect = egui::Rect::from_min_size(pos + egui::vec2(14., -10.), galley.size())
+            .expand2(egui::vec2(10., 6.));
+        painter.rect_filled(rect, 6., p.raised);
+        painter.galley(rect.min + egui::vec2(10., 6.), galley, p.text);
+        ui.ctx().request_repaint();
     }
     fn conversation_row(
         &mut self,
@@ -500,8 +677,10 @@ impl Gui {
         chat: &Conversation,
         p: Palette,
     ) -> egui::Response {
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 90.), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 90.),
+            egui::Sense::click_and_drag(),
+        );
         if !ui.is_rect_visible(rect) {
             return response;
         }
@@ -517,7 +696,7 @@ impl Gui {
                 rect.shrink2(egui::vec2(0., 3.)),
                 8.,
                 if active {
-                    p.raised
+                    p.select
                 } else {
                     theme::tint(p.panel, p.raised, 0.45)
                 },
@@ -586,10 +765,11 @@ impl Gui {
             }
         }
         // Account color rings the profile image. A group rings each face.
-        let account_ring = egui::Stroke::new(3.0_f32, color);
+        // Sit inside the photo so the ring does not crowd the unread dot.
+        let account_ring = egui::Stroke::new(2.0_f32, color);
         if !multi {
             ui.painter()
-                .circle_stroke(avatar_rect.center(), 24., account_ring);
+                .circle_stroke(avatar_rect.center(), 19., account_ring);
         } else {
             for (index, _) in members.iter().enumerate() {
                 let offset = [
@@ -599,7 +779,7 @@ impl Gui {
                 ][index];
                 let cell = egui::Rect::from_min_size(avatar_rect.min + offset, Vec2::splat(25.));
                 ui.painter()
-                    .circle_stroke(cell.center(), 14.5, account_ring);
+                    .circle_stroke(cell.center(), 10.5, account_ring);
             }
         }
         let badge = egui::Rect::from_center_size(
@@ -695,8 +875,26 @@ impl Gui {
             response.on_hover_text(format!("{}\n{}", chat.title, context))
         }
     }
+    fn pin_chat(&mut self, id: &str, position: usize) {
+        self.app.move_pin(id, Some(position));
+        self.save_settings();
+        self.app.refresh(false);
+    }
     fn channel_rules(&mut self, ui: &mut egui::Ui, chat: &Conversation) {
         let id = chat.id.clone();
+        let pinned = self.app.is_pinned(&id);
+        if ui.button(if pinned { "Unpin" } else { "Pin" }).clicked() {
+            if pinned {
+                self.app.move_pin(&id, None);
+                self.save_settings();
+                self.app.refresh(false);
+            } else {
+                let position = self.app.pinned_count();
+                self.pin_chat(&id, position);
+            }
+            ui.close();
+        }
+        ui.separator();
         let priority = if chat.local_priority.is_empty() {
             "auto"
         } else {
@@ -801,7 +999,7 @@ impl Gui {
                 let Some(chat) = self.app.active.clone() else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() * 0.32);
-                        ui.label(RichText::new("c·").size(58.).color(p.accent));
+                        self.show_logo(ui, 64., RichText::new("c·").size(58.).color(p.accent));
                         ui.heading("Your conversations");
                         ui.label(
                             RichText::new("Slack, Discord, WhatsApp, iPhone, and email")
@@ -1019,6 +1217,7 @@ impl Gui {
                     .any(|reply| reply.thread_root_id.as_ref() == Some(&m.id)));
         let mut thread_clicked = false;
         let reaction_hovered = std::cell::Cell::new(false);
+        let reaction_clicked = std::cell::Cell::new(false);
         let response = ui
             .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
                 egui::Frame::new()
@@ -1158,7 +1357,26 @@ impl Gui {
                                     );
                                 }
                                 if !m.text.is_empty() {
-                                    thread_clicked |= links::text(ui, &m.text);
+                                    for emote in &m.emotes {
+                                        if emote.mxc.starts_with("mxc://") {
+                                            self.media.request(
+                                                Request::Emoji(emote.mxc.clone()),
+                                                self.app.api.clone(),
+                                                ui.ctx(),
+                                            );
+                                        }
+                                    }
+                                    thread_clicked |=
+                                        links::rich_text(ui, &m.text, &m.emotes, |mxc| {
+                                            self.media.texture(&format!("emoji:{mxc}"))
+                                        });
+                                }
+                                if let Some(error) = &m.send_error {
+                                    ui.label(
+                                        RichText::new(format!("Not sent · {error}"))
+                                            .small()
+                                            .color(p.accent),
+                                    );
                                 }
                                 if has_thread {
                                     let count = m.reply_count.max(
@@ -1246,34 +1464,39 @@ impl Gui {
                                         }
                                     }
                                 }
-                                let reactions = reaction_summaries(
+                                let reactions = reaction_groups(
                                     &m.reactions,
                                     self.app.status["userID"].as_str().unwrap_or(""),
                                 );
                                 if !reactions.is_empty() {
                                     ui.horizontal_wrapped(|ui| {
-                                        for (key, summary) in reactions {
-                                            let response = ui
-                                                .add_enabled(
-                                                    chat.can_react,
-                                                    emoji::button(
-                                                        ui,
-                                                        &key,
-                                                        &summary.count.to_string(),
-                                                    )
-                                                    .fill(if summary.mine {
-                                                        p.own
-                                                    } else {
-                                                        p.raised
-                                                    })
-                                                    .corner_radius(10),
-                                                )
-                                                .on_hover_text(reaction_tooltip(&summary));
+                                        for summary in reactions {
+                                            let response = ui.add(paint_reaction(
+                                                self.reaction_button(
+                                                    ui,
+                                                    &summary.key,
+                                                    summary.image.as_deref(),
+                                                    summary.shortcode.as_deref(),
+                                                    &reaction_count_label(
+                                                        summary.count,
+                                                        summary.mine,
+                                                    ),
+                                                ),
+                                                summary.mine,
+                                                p,
+                                            ));
                                             if response.hovered() {
                                                 reaction_hovered.set(true);
                                             }
                                             if response.clicked() {
-                                                self.react(chat, m, &key, summary.mine);
+                                                reaction_clicked.set(true);
+                                                self.reaction_target = None;
+                                                self.reaction_detail = Some(ReactionDetail {
+                                                    chat: chat.clone(),
+                                                    message: m.clone(),
+                                                    anchor: response.rect.center_bottom()
+                                                        + egui::vec2(0., 6.),
+                                                });
                                             }
                                         }
                                     });
@@ -1290,7 +1513,10 @@ impl Gui {
                     .clone()
                     .on_hover_text("Click to expand or collapse replies");
             }
-            if (response.clicked() || thread_clicked) && !response.double_clicked() {
+            if !reaction_clicked.get()
+                && (response.clicked() || thread_clicked)
+                && !response.double_clicked()
+            {
                 let target = (chat.id.clone(), m.id.clone());
                 if self.expanded_thread.as_ref() == Some(&target) {
                     self.expanded_thread = None;
@@ -1329,11 +1555,184 @@ impl Gui {
         if !chat.can_react {
             return;
         }
-        self.app.operation(
-            "Reaction queued",
-            Api::conversation(&chat.id, "reaction"),
-            json!({"messageID":m.id,"reactionKey":key,"remove":remove}),
-        );
+        self.app.queue_reaction(&chat.id, &m.id, key, !remove);
+    }
+    fn show_reaction_detail(&mut self, ctx: &egui::Context) {
+        let Some(detail) = self.reaction_detail.clone() else {
+            return;
+        };
+        if self.app.active.as_ref().map(|chat| chat.id.as_str()) != Some(detail.chat.id.as_str()) {
+            self.reaction_detail = None;
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.reaction_detail = None;
+            return;
+        }
+        let message = self
+            .app
+            .messages
+            .iter()
+            .find(|item| item.id == detail.message.id)
+            .cloned()
+            .unwrap_or(detail.message.clone());
+        let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
+        let p = self.theme.palette(ctx.theme());
+        let mut open = true;
+        let mut picked = false;
+        let below = detail.anchor.y + 360. <= ctx.content_rect().bottom();
+        let shown = egui::Window::new("Reactions")
+            .id(egui::Id::new(("reaction_detail", message.id.clone())))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.)
+            .pivot(if below {
+                egui::Align2::LEFT_TOP
+            } else {
+                egui::Align2::LEFT_BOTTOM
+            })
+            .fixed_pos(detail.anchor)
+            .show(ctx, |ui| {
+                ui.set_min_width(280.);
+                ui.label(RichText::new("Quick").small().color(p.muted));
+                let groups = reaction_groups(&message.reactions, &self_id);
+                let mut keys = Vec::new();
+                for group in groups.iter().take(12) {
+                    keys.push((
+                        group.key.clone(),
+                        group.image.clone(),
+                        group.shortcode.clone(),
+                    ));
+                }
+                for key in QUICK_REACTIONS {
+                    if !keys.iter().any(|(known, _, _)| known == key) {
+                        keys.push(((*key).to_owned(), None, None));
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for (key, image, shortcode) in &keys {
+                        let mine = message
+                            .reactions
+                            .iter()
+                            .any(|reaction| reaction_is_users(reaction, key, &self_id));
+                        let button = paint_reaction(
+                            self.reaction_button(
+                                ui,
+                                key,
+                                image.as_deref(),
+                                shortcode.as_deref(),
+                                if mine { "you" } else { "" },
+                            ),
+                            mine,
+                            p,
+                        );
+                        if ui.add_enabled(detail.chat.can_react, button).clicked() {
+                            self.react(&detail.chat, &message, key, mine);
+                            picked = true;
+                        }
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("Who reacted").small().color(p.muted));
+                egui::ScrollArea::vertical()
+                    .max_height(340.)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_max_width(300.);
+                        if groups.is_empty() {
+                            ui.label(RichText::new("No reactions yet").color(p.muted));
+                        }
+                        for group in &groups {
+                            ui.add_space(6.);
+                            ui.horizontal(|ui| {
+                                let _ = ui.add(paint_reaction(
+                                    self.reaction_button(
+                                        ui,
+                                        &group.key,
+                                        group.image.as_deref(),
+                                        group.shortcode.as_deref(),
+                                        &reaction_count_label(group.count, group.mine),
+                                    ),
+                                    group.mine,
+                                    p,
+                                ));
+                                if let Some(name) = group
+                                    .shortcode
+                                    .as_deref()
+                                    .map(emoji_name)
+                                    .filter(|name| !name.is_empty())
+                                {
+                                    ui.label(RichText::new(name).color(p.muted).size(12.));
+                                }
+                            });
+                            for name in &group.names {
+                                let you = name == "You";
+                                let mut text = RichText::new(name);
+                                if you {
+                                    text = text.strong().color(p.accent);
+                                }
+                                ui.add(egui::Label::new(text).truncate());
+                            }
+                            if group.unnamed > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} unnamed {}",
+                                        group.unnamed,
+                                        if group.unnamed == 1 {
+                                            "person"
+                                        } else {
+                                            "people"
+                                        }
+                                    ))
+                                    .small()
+                                    .color(p.muted),
+                                );
+                            }
+                        }
+                    });
+            });
+        if shown.is_some_and(|shown| shown.response.clicked_elsewhere()) {
+            open = false;
+        }
+        if !open || picked {
+            self.reaction_detail = None;
+        }
+    }
+    fn reaction_button(
+        &mut self,
+        ui: &egui::Ui,
+        key: &str,
+        image: Option<&str>,
+        shortcode: Option<&str>,
+        label: &str,
+    ) -> egui::Button<'static> {
+        let mxc = image
+            .filter(|value| value.starts_with("mxc://"))
+            .or_else(|| key.starts_with("mxc://").then_some(key));
+        if let Some(mxc) = mxc {
+            let cache_key = format!("emoji:{mxc}");
+            self.media.request(
+                Request::Emoji(mxc.to_owned()),
+                self.app.api.clone(),
+                ui.ctx(),
+            );
+            if let Some(texture) = self.media.texture(&cache_key) {
+                let image = egui::Image::new((texture.id(), egui::vec2(22., 22.)));
+                return egui::Button::image_and_text(image, label.to_owned());
+            }
+            let name = shortcode
+                .map(emoji_name)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("emoji");
+            let text = if label.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name} {label}")
+            };
+            return egui::Button::new(text);
+        }
+        emoji::button(ui, key, label)
     }
     fn reaction_picker(&mut self, ctx: &egui::Context) {
         let Some((chat, message)) = self.reaction_target.clone() else {
@@ -1355,15 +1754,20 @@ impl Gui {
                 ui.label(RichText::new(&chat.title).strong());
                 ui.label(&message.sender_name);
                 ui.add(egui::Label::new(one_line(&message.text)).truncate());
-                ui.label("Choose an emoji. Select your existing reaction to remove it.");
+                ui.label("Yours are marked you. Select one again to remove it.");
+                let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
                 ui.horizontal_wrapped(|ui| {
                     for key in REACTIONS {
-                        let mine = message.reactions.iter().any(|r| {
-                            r["reactionKey"] == *key
-                                && r["participantID"].is_string()
-                                && r["participantID"] == self.app.status["userID"]
-                        });
-                        if ui.add(emoji::button(ui, key, "").selected(mine)).clicked() {
+                        let mine = message
+                            .reactions
+                            .iter()
+                            .any(|reaction| reaction_is_users(reaction, key, &self_id));
+                        let button = paint_reaction(
+                            emoji::button(ui, key, if mine { "you" } else { "" }),
+                            mine,
+                            self.theme.palette(ctx.theme()),
+                        );
+                        if ui.add(button).clicked() {
                             self.react(&chat, &message, key, mine);
                             picked = true;
                         }
@@ -1377,10 +1781,17 @@ impl Gui {
     fn reaction_menu(&mut self, ui: &mut egui::Ui, chat: &Conversation, m: &Message, p: Palette) {
         ui.menu_button(RichText::new("☺").color(p.muted), |ui| {
             ui.set_max_width(260.);
+            let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
             ui.horizontal_wrapped(|ui| {
                 for key in REACTIONS {
-                    if ui.add(emoji::button(ui, key, "")).clicked() {
-                        self.react(chat, m, key, false);
+                    let mine = user_has_reaction(&m.reactions, key, &self_id);
+                    let button = paint_reaction(
+                        emoji::button(ui, key, if mine { "you" } else { "" }),
+                        mine,
+                        p,
+                    );
+                    if ui.add(button).clicked() {
+                        self.react(chat, m, key, mine);
                         ui.close();
                     }
                 }
@@ -1476,7 +1887,7 @@ impl Gui {
                 }
             });
         }
-        let enabled = chat.can_send && !self.file_busy && !self.app.send_busy;
+        let enabled = chat.can_send && !self.file_busy;
         egui::Frame::new()
             .fill(p.panel)
             .stroke(egui::Stroke::new(1.0_f32, p.line))
@@ -1548,7 +1959,7 @@ impl Gui {
                             && (!self.app.editor.text.trim().is_empty()
                                 || self.app.pending_attachment.is_some())
                             && self.app.mode != Mode::Confirm;
-                        if ui
+                        let clicked = ui
                             .add_enabled(
                                 can_send,
                                 egui::Button::new(
@@ -1562,10 +1973,11 @@ impl Gui {
                                 .fill(p.accent)
                                 .corner_radius(7),
                             )
-                            .clicked()
-                            || (can_send && send_key)
+                            .clicked();
+                        if (clicked || (can_send && send_key))
+                            && let Some(id) = self.app.prepare_send()
                         {
-                            self.app.prepare_send();
+                            self.scroll_to = Some(id);
                         }
                     });
                 });
@@ -2250,6 +2662,7 @@ impl Gui {
 impl eframe::App for Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.reaction_picker(ctx);
+        self.show_reaction_detail(ctx);
         self.app.poll();
         if self.gallery.is_empty()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -2305,7 +2718,7 @@ impl eframe::App for Gui {
         {
             self.app.upload(path);
         }
-        let p = self.theme.palette();
+        let p = self.theme.palette(ctx.theme());
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
@@ -2315,8 +2728,14 @@ impl eframe::App for Gui {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::Label::new(RichText::new(&self.app.notice).size(11.).color(p.muted))
-                            .truncate(),
+                        egui::Label::new(RichText::new(&self.app.notice).size(11.).color(
+                            if keeps_failure(&self.app.notice) {
+                                p.accent
+                            } else {
+                                p.muted
+                            },
+                        ))
+                        .truncate(),
                     );
                     if !self.app.errors.is_empty()
                         && ui
@@ -2354,62 +2773,122 @@ impl eframe::App for Gui {
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
-#[derive(Default)]
-struct ReactionSummary {
+#[derive(Clone)]
+struct ReactionDetail {
+    chat: Conversation,
+    message: Message,
+    anchor: egui::Pos2,
+}
+struct ReactionGroup {
+    key: String,
+    image: Option<String>,
+    shortcode: Option<String>,
     count: usize,
     mine: bool,
     names: Vec<String>,
+    unnamed: usize,
+}
+const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🎉"];
+
+fn emoji_name(shortcode: &str) -> &str {
+    shortcode.trim().trim_matches(':')
 }
 
-fn reaction_summaries(reactions: &[Value], self_id: &str) -> BTreeMap<String, ReactionSummary> {
-    let mut grouped = BTreeMap::<String, ReactionSummary>::new();
-    let mut seen = BTreeMap::<String, Vec<String>>::new();
+fn reaction_count_label(count: usize, mine: bool) -> String {
+    if mine {
+        format!("{count} · you")
+    } else {
+        count.to_string()
+    }
+}
+
+fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui::Button<'static> {
+    button
+        .fill(if mine {
+            theme::tint(p.raised, p.accent, 0.62)
+        } else {
+            p.raised
+        })
+        .stroke(egui::Stroke::new(if mine { 2. } else { 0. }, p.accent))
+        .corner_radius(10)
+}
+
+fn reaction_groups(reactions: &[Value], self_id: &str) -> Vec<ReactionGroup> {
+    let mut groups = Vec::<ReactionGroup>::new();
+    let mut seen = Vec::<(String, String)>::new();
     for reaction in reactions {
         let key = reaction["reactionKey"].as_str().unwrap_or("?").to_owned();
         let id = reaction["participantID"]
             .as_str()
-            .filter(|id| !id.is_empty());
-        if let Some(id) = id {
-            let seen_ids = seen.entry(key.clone()).or_default();
-            if seen_ids.iter().any(|known| known == id) {
-                continue;
-            }
-            seen_ids.push(id.to_owned());
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        if let Some(id) = id.as_ref()
+            && seen
+                .iter()
+                .any(|(known_key, known_id)| known_key == &key && known_id == id)
+        {
+            continue;
         }
-        let summary = grouped.entry(key).or_default();
-        summary.count += 1;
+        if let Some(id) = id.clone() {
+            seen.push((key.clone(), id));
+        }
         let named = reaction["participantName"]
             .as_str()
             .map(str::trim)
-            .filter(|name| !name.is_empty());
-        let mine = id.is_some_and(|id| id == self_id) || named == Some("You");
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let mine = reaction_is_users(reaction, &key, self_id);
+        let image = reaction["image"]
+            .as_str()
+            .filter(|value| value.starts_with("mxc://"))
+            .map(str::to_owned)
+            .or_else(|| key.starts_with("mxc://").then(|| key.clone()));
+        let shortcode = reaction["shortcode"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        if !groups.iter().any(|group| group.key == key) {
+            groups.push(ReactionGroup {
+                key: key.clone(),
+                image: image.clone(),
+                shortcode: shortcode.clone(),
+                count: 0,
+                mine: false,
+                names: Vec::new(),
+                unnamed: 0,
+            });
+        }
+        let group = groups
+            .iter_mut()
+            .find(|group| group.key == key)
+            .expect("reaction group exists");
+        if group.image.is_none() {
+            group.image = image;
+        }
+        if group.shortcode.is_none() {
+            group.shortcode = shortcode;
+        }
+        // Discord and Slack echo your reaction from a bridge puppet as well as
+        // your Matrix user. Both are you, so the chip can only move by one.
         if mine {
-            summary.mine = true;
-            if !summary.names.iter().any(|name| name == "You") {
-                summary.names.insert(0, "You".into());
+            if !group.mine {
+                group.count += 1;
+                group.mine = true;
+                if !group.names.iter().any(|name| name == "You") {
+                    group.names.insert(0, "You".into());
+                }
             }
-        } else if let Some(name) = named {
-            summary.names.push(name.to_owned());
+        } else {
+            group.count += 1;
+            if let Some(name) = named {
+                group.names.push(name);
+            } else {
+                group.unnamed += 1;
+            }
         }
     }
-    grouped
-}
-
-fn reaction_tooltip(summary: &ReactionSummary) -> String {
-    if summary.names.is_empty() {
-        return if summary.mine {
-            "Remove your reaction".into()
-        } else {
-            "React".into()
-        };
-    }
-    const LIMIT: usize = 12;
-    if summary.names.len() <= LIMIT {
-        return summary.names.join("\n");
-    }
-    let mut lines = summary.names[..LIMIT].to_vec();
-    lines.push(format!("and {} more", summary.names.len() - LIMIT));
-    lines.join("\n")
+    groups
 }
 
 // Keep loaded Slack replies beside their parent while retaining their original
@@ -2526,35 +3005,47 @@ pub fn run(app: App) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn reaction_hover_lists_people_and_puts_you_first() {
+    fn reaction_list_names_everyone_and_puts_you_first() {
         let reactions = vec![
             json!({"reactionKey":"👍","participantID":"alex","participantName":"Alex Chen"}),
             json!({"reactionKey":"👍","participantID":"alex","participantName":"Alex Chen"}),
             json!({"reactionKey":"👍","participantID":"@max:chord.local","participantName":"Max"}),
+            json!({"reactionKey":"👍","participantID":"@discord_max:chord.local","participantName":"You"}),
+            json!({"reactionKey":"👍","participantID":"local-you","participantName":"You","local":true}),
             json!({"reactionKey":"👍","participantID":"sam","participantName":"Sam"}),
             json!({"reactionKey":"❤️","participantID":"unknown"}),
+            json!({"reactionKey":"mxc://chord.local/blob","shortcode":":blobcat:","participantID":"pat","participantName":"Pat"}),
         ];
-        let grouped = reaction_summaries(&reactions, "@max:chord.local");
-        let thumbs = &grouped["👍"];
+        let grouped = reaction_groups(&reactions, "@max:chord.local");
+        let thumbs = grouped.iter().find(|group| group.key == "👍").unwrap();
         assert_eq!(thumbs.count, 3);
         assert!(thumbs.mine);
         assert_eq!(thumbs.names, ["You", "Alex Chen", "Sam"]);
-        assert_eq!(reaction_tooltip(thumbs), "You\nAlex Chen\nSam");
-        let heart = &grouped["❤️"];
+        let heart = grouped.iter().find(|group| group.key == "❤️").unwrap();
         assert_eq!(heart.count, 1);
         assert!(!heart.mine);
         assert!(heart.names.is_empty());
-        assert_eq!(reaction_tooltip(heart), "React");
+        assert_eq!(heart.unnamed, 1);
+        let custom = grouped
+            .iter()
+            .find(|group| group.key == "mxc://chord.local/blob")
+            .unwrap();
+        assert_eq!(custom.image.as_deref(), Some("mxc://chord.local/blob"));
+        assert_eq!(custom.shortcode.as_deref(), Some(":blobcat:"));
+        assert_eq!(custom.names, ["Pat"]);
         let mut many = Vec::new();
-        for index in 0..14 {
+        for index in 0..40 {
             many.push(json!({"reactionKey":"🎉","participantID":format!("p{index}"),"participantName":format!("Person {index}")}));
         }
-        let party = &reaction_summaries(&many, "")["🎉"];
-        assert_eq!(party.count, 14);
-        assert_eq!(
-            reaction_tooltip(party),
-            "Person 0\nPerson 1\nPerson 2\nPerson 3\nPerson 4\nPerson 5\nPerson 6\nPerson 7\nPerson 8\nPerson 9\nPerson 10\nPerson 11\nand 2 more"
-        );
+        let party = reaction_groups(&many, "")
+            .into_iter()
+            .find(|group| group.key == "🎉")
+            .unwrap();
+        assert_eq!(party.count, 40);
+        assert_eq!(party.names.len(), 40);
+        assert_eq!(party.names[0], "Person 0");
+        assert_eq!(party.names[39], "Person 39");
+        assert!(party.names.iter().all(|name| !name.contains("more")));
     }
     #[test]
     fn bundled_fonts_cover_message_and_reaction_emoji() {
@@ -2595,7 +3086,7 @@ mod tests {
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let top = ui.cursor().top();
-                        gui.message(ui, &chat, &message, 0, gui.theme.palette());
+                        gui.message(ui, &chat, &message, 0, gui.theme.palette(ctx.theme()));
                         rect = egui::Rect::from_min_max(
                             egui::pos2(ui.min_rect().left(), top),
                             egui::pos2(ui.max_rect().right(), ui.cursor().top()),
@@ -2673,7 +3164,7 @@ mod tests {
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             let top = ui.cursor().top();
-                            gui.message(ui, &chat, &message, 0, gui.theme.palette());
+                            gui.message(ui, &chat, &message, 0, gui.theme.palette(ctx.theme()));
                             rect = egui::Rect::from_min_max(
                                 egui::pos2(ui.min_rect().left(), top),
                                 egui::pos2(ui.max_rect().right(), ui.cursor().top()),
@@ -2728,7 +3219,7 @@ mod tests {
             chat.contact_ids = contacts;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let p = gui.theme.palette();
+                    let p = gui.theme.palette(ctx.theme());
                     let first = gui.conversation_row(ui, &chat, p).rect;
                     let second = gui.conversation_row(ui, &chat, p).rect;
                     assert!(
@@ -2764,7 +3255,7 @@ mod tests {
                     time: Some(frame as f64),
                     ..Default::default()
                 },
-                |ctx| gui.thread(ctx, gui.theme.palette()),
+                |ctx| gui.thread(ctx, gui.theme.palette(ctx.theme())),
             );
             divider_y = output.shapes.iter().find_map(|shape| match &shape.shape {
                 egui::Shape::Text(text) if text.galley.job.text == "New messages" => {
@@ -2802,7 +3293,8 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        let response = gui.conversation_row(ui, &chat, gui.theme.palette());
+                        let response =
+                            gui.conversation_row(ui, &chat, gui.theme.palette(ctx.theme()));
                         opened = response.context_menu_opened();
                         rect = response.rect;
                     });
@@ -2876,7 +3368,7 @@ mod tests {
         chat.title = "snipes".into();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                gui.conversation_row(ui, &chat, gui.theme.palette());
+                gui.conversation_row(ui, &chat, gui.theme.palette(ctx.theme()));
             });
         });
         fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
@@ -2900,6 +3392,107 @@ mod tests {
         gui.app.apply_channel_rule(&chat.id, None, Some(Some(60)));
         assert!(!gui.app.conversations[0].unread);
         assert!(gui.app.conversations[0].mute_until.is_some());
+    }
+    #[test]
+    fn dragging_a_chat_to_the_top_pins_it_and_dragging_it_back_down_unpins_it() {
+        type Titles = Vec<(String, egui::Pos2)>;
+        let ctx = egui::Context::default();
+        let mut gui = Gui::new(App::new(None, true), &ctx);
+        let settings = std::env::temp_dir().join(format!("chord-pins-{}.json", std::process::id()));
+        gui.settings_path = settings.clone();
+        let mut time = 0.;
+        let mut frame = |gui: &mut Gui, events: Vec<egui::Event>| {
+            time += 0.05;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 900.),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| gui.inbox(ctx, gui.theme.palette(ctx.theme())),
+            );
+            let mut titles = Vec::new();
+            for shape in output.shapes {
+                if let egui::epaint::Shape::Text(text) = shape.shape {
+                    titles.push((
+                        text.galley.job.text.clone(),
+                        text.pos + text.galley.rect.center().to_vec2(),
+                    ));
+                }
+            }
+            titles
+        };
+        let find = |titles: &[(String, egui::Pos2)], title: &str| {
+            titles
+                .iter()
+                .find(|(t, _)| t.starts_with(&format!("{title} · ")))
+                .map(|(_, pos)| *pos)
+                .unwrap_or_else(|| panic!("{title:?} not in {titles:?}"))
+        };
+        let drag = |gui: &mut Gui,
+                    frame: &mut dyn FnMut(&mut Gui, Vec<egui::Event>) -> Titles,
+                    from: egui::Pos2,
+                    to: egui::Pos2| {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(gui, vec![egui::Event::PointerMoved(from)]);
+            frame(gui, vec![button(from, true)]);
+            for step in 1..=8 {
+                frame(
+                    gui,
+                    vec![egui::Event::PointerMoved(
+                        from + (to - from) * (step as f32 / 8.),
+                    )],
+                );
+            }
+            frame(gui, vec![button(to, false)]);
+            frame(gui, vec![]);
+        };
+        frame(&mut gui, vec![]);
+        let titles = frame(&mut gui, vec![]);
+        let chats: Vec<Conversation> = gui.app.visible().into_iter().cloned().collect();
+        let (first, third) = (
+            find(&titles, &chats[0].title),
+            find(&titles, &chats[3].title),
+        );
+        drag(&mut gui, &mut frame, third, first - egui::vec2(0., 12.));
+        assert_eq!(gui.app.visible()[0].id, chats[3].id);
+        assert!(gui.app.is_pinned(&chats[3].id));
+        assert!(
+            gui.app
+                .conversations
+                .iter()
+                .any(|c| c.id == chats[3].id && c.local_priority == chats[3].local_priority)
+        );
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains(&chats[3].id)
+        );
+        let titles = frame(&mut gui, vec![]);
+        let (pinned, low) = (
+            find(&titles, &chats[3].title),
+            find(&titles, &chats[2].title),
+        );
+        drag(&mut gui, &mut frame, pinned, low + egui::vec2(0., 20.));
+        assert!(!gui.app.is_pinned(&chats[3].id));
+        assert_eq!(
+            gui.app
+                .visible()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
+            chats.iter().map(|c| c.id.clone()).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_file(settings);
     }
     #[test]
     fn sidebar_rows_are_colored_by_account_and_slack_workspace() {
@@ -2930,7 +3523,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let p = gui.theme.palette();
+                    let p = gui.theme.palette(ctx.theme());
                     gui.conversation_row(ui, &lab, p);
                     gui.conversation_row(ui, &course, p);
                 });
@@ -2972,7 +3565,7 @@ mod tests {
         let ring = |color: Color32| {
             marks
                 .iter()
-                .any(|mark| mark.stroke == color && mark.stroke_width >= 2.5 && mark.radius >= 14.)
+                .any(|mark| mark.stroke == color && mark.stroke_width >= 2. && mark.radius >= 10.)
         };
         assert!(ring(lab_color), "lab ring missing");
         assert!(
@@ -2981,12 +3574,12 @@ mod tests {
         );
         let dots: Vec<_> = marks
             .iter()
-            .filter(|mark| mark.fill == gui.theme.palette().blue && mark.radius >= 6.)
+            .filter(|mark| mark.fill == gui.theme.palette(ctx.theme()).blue && mark.radius >= 6.)
             .collect();
         assert_eq!(dots.len(), 1, "unread dot should be the one large mark");
         let lab_ring = marks
             .iter()
-            .find(|mark| mark.stroke == lab_color && mark.stroke_width >= 2.5)
+            .find(|mark| mark.stroke == lab_color && mark.stroke_width >= 2.)
             .expect("lab ring");
         assert!(
             dots[0].center.x < lab_ring.center.x,
@@ -3016,7 +3609,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    let p = gui.theme.palette();
+                    let p = gui.theme.palette(ctx.theme());
                     gui.sidebar(ctx, p);
                     gui.inbox(ctx, p);
                     gui.thread(ctx, p);

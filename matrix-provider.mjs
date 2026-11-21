@@ -6,8 +6,45 @@ import {ArchiveStore,accountNamespace,digest,DAY,RETENTION_DAYS} from './archive
 import {readHistory,writeHistory} from './history-file.mjs';
 
 const enc=encodeURIComponent;
+// Room state (names, bridge info, membership) re-sent by a bridge is not conversation activity.
+const MESSAGE_TYPES=['m.room.message','m.room.encrypted','m.sticker'];
+const isMessageEvent=e=>!!e&&e.state_key===undefined&&(!e.type||MESSAGE_TYPES.includes(e.type));
 const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'iPhone':'Matrix';
 const page=(items,limit=200,offset=0)=>({items:items.slice(offset,offset+limit),hasMore:items.length>offset+limit,oldestCursor:String(offset+limit),newestCursor:null});
+const threadEvent=event=>event?.content?.['m.relates_to']?.rel_type==='m.thread';
+const isChannelEvent=e=>isMessageEvent(e)&&!threadEvent(e)&&e.content?.['m.relates_to']?.rel_type!=='m.replace';
+const threadMessage=message=>!!(message?.threadRootID&&message.threadRootID!==message.id);
+export function reactionRecord(source){
+ const content=source?.content||source?.raw?.content||{};
+ const relates=content['m.relates_to']||{};
+ const key=source?.reactionKey||source?.key||relates.key;
+ if(!key)return null;
+ const custom=content['fi.mau.discord.reaction']||content['fi.mau.slack.reaction']||null;
+ const image=String(key).startsWith('mxc://')?key:(typeof custom?.mxc==='string'&&custom.mxc.startsWith('mxc://')?custom.mxc:undefined);
+ let shortcode=typeof content['com.beeper.reaction.shortcode']==='string'?content['com.beeper.reaction.shortcode']:undefined;
+ if(!shortcode&&custom?.name)shortcode=':'+String(custom.name).replace(/^:|:$/g,'')+':';
+ if(typeof shortcode==='string')shortcode=shortcode.trim();
+ const participantID=source.participantID||source.sender?.userId||(typeof source.sender==='string'?source.sender:undefined);
+ const record={id:source.id||source.eventId||source.event_id,reactionKey:key,participantID};
+ if(image)record.image=image;
+ if(shortcode)record.shortcode=shortcode;
+ return record;
+}
+// Sidebar preview and sort follow the main timeline. A reply inside a thread
+// must not replace the channel preview or pull the row upward.
+function roomListing(c,timeline){
+ const messages=timeline||[];
+ const own=new Set(messages.filter(m=>m.isSender).map(m=>m.id));
+ const channel=[...messages].reverse().find(m=>!threadMessage(m));
+ const newestThread=[...messages].reverse().find(threadMessage);
+ const storedTime=Date.parse(c.lastActivity)||0;
+ const channelTime=Date.parse(channel?.timestamp)||0;
+ const previewFromThread=!!(newestThread?.text&&c.preview?.text===newestThread.text);
+ const activity=previewFromThread?(channelTime||storedTime):Math.max(storedTime,channelTime);
+ const recent=m=>!threadMessage(m)&&!m.isSender&&Date.parse(m.timestamp)>Date.now()-30*86400000;
+ const preview=channel?.text&&(previewFromThread||!c.preview?.text||channelTime>=storedTime)?{text:channel.text,senderName:channel.senderName,senderID:channel.senderID}:(previewFromThread?{text:''}:c.preview);
+ return {...c,lastActivity:activity?new Date(activity).toISOString():c.lastActivity,direct:c.type==='single',signals:{mention:!!c.highlightCount||messages.some(m=>recent(m)&&m.isMention),replyToYou:messages.some(m=>recent(m)&&own.has(m.linkedMessageID))},preview};
+}
 
 export class MatrixProvider{
  constructor(client,account,{dataDir,save=true,archive}={}){this.client=client;this.account=account;this.dataDir=dataDir;this.persist=save;this.archive=archive;this.chats=new Map();this.timelines=new Map();this.reactions=new Map();this.uploads=new Map();this.mediaFiles=new Map();this.error=null;this.started=false;this.flushTimer=null;this.relationCache=new Map();this.messageFetches=new Map();this.relationRefresh=new Map();this.relationVersions=new Map();}
@@ -24,11 +61,44 @@ export class MatrixProvider{
  async start(){
   if(this.started)return;await this.client.boot();
   if(this.persist){const saved=await readHistory(this.dataDir).catch(e=>{if(e.code!=='ENOENT')throw e;return null});if(saved){this.chats=new Map(saved.chats||[]);this.timelines=new Map(saved.timelines||[]);this.reactions=new Map(saved.reactions||[]);this.mediaFiles=new Map(saved.mediaFiles||[]);if(saved.syncToken)this.syncToken=saved.syncToken}}
-  await this.refreshRooms();this.subscription=await this.client.subscribe(undefined,e=>this.onEvent(e));this.subscription.done.catch(e=>{this.error=e.message});this.started=true;
+  await this.refreshRooms();this.subscription=await this.client.subscribe(undefined,e=>this.onEvent(e));this.subscription.done.catch(e=>{this.error=e.message});this.started=true;this.scheduleActivityRepair();
+ }
+ // Repair existing summaries without delaying the first inbox response.
+ scheduleActivityRepair(){
+  if(!this.persist||this.closing||this.activityRepair||Date.now()<(this.nextActivityRepair||0))return;
+  this.nextActivityRepair=Date.now()+60000;
+  this.activityRepair=this.repairActivity().catch(e=>{this.error=e.message}).finally(()=>{this.activityRepair=null});
+ }
+ async repairActivity(){
+  const pending=[...this.chats.keys()].filter(id=>this.chats.get(id).activityVersion!==3);
+  for(let i=0;i<pending.length&&!this.closing;i+=4){
+   await Promise.all(pending.slice(i,i+4).map(async id=>{
+    const room=this.chats.get(id),previous=room.lastActivity;
+    const timeline=Date.parse(this.timelines.get(id)?.findLast(m=>!threadMessage(m))?.timestamp)||0;
+    let latest=Math.max(timeline,this.observedActivity?.get(id)||0,this.archive?.latestMessageAt?.('matrix:'+id)||0);
+    if(!latest){try{latest=await this.latestMessageOnServer(id)}catch{return}}
+    const current=this.chats.get(id);
+    if(this.closing||!current||current.lastActivity!==previous)return;
+    this.chats.set(id,{...current,activityVersion:3,...(latest?{lastActivity:new Date(latest).toISOString()}:{})});
+    this.observedActivity?.delete(id);
+    this.scheduleSave();
+   }));
+  }
+ }
+ async latestMessageOnServer(roomId){
+  let from;
+  for(let i=0;i<3;i++){
+   const page=await this.raw('GET',`/_matrix/client/v3/rooms/${enc(roomId)}/messages`,undefined,{dir:'b',limit:'20',filter:JSON.stringify({types:MESSAGE_TYPES}),...(from?{from}:{})});
+   const latest=page.chunk?.find(isChannelEvent)?.origin_server_ts;
+   if(latest)return latest;
+   if(!page.end||page.end===from)return 0;
+   from=page.end;
+  }
+  return 0;
  }
  async refreshRooms(){
   if(this.roomRefresh)return this.roomRefresh;
-  this.roomRefresh=this.refreshRoomsNow().finally(()=>{this.roomRefresh=null});
+  this.roomRefresh=this.refreshRoomsNow().then(()=>this.scheduleActivityRepair()).finally(()=>{this.roomRefresh=null});
   return this.roomRefresh;
  }
  async refreshRoomsNow(){
@@ -62,7 +132,7 @@ export class MatrixProvider{
    if(bridge||freshRoom){accountID=bridge?.protocol?.id||'matrix';accountID=/slack/i.test(accountID)?'slack':/discord/i.test(accountID)?'discord':/whatsapp/i.test(accountID)?'whatsapp':accountID;network=bridge?.protocol?.displayname||networkFor(accountID)}
    const people=state.filter(e=>e.type==='m.room.member'&&e.content?.membership==='join').map(e=>({id:e.state_key,fullName:e.content.displayname||e.state_key,isSelf:e.state_key===this.account.userId}));
    const prefs=room.account_data?.events?.find(e=>e.type==='org.chord.chat')?.content||{};const marked=room.account_data?.events?.find(e=>e.type==='m.marked_unread')?.content?.unread;
-   const latest=room.timeline?.events?.at(-1);const summaryCount=room.summary?.['m.joined_member_count'];
+   const events=room.timeline?.events||[],channelEvent=events.findLast(isChannelEvent);const summaryCount=room.summary?.['m.joined_member_count'];
    let title,description,type,participants;
    if(freshRoom){
     title=find('m.room.name')?.name||bridge?.channel?.displayname||people.filter(p=>!p.isSelf).map(p=>p.fullName).slice(0,3).join(', ')||roomId;
@@ -77,10 +147,22 @@ export class MatrixProvider{
     const items=[...merged.values()],total=summaryCount!==undefined?summaryCount:(old.participants?.total||items.length);
     participants={items,total,hasMore:total>items.length};
    }
-   const locallyRead=old.localReadAt&&Number(latest?.origin_server_ts||Date.parse(old.lastActivity)||0)<=old.localReadAt;
-   const notes=room.unread_notifications,rawHighlights=(notes||freshRoom)?(notes?.highlight_count||0):(old.rawHighlightCount||0),notificationCount=(notes||freshRoom)?(notes?.notification_count||0):(old.unreadCount||0);
+   const threadOnly=events.some(threadEvent)&&!channelEvent;
+   if(old.activityVersion!==3&&channelEvent?.origin_server_ts){
+    const observed=this.observedActivity??=new Map();
+    observed.set(roomId,Math.max(observed.get(roomId)||0,channelEvent.origin_server_ts));
+   }
+   const notes=room.unread_notifications;
+   let rawHighlights=(notes||freshRoom)?(notes?.highlight_count||0):(old.rawHighlightCount||0),notificationCount=(notes||freshRoom)?(notes?.notification_count||0):(old.unreadCount||0);
+   // A sync batch that is only thread replies must not raise the badge, even
+   // when the homeserver still folds those replies into its notification totals.
+   if(threadOnly){if(notificationCount>(old.unreadCount||0))notificationCount=old.unreadCount||0;if(rawHighlights>(old.rawHighlightCount||0))rawHighlights=old.rawHighlightCount||0}
+   const readBasis=Math.max(channelEvent?.origin_server_ts||0,Date.parse(old.lastActivity)||0);
+   const locallyRead=old.localReadAt&&readBasis<=old.localReadAt;
    const readHighlightBaseline=old.localReadAt?Math.min(old.readHighlightBaseline??rawHighlights,rawHighlights):0;
-   this.chats.set(roomId,{...old,id:roomId,accountID,network:network||networkFor(accountID||'matrix'),title,description,type,participants,lastActivity:new Date(Math.max(latest?.origin_server_ts||0,Date.parse(old.lastActivity)||0)).toISOString(),rawHighlightCount:rawHighlights,readHighlightBaseline,highlightCount:locallyRead?0:Math.max(0,rawHighlights-readHighlightBaseline),unreadCount:locallyRead?0:notificationCount,isMarkedUnread:old.localMarkedUnread?true:locallyRead?false:marked??old.isMarkedUnread??false,isArchived:prefs.archived??old.isArchived??false,isMuted:old.isMuted||false,isReadOnly:false,capabilities:{reply:2,reaction:2,edit:2,archive:true,markAsUnread:true},preview:latest?.content?.body?{text:latest.content.body}:old.preview});
+   const lastActivity=channelEvent?.origin_server_ts?new Date(Math.max(channelEvent.origin_server_ts,Date.parse(old.lastActivity)||0)).toISOString():(old.lastActivity||new Date(0).toISOString());
+   const preview=channelEvent?.content?.body?{text:channelEvent.content.body,senderID:channelEvent.sender}:old.preview;
+   this.chats.set(roomId,{...old,id:roomId,accountID,network:network||networkFor(accountID||'matrix'),title,description,type,participants,lastActivity,rawHighlightCount:rawHighlights,readHighlightBaseline,highlightCount:locallyRead?0:Math.max(0,rawHighlights-readHighlightBaseline),unreadCount:locallyRead?0:notificationCount,isMarkedUnread:old.localMarkedUnread?true:locallyRead?false:marked??old.isMarkedUnread??false,isArchived:prefs.archived??old.isArchived??false,isMuted:old.isMuted||false,isReadOnly:false,capabilities:{reply:2,reaction:2,edit:2,archive:true,markAsUnread:true},preview});
   }
   if(snapshot.next_batch)this.syncToken=snapshot.next_batch;
   this.scheduleSave();
@@ -116,9 +198,9 @@ export class MatrixProvider{
   const room=this.chats.get(event.roomId);
   if(event.kind==='message'){
    const message=this.normalizeMessage(event);const timeline=this.timelines.get(event.roomId)||[];const index=timeline.findIndex(m=>m.id===message.id);if(index>=0)timeline[index]=message;else timeline.push(message);timeline.sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));this.timelines.set(event.roomId,timeline);
-   if(room){room.preview=message;room.lastActivity=message.timestamp;}
+   if(room&&!threadMessage(message)&&Date.parse(message.timestamp)>=(Date.parse(room.lastActivity)||0)){room.preview={text:message.text,senderName:message.senderName,senderID:message.senderID};room.lastActivity=message.timestamp;}
   }else if(event.kind==='reaction'){
-   const key=event.roomId+'|'+event.relatesTo;this.relationVersions.set(key,(this.relationVersions.get(key)||0)+1);const current=this.reactions.get(key)||this.archive?.message('matrix:'+event.roomId,event.relatesTo)?.reactions||[];const filtered=current.filter(r=>r.id!==event.eventId);if(event.added)filtered.push({id:event.eventId,reactionKey:event.key,participantID:event.sender.userId});this.reactions.set(key,filtered);
+   const key=event.roomId+'|'+event.relatesTo;this.relationVersions.set(key,(this.relationVersions.get(key)||0)+1);const current=this.reactions.get(key)||this.archive?.message('matrix:'+event.roomId,event.relatesTo)?.reactions||[];const filtered=current.filter(r=>r.id!==event.eventId);if(event.added){const record=reactionRecord(event);if(record)filtered.push(record)}this.reactions.set(key,filtered);
   }else if(event.kind==='event'&&event.type==='m.room.redaction'){
    const redacts=event.raw?.redacts||event.content?.redacts;for(const [key,items] of this.reactions)this.reactions.set(key,items.filter(r=>r.id!==redacts));const m=this.timelines.get(event.roomId)?.find(m=>m.id===redacts)||this.archive?.message('matrix:'+event.roomId,redacts);if(m){m.isDeleted=true;m.text='[Message deleted]';m.attachments=[];m.reactions=[];this.retain(event.roomId,[m])}
   }else if(event.class==='state'&&room){if(event.type==='m.room.name')room.title=event.content?.name||room.title;if(event.type==='m.room.topic')room.description=event.content?.topic;}
@@ -145,7 +227,7 @@ export class MatrixProvider{
   const work=(async()=>{
    for(let offset=0;offset<due.length;offset+=6)await Promise.all(due.slice(offset,offset+6).map(async m=>{
     const key=roomId+'|'+m.id,version=this.relationVersions.get(roomId+'|'+m.id)||0;
-    try{const data=await this.raw('GET',`/_matrix/client/v1/rooms/${enc(roomId)}/relations/${enc(m.id)}/m.annotation/m.reaction`,undefined,{limit:'100'});if(version!==(this.relationVersions.get(key)||0))return;this.reactions.set(key,(data.chunk||[]).map(e=>({id:e.event_id,reactionKey:e.content?.['m.relates_to']?.key,participantID:e.sender})).filter(r=>r.reactionKey));this.relationCache.set(key,Date.now())}catch{}
+    try{const data=await this.raw('GET',`/_matrix/client/v1/rooms/${enc(roomId)}/relations/${enc(m.id)}/m.annotation/m.reaction`,undefined,{limit:'100'});if(version!==(this.relationVersions.get(key)||0))return;this.reactions.set(key,(data.chunk||[]).map(e=>reactionRecord({id:e.event_id,sender:e.sender,content:e.content})).filter(Boolean));this.relationCache.set(key,Date.now())}catch{}
    }));
    this.retain(roomId,items);this.scheduleSave();
   })().finally(()=>{this.relationRefresh.delete(roomId)});
@@ -188,7 +270,7 @@ export class MatrixProvider{
    if(Date.now()-(this.lastRoomRefresh||0)>5000)await this.refreshRooms();
    let rooms=[...this.chats.values()].filter(c=>!q.has('accountIDs')||q.getAll('accountIDs').includes(c.accountID));
    if(q.get('query'))rooms=rooms.filter(c=>c.title.toLowerCase().includes(q.get('query').toLowerCase()));if(q.get('type')&&q.get('type')!=='any')rooms=rooms.filter(c=>c.type===q.get('type'));if(q.get('unreadOnly')==='true')rooms=rooms.filter(c=>c.unreadCount||c.isMarkedUnread);if(q.get('inbox'))rooms=rooms.filter(c=>q.get('inbox')==='archive'?c.isArchived:!c.isArchived);
-   rooms=rooms.map(c=>{const timeline=this.timelines.get(c.id)||[];const own=new Set(timeline.filter(m=>m.isSender).map(m=>m.id));return {...c,lastActivity:new Date(Math.max(Date.parse(c.lastActivity)||0,Date.parse(timeline.at(-1)?.timestamp)||0)).toISOString(),direct:c.type==='single',signals:{mention:!!c.highlightCount||timeline.some(m=>!m.isSender&&m.isMention&&Date.parse(m.timestamp)>Date.now()-30*86400000),replyToYou:timeline.some(m=>!m.isSender&&own.has(m.linkedMessageID)&&Date.parse(m.timestamp)>Date.now()-30*86400000)},preview:timeline.at(-1)?.text?{text:timeline.at(-1).text,senderName:timeline.at(-1).senderName,senderID:timeline.at(-1).senderID}:c.preview}});
+   rooms=rooms.map(c=>roomListing(c,this.timelines.get(c.id)));
    rooms.sort((a,b)=>new Date(b.lastActivity)-new Date(a.lastActivity));return page(rooms,Math.min(200,Number(q.get('limit'))||200),Number(q.get('cursor'))||0);
   }
   if(p==='/v1/messages/search'){
@@ -219,7 +301,7 @@ export class MatrixProvider{
     else throw Object.assign(new Error('Reminders are not implemented by the independent transport'),{status:501});this.scheduleSave();return c;
    }
    if(p.includes('/reactions')){
-    if(method==='POST'){const r=await this.client.reactions.send({roomId,eventId,key:body.reactionKey});const k=roomId+'|'+eventId;this.relationVersions.set(k,(this.relationVersions.get(k)||0)+1);this.reactions.set(k,[...(this.reactions.get(k)||[]).filter(x=>x.id!==r.eventId),{id:r.eventId,reactionKey:body.reactionKey,participantID:this.account.userId}]);this.relationCache.set(k,Date.now());this.scheduleSave();return {success:true,messageID:eventId,chatID:roomId,reactionKey:body.reactionKey,eventID:r.eventId}}
+    if(method==='POST'){const r=await this.client.reactions.send({roomId,eventId,key:body.reactionKey});const k=roomId+'|'+eventId;this.relationVersions.set(k,(this.relationVersions.get(k)||0)+1);const record=reactionRecord({id:r.eventId,reactionKey:body.reactionKey,participantID:this.account.userId});this.reactions.set(k,[...(this.reactions.get(k)||[]).filter(x=>x.id!==r.eventId),record]);this.relationCache.set(k,Date.now());this.scheduleSave();return {success:true,messageID:eventId,chatID:roomId,reactionKey:body.reactionKey,eventID:r.eventId}}
     if(method==='DELETE'){await this.client.reactions.redact({roomId,eventId,key});const k=roomId+'|'+eventId;this.relationVersions.set(k,(this.relationVersions.get(k)||0)+1);this.reactions.set(k,(this.reactions.get(k)||[]).filter(x=>!(x.reactionKey===key&&x.participantID===this.account.userId)));this.relationCache.set(k,Date.now());this.scheduleSave();return {success:true}}
    }
    if(eventId){
@@ -261,4 +343,4 @@ export async function getMatrix({config,dataDir}){
  })().catch(e=>{boot=null;throw e});return boot;
 }
 export async function matrixRequest(context,endpoint,method,body){return (await getMatrix(context)).request(endpoint,method,body)}
-export async function closeMatrix(){const provider=instance||await boot?.catch(()=>null);if(!provider)return;clearTimeout(provider.flushTimer);if(provider.subscription)await provider.subscription.stop();await provider.client.close();clearTimeout(provider.flushTimer);await provider.save();provider.store?.close();provider.archive?.close();instance=null;boot=null;}
+export async function closeMatrix(){const provider=instance||await boot?.catch(()=>null);if(!provider)return;provider.closing=true;await provider.activityRepair;clearTimeout(provider.flushTimer);if(provider.subscription)await provider.subscription.stop();await provider.client.close();clearTimeout(provider.flushTimer);await provider.save();provider.store?.close();provider.archive?.close();instance=null;boot=null;}

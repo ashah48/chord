@@ -424,6 +424,20 @@ fn render_inbox(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
         &mut state,
     );
 }
+fn reaction_label(reaction: &serde_json::Value) -> String {
+    let key = reaction["reactionKey"].as_str().unwrap_or("?");
+    if let Some(shortcode) = reaction["shortcode"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+    {
+        return shortcode.trim_matches(':').to_owned();
+    }
+    if key.starts_with("mxc://") {
+        "custom".into()
+    } else {
+        key.to_owned()
+    }
+}
 fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
     let Some(c) = app.active.as_ref() else {
         frame.render_widget(panel("", false, t), area);
@@ -598,11 +612,21 @@ fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
                 .style(style),
             );
         }
-        let mut reactions = BTreeMap::<String, usize>::new();
+        let mut reactions = BTreeMap::<String, (String, usize, bool)>::new();
+        let self_id = app.status["userID"].as_str().unwrap_or("");
         for r in &m.reactions {
-            *reactions
-                .entry(r["reactionKey"].as_str().unwrap_or("?").to_owned())
-                .or_default() += 1
+            let key = r["reactionKey"].as_str().unwrap_or("?").to_owned();
+            let label = reaction_label(r);
+            let mine = crate::app::reaction_is_users(r, &key, self_id);
+            let entry = reactions.entry(key.clone()).or_insert((label, 0, false));
+            if mine {
+                if !entry.2 {
+                    entry.1 += 1;
+                    entry.2 = true;
+                }
+            } else {
+                entry.1 += 1;
+            }
         }
         if !reactions.is_empty() {
             lines.push(
@@ -611,7 +635,13 @@ fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
                         "   {}",
                         reactions
                             .iter()
-                            .map(|(k, v)| format!("{k} {v}"))
+                            .map(|(_, (label, count, mine))| {
+                                if *mine {
+                                    format!("{label} {count} · you")
+                                } else {
+                                    format!("{label} {count}")
+                                }
+                            })
                             .collect::<Vec<_>>()
                             .join("   ")
                     ),

@@ -1,6 +1,19 @@
 import {ContactBook,phoneIdentity,mailbox,text,usableName} from './contacts.mjs';
 import {readContactCatalog} from './contact-catalog.mjs';
 
+// Workspace custom emoji are keyed by the shortcode people type, and only when
+// the bridge has already stored an mxc image. Time ranges such as 7:30-4:00
+// contain a colon pair and must stay text unless that name is a real emoji.
+export function messageEmotes(text, emoji){
+ if(!emoji)return [];
+ const found=[],seen=new Set();
+ for(const match of String(text||'').matchAll(/:([A-Za-z0-9_+-]{1,64}):/g)){
+  const name=match[1],mxc=emoji.get(name);
+  if(!mxc||seen.has(name))continue;
+  seen.add(name);found.push({name,mxc});
+ }
+ return found;
+}
 export class Directory{
  constructor(book,{blue,config}){this.book=book;this.blue=blue;this.config=config;this.refreshed=0;this.catalog={rooms:new Map(),selfIds:new Set(),errors:[]};this.profiles=new Map();this.conversations=new Map()}
  static async open(dataDir,options){return new Directory(await new ContactBook(dataDir).load(),options)}
@@ -38,7 +51,10 @@ export class Directory{
    ? contactIDs.map(id=>this.book.data.people[id]).filter(p=>p&&!p.identities.some(i=>i.isBot)&&!/[（(]bot[）)]\s*$/i.test(this.book.present(p).name)).slice(0,3).map(p=>({id:p.id,name:this.book.present(p).name})) : [];
   const accountKey=c.source==='slack'&&room?.workspaceID?`slack:${room.workspaceID}`:(c.source||'matrix');
   const accountName=c.source==='slack'&&room?.workspaceName?room.workspaceName:null;
-  const enriched={...c,avatarContacts,previewSenderName:this.book.name(c.previewSenderID,c.previewSenderName)||c.previewSenderName||'',serverID:room?.serverID||null,serverName:room?.serverName||null,accountKey,accountName,channelID:room?.portalId||null,channelName:room?.title||null,...(room?.activity?{activity:room.activity}:{}),direct,groupDM:!!room?.groupDM,contactIDs,knownContact:contactIDs.some(id=>{const p=this.book.data.people[id];return p?.customName||p?.favorite||p?.identities.some(i=>i.source!=='email')}),isBot:direct&&!!this.book.person(other)?.identities.some(i=>i.isBot),title:direct&&resolved&&c.kind!=='email'?resolved:c.title,...(room?.activity?.lastMessageAt?{timestamp:new Date(Math.max(room.activity.lastMessageAt,Date.parse(c.timestamp)||0)).toISOString()}:{})};this.conversations.set(c.id,enriched);return enriched;
+  const catalogActivity=room?.activity;
+  const channelActivity=Date.parse(c.lastActivity);
+  const timestamp=Number.isFinite(channelActivity)?channelActivity:Math.max(catalogActivity?.lastMessageAt||0,Date.parse(c.timestamp)||0);
+  const enriched={...c,avatarContacts,previewSenderName:this.book.name(c.previewSenderID,c.previewSenderName)||c.previewSenderName||'',serverID:room?.serverID||null,serverName:room?.serverName||null,accountKey,accountName,channelID:room?.portalId||null,channelName:room?.title||null,...(catalogActivity?{activity:{...catalogActivity,lastMessageAt:timestamp}}:{}),direct,groupDM:!!room?.groupDM,contactIDs,knownContact:contactIDs.some(id=>{const p=this.book.data.people[id];return p?.customName||p?.favorite||p?.identities.some(i=>i.source!=='email')}),isBot:direct&&!!this.book.person(other)?.identities.some(i=>i.isBot),title:direct&&resolved&&c.kind!=='email'?resolved:c.title,...(Number.isFinite(channelActivity)||catalogActivity?.lastMessageAt?{timestamp:new Date(timestamp).toISOString()}:{})};this.conversations.set(c.id,enriched);return enriched;
  }
  async profile(key){
   if(!/^@[^:]+:chord\.local$/.test(key)||this.profiles.get(key)>Date.now())return;
@@ -55,6 +71,7 @@ export class Directory{
   const mentionMap=new Map();
   for(const p of this.book.list())for(const i of p.identities){const match=i.key.match(/^@(slack|discord)_(.+):chord\.local$/);if(match){const remote=match[1]==='slack'?match[2].split('-').at(-1):match[2];const key=remote.toLowerCase();const prev=mentionMap.get(key);mentionMap.set(key,prev&&prev!==p.name?null:p.name)}}
   const participantName=id=>{if(!id)return null;if(this.catalog.selfIds.has(id))return 'You';return this.book.name(id)};
+  const emoji=source==='slack'?this.catalog.slackEmoji?.get(conversation.workspaceID):null;
   const result=items.map(m=>{
    const key=keyFor(m);if(source.startsWith('mail:'))this.observeMail(m.from||m.senderName);
    if(key&&!this.book.person(key))this.book.observe({key,source,name:usableName(m.senderName)?m.senderName:null});
@@ -62,7 +79,9 @@ export class Directory{
    const isSender=m.isSender||this.catalog.selfIds.has(key);
    const fallback=source==='iphone'?'Phone contact':source==='slack'?'Slack contact':source==='discord'?'Discord contact':'Unknown contact';
    const reactions=Array.isArray(m.reactions)?m.reactions.map(r=>{const name=participantName(r?.participantID);return name?{...r,participantName:name}:r}):m.reactions;
-   return {...m,isSender,senderName:isSender?'You':resolved||fallback,senderContactID:p?.id||null,contactResolved:!!resolved,reactions,text:String(m.text||'').replace(/<@!?([a-zA-Z0-9]+)>/g,(whole,id)=>mentionMap.get(id.toLowerCase())?'@'+mentionMap.get(id.toLowerCase()):whole)};
+   const text=String(m.text||'').replace(/<@!?([a-zA-Z0-9]+)>/g,(whole,id)=>mentionMap.get(id.toLowerCase())?'@'+mentionMap.get(id.toLowerCase()):whole);
+   const emotes=messageEmotes(text, emoji);
+   return {...m,isSender,senderName:isSender?'You':resolved||fallback,senderContactID:p?.id||null,contactResolved:!!resolved,reactions,text,...(emotes.length?{emotes}:{})};
   });
   const spoken=new Map();
   for(const m of result)if(m.senderID&&(m.isSender||m.contactResolved))spoken.set(m.senderID,m.senderName);

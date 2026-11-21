@@ -18,6 +18,7 @@ test('slack portal ids keep their workspace, and other accounts stay one color k
   CREATE TABLE ghost (id TEXT, name TEXT, is_bot INT, identifiers TEXT);
   CREATE TABLE portal (id TEXT, receiver TEXT, mxid TEXT, name TEXT, room_type TEXT, other_user_id TEXT);
   CREATE TABLE message (room_id TEXT, room_receiver TEXT, sender_id TEXT, sender_mxid TEXT, timestamp INT);
+  CREATE TABLE emoji (team_id TEXT, emoji_id TEXT, image_mxc TEXT);
  `);
  db.prepare('INSERT INTO user_login VALUES (?,?,?)').run('TEMMBGZU3-U1', '@max:chord.local', 'Garcia-Bosch Lab');
  db.prepare('INSERT INTO user_login VALUES (?,?,?)').run('TSAU3JLKZ-U1', '@max:chord.local', '15-112 Staff Fall 2026');
@@ -25,6 +26,8 @@ test('slack portal ids keep their workspace, and other accounts stay one color k
  portal.run('TEMMBGZU3-C1', '', '!lab', '#general', '', null);
  portal.run('TSAU3JLKZ-D1', '', '!course', 'Stella Lim', 'dm', 'TSAU3JLKZ-USTELLA');
  portal.run('TEMMBGZU3', '', '!space', 'Garcia-Bosch Lab', 'space', null);
+ db.prepare('INSERT INTO emoji VALUES (?,?,?)').run('TSAU3JLKZ', 'boomparrot', 'mxc://chord.local/parrot');
+ db.prepare('INSERT INTO emoji VALUES (?,?,?)').run('TSAU3JLKZ', 'nope', 'https://emoji.slack-edge.com/nope.png');
  db.close();
  const catalog = readContactCatalog(dir);
  const lab = catalog.rooms.get('!lab');
@@ -34,6 +37,8 @@ test('slack portal ids keep their workspace, and other accounts stay one color k
  assert.equal(course.workspaceID, 'TSAU3JLKZ');
  assert.equal(course.workspaceName, '15-112 Staff Fall 2026');
  assert.equal(catalog.rooms.has('!space'), false);
+ assert.equal(catalog.slackEmoji.get('TSAU3JLKZ').get('boomparrot'), 'mxc://chord.local/parrot');
+ assert.equal(catalog.slackEmoji.get('TSAU3JLKZ').has('nope'), false);
  const book = new ContactBook(dir);
  book.save = async () => {};
  const directory = new Directory(book, {blue: async () => [], config: () => ({})});

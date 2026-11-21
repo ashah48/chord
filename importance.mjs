@@ -5,7 +5,7 @@ export function importance(conversation,{preference={},favorite=false,now=Date.n
  const reasons=[];let score=0;
  const add=(points,reason)=>{score+=points;reasons.push(reason)};
  if(preference.muted)return {important:false,score:-500,reasons:['Muted'],rule:'muted'};
- if(preference.priority==='important')return {important:true,score:1000,reasons:['Pinned by you'],rule:'important'};
+ if(preference.priority==='important')return {important:true,score:1000,reasons:['Marked important by you'],rule:'important'};
  if(preference.priority==='quiet')return {important:false,score:-1000,reasons:['Quieted by you'],rule:'quiet'};
  if(c.attention)return {important:c.attention.important,score:c.attention.important?100:0,reasons:[c.attention.reason],rule:'attention'};
  if(c.isMuted)return {important:false,score:-500,reasons:['Muted conversation'],rule:'auto'};
@@ -40,13 +40,14 @@ function withLocalRules(c,book,now){
  if(preference.priority==='important'&&c.sourceUnread)return {...next,unread:true};
  return next;
 }
-export function rankInbox(items,book,{view='all',now=Date.now()}={}){
+export function rankInbox(items,book,{view='all',now=Date.now(),pins=[]}={}){
  const ranked=items.map(c=>{
   const next=withLocalRules(c,book,now);
   const favorite=(next.contactIDs||[]).some(id=>book.data.people[id]?.favorite)&&(next.direct||next.kind==='email');
   return {...next,importance:importance(next,{preference:book.preference(c.id,now),favorite,now})};
  });
- const focused=ranked.filter(c=>c.importance.important);
+ const pinned=new Set(pins);
+ const focused=ranked.filter(c=>c.importance.important||pinned.has(c.id));
  const visible=view==='focus'?focused:ranked;
  const timestamp=c=>{const value=Date.parse(c.timestamp);return Number.isFinite(value)?value:0};
  visible.sort((a,b)=>timestamp(b)-timestamp(a));

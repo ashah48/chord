@@ -48,6 +48,11 @@ export class ArchiveStore {
   return value;
  }
  getConversation(id){const r=this.db.prepare('SELECT payload FROM conversations WHERE namespace=? AND id=?').get(this.namespace,id);return r?JSON.parse(r.payload):null}
+ latestMessageAt(id){
+  const rows=this.db.prepare('SELECT c.event_at,r.payload,r.codec FROM current_messages c JOIN records r ON r.seq=c.seq WHERE c.namespace=? AND c.conversation_id=? ORDER BY c.event_at DESC').iterate(this.namespace,id);
+  for(const row of rows){const m=unpackJSON(row.payload,row.codec);if(!m.threadRootID||m.threadRootID===m.id)return row.event_at}
+  return 0;
+ }
  message(id,messageID){if(typeof messageID!=='string')return null;const r=this.db.prepare('SELECT r.payload,r.codec FROM current_messages c JOIN records r ON r.seq=c.seq WHERE c.namespace=? AND c.conversation_id=? AND c.message_id=?').get(this.namespace,id,messageID);return r?unpackJSON(r.payload,r.codec):null}
  recordMessages(conversationID,items,conversation={}, {historical=false}={}){
   if(!items?.length)return;

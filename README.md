@@ -14,6 +14,9 @@ and mautrix bridges handle Slack, Discord, and WhatsApp. Chord uses independent
 network sessions. It does not connect through a Beeper account or desktop app.
 
 ## Build and open
+On a Mac, see the [macOS installation guide](docs/install-macos.md) for the
+disk image and backend requirements.
+
 
 On NixOS, from this checkout:
 

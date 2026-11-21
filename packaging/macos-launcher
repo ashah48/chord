@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+app_dir=$(dirname "$0")
+config="$HOME/Library/Application Support/Chord/config.json"
+
+if [ "$#" -gt 0 ]; then
+    exec "$app_dir/chord" "$@"
+fi
+if [ -f "$config" ]; then
+    exec "$app_dir/chord" --config "$config"
+fi
+exec "$app_dir/chord" --demo

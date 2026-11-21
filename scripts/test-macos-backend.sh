@@ -1,10 +1,13 @@
 #!/bin/bash
 set -euo pipefail
-scratch=$(mktemp -d)
-HOME="$scratch" sh scripts/start-macos.sh &
+data="$HOME/Library/Application Support/Chord/local"
+if [[ -e "$data" || -L "$data" ]]; then
+    echo 'The backend smoke test requires a fresh macOS user profile.' >&2
+    exit 1
+fi
+sh scripts/start-macos.sh &
 backend=$!
 trap 'kill "$backend" 2>/dev/null || true; wait "$backend" || true' EXIT
-data="$scratch/Library/Application Support/Chord/local"
 for ((attempt=0; attempt<90; attempt++)); do
     kill -0 "$backend"
     if [[ $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4789/api/status || true) = 401 ]]; then

@@ -1159,14 +1159,9 @@ impl App {
                         Ok(file) => {
                             self.notice = format!("Saved {}", file.display());
                             if key.code == KeyCode::Char('b')
-                                && let Err(e) = std::process::Command::new("brave")
-                                    .arg(&file)
-                                    .stdin(std::process::Stdio::null())
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .spawn()
+                                && let Err(e) = crate::gui::links::open(&file)
                             {
-                                self.notice = format!("Could not open Brave: {e}");
+                                self.notice = format!("Could not open the image: {e}");
                             }
                         }
                         Err(e) => self.notice = format!("Could not save image: {e}"),

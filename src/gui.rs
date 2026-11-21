@@ -36,39 +36,19 @@ pub struct Gui {
     search_busy: bool,
     search_seq: u64,
     search_results: Value,
+    logo: Option<egui::TextureHandle>,
 }
 impl Gui {
     pub fn new(mut app: App, ctx: &egui::Context) -> Self {
         app.native_ui = true;
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "emoji".into(),
-            std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-                "../assets/NotoEmoji.ttf"
-            ))),
-        );
-        fonts
-            .families
-            .insert(egui::FontFamily::Name("emoji".into()), vec!["emoji".into()]);
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .push("emoji".into());
-        }
-        ctx.set_fonts(fonts);
         let settings_path = settings_path();
         let settings: Value = std::fs::read(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or(Value::Null);
-        let theme = match settings["theme"].as_str() {
-            Some("light") => Theme::Light,
-            Some("dark") => Theme::Dark,
-            _ => Theme::Gruvbox,
-        };
+        let theme = Theme::from_setting(settings["theme"].as_str());
         theme.apply(ctx);
+        Self::apply_fonts(ctx, theme);
         Self {
             app,
             media: Media::default(),
@@ -89,6 +69,81 @@ impl Gui {
             search_busy: false,
             search_seq: 0,
             search_results: Value::Null,
+            logo: None,
+        }
+    }
+    fn apply_fonts(ctx: &egui::Context, theme: Theme) {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "emoji".into(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+                "../assets/NotoEmoji.ttf"
+            ))),
+        );
+        fonts
+            .families
+            .insert(egui::FontFamily::Name("emoji".into()), vec!["emoji".into()]);
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("emoji".into());
+        }
+        if cfg!(target_os = "macos") && theme == Theme::MacOs {
+            for (name, path, family) in [
+                (
+                    "sf",
+                    "/System/Library/Fonts/SFNS.ttf",
+                    egui::FontFamily::Proportional,
+                ),
+                (
+                    "sf-mono",
+                    "/System/Library/Fonts/SFNSMono.ttf",
+                    egui::FontFamily::Monospace,
+                ),
+            ] {
+                if let Ok(bytes) = std::fs::read(path) {
+                    fonts.font_data.insert(
+                        name.into(),
+                        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                    );
+                    fonts
+                        .families
+                        .entry(family)
+                        .or_default()
+                        .insert(0, name.into());
+                }
+            }
+        }
+        ctx.set_fonts(fonts);
+    }
+    fn show_logo(&mut self, ui: &mut egui::Ui, size: f32, fallback: RichText) {
+        if self.theme == Theme::MacOs
+            && self.logo.is_none()
+            && let Ok(icon) = image::load_from_memory(include_bytes!("../assets/macos/icon.png"))
+        {
+            let side = icon.width() * 824 / 1024;
+            let margin = (icon.width() - side) / 2;
+            let icon = icon
+                .crop_imm(margin, margin, side, side)
+                .thumbnail(192, 192)
+                .into_rgba8();
+            self.logo = Some(ui.ctx().load_texture(
+                "chord-logo",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width() as usize, icon.height() as usize],
+                    icon.as_raw(),
+                ),
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        if self.theme == Theme::MacOs
+            && let Some(logo) = &self.logo
+        {
+            ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(size)));
+        } else {
+            ui.label(fallback);
         }
     }
     fn key(&mut self, code: crossterm::event::KeyCode) {
@@ -99,7 +154,7 @@ impl Gui {
     }
     fn save_theme(&mut self, ctx: &egui::Context) {
         self.theme.apply(ctx);
-        let value = json!({"theme":match self.theme{Theme::Gruvbox=>"gruvbox",Theme::Dark=>"dark",Theme::Light=>"light"}});
+        let value = json!({"theme": self.theme.setting()});
         let result = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
@@ -149,7 +204,11 @@ impl Gui {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("c·").size(30.).color(p.accent).strong());
+                    self.show_logo(
+                        ui,
+                        30.,
+                        RichText::new("c·").size(30.).color(p.accent).strong(),
+                    );
                     if !compact {
                         ui.label(RichText::new("chord").size(23.).strong());
                     }
@@ -276,7 +335,7 @@ impl Gui {
                 ui.menu_button("⚙", |ui| {
                     ui.label(RichText::new("Appearance").small().color(p.muted));
                     let old = self.theme;
-                    for theme in [Theme::Gruvbox, Theme::Dark, Theme::Light] {
+                    for theme in Theme::OPTIONS {
                         if ui
                             .selectable_value(&mut self.theme, theme, theme.name())
                             .clicked()
@@ -285,6 +344,11 @@ impl Gui {
                         }
                     }
                     if old != self.theme {
+                        if cfg!(target_os = "macos")
+                            && (old == Theme::MacOs || self.theme == Theme::MacOs)
+                        {
+                            Self::apply_fonts(ui.ctx(), self.theme);
+                        }
                         self.save_theme(ui.ctx());
                     }
                     ui.separator();
@@ -517,7 +581,7 @@ impl Gui {
                 rect.shrink2(egui::vec2(0., 3.)),
                 8.,
                 if active {
-                    p.raised
+                    p.select
                 } else {
                     theme::tint(p.panel, p.raised, 0.45)
                 },
@@ -801,7 +865,7 @@ impl Gui {
                 let Some(chat) = self.app.active.clone() else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() * 0.32);
-                        ui.label(RichText::new("c·").size(58.).color(p.accent));
+                        self.show_logo(ui, 64., RichText::new("c·").size(58.).color(p.accent));
                         ui.heading("Your conversations");
                         ui.label(
                             RichText::new("Slack, Discord, WhatsApp, iPhone, and email")
@@ -2305,7 +2369,7 @@ impl eframe::App for Gui {
         {
             self.app.upload(path);
         }
-        let p = self.theme.palette();
+        let p = self.theme.palette(ctx.theme());
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
@@ -2595,7 +2659,7 @@ mod tests {
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let top = ui.cursor().top();
-                        gui.message(ui, &chat, &message, 0, gui.theme.palette());
+                        gui.message(ui, &chat, &message, 0, gui.theme.palette(ctx.theme()));
                         rect = egui::Rect::from_min_max(
                             egui::pos2(ui.min_rect().left(), top),
                             egui::pos2(ui.max_rect().right(), ui.cursor().top()),
@@ -2673,7 +2737,7 @@ mod tests {
                     |ctx| {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             let top = ui.cursor().top();
-                            gui.message(ui, &chat, &message, 0, gui.theme.palette());
+                            gui.message(ui, &chat, &message, 0, gui.theme.palette(ctx.theme()));
                             rect = egui::Rect::from_min_max(
                                 egui::pos2(ui.min_rect().left(), top),
                                 egui::pos2(ui.max_rect().right(), ui.cursor().top()),
@@ -2728,7 +2792,7 @@ mod tests {
             chat.contact_ids = contacts;
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let p = gui.theme.palette();
+                    let p = gui.theme.palette(ctx.theme());
                     let first = gui.conversation_row(ui, &chat, p).rect;
                     let second = gui.conversation_row(ui, &chat, p).rect;
                     assert!(
@@ -2764,7 +2828,7 @@ mod tests {
                     time: Some(frame as f64),
                     ..Default::default()
                 },
-                |ctx| gui.thread(ctx, gui.theme.palette()),
+                |ctx| gui.thread(ctx, gui.theme.palette(ctx.theme())),
             );
             divider_y = output.shapes.iter().find_map(|shape| match &shape.shape {
                 egui::Shape::Text(text) if text.galley.job.text == "New messages" => {
@@ -2802,7 +2866,8 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        let response = gui.conversation_row(ui, &chat, gui.theme.palette());
+                        let response =
+                            gui.conversation_row(ui, &chat, gui.theme.palette(ctx.theme()));
                         opened = response.context_menu_opened();
                         rect = response.rect;
                     });
@@ -2876,7 +2941,7 @@ mod tests {
         chat.title = "snipes".into();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                gui.conversation_row(ui, &chat, gui.theme.palette());
+                gui.conversation_row(ui, &chat, gui.theme.palette(ctx.theme()));
             });
         });
         fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
@@ -2930,7 +2995,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let p = gui.theme.palette();
+                    let p = gui.theme.palette(ctx.theme());
                     gui.conversation_row(ui, &lab, p);
                     gui.conversation_row(ui, &course, p);
                 });
@@ -2981,7 +3046,7 @@ mod tests {
         );
         let dots: Vec<_> = marks
             .iter()
-            .filter(|mark| mark.fill == gui.theme.palette().blue && mark.radius >= 6.)
+            .filter(|mark| mark.fill == gui.theme.palette(ctx.theme()).blue && mark.radius >= 6.)
             .collect();
         assert_eq!(dots.len(), 1, "unread dot should be the one large mark");
         let lab_ring = marks
@@ -3016,7 +3081,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    let p = gui.theme.palette();
+                    let p = gui.theme.palette(ctx.theme());
                     gui.sidebar(ctx, p);
                     gui.inbox(ctx, p);
                     gui.thread(ctx, p);

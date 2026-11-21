@@ -112,13 +112,57 @@ pub enum Response {
     InlineThread(String, Result<Value, String>),
     Operation(String, Result<Value, String>),
     ReadState(String, u64, bool, Result<Value, String>),
-    Sent(String, Result<Value, String>),
+    Sent(String, String, Result<Value, String>),
     Uploaded(String, Result<Value, String>),
     Accounts(Result<Value, String>),
     Login(String, Result<Value, String>),
+    Reaction(u64, Result<Value, String>),
 }
 fn result(r: anyhow::Result<Value>) -> Result<Value, String> {
     r.map_err(|e| format!("{e:#}"))
+}
+
+pub fn reaction_is_users(reaction: &Value, key: &str, self_id: &str) -> bool {
+    if reaction["reactionKey"].as_str() != Some(key) {
+        return false;
+    }
+    reaction["participantName"].as_str() == Some("You")
+        || reaction["local"] == true
+        || (!self_id.is_empty() && reaction["participantID"].as_str() == Some(self_id))
+}
+
+pub fn user_has_reaction(reactions: &[Value], key: &str, self_id: &str) -> bool {
+    reactions
+        .iter()
+        .any(|reaction| reaction_is_users(reaction, key, self_id))
+}
+
+fn apply_user_reaction(reactions: &mut Vec<Value>, key: &str, self_id: &str, add: bool) {
+    let present = user_has_reaction(reactions, key, self_id);
+    if add && !present {
+        reactions.push(json!({
+            "reactionKey": key,
+            "participantID": if self_id.is_empty() { "you" } else { self_id },
+            "participantName": "You",
+            "local": true,
+        }));
+    } else if !add && present {
+        reactions.retain(|reaction| !reaction_is_users(reaction, key, self_id));
+    }
+}
+
+fn now_stamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn stamp_millis(stamp: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .map(|time| time.timestamp_millis())
+        .unwrap_or(i64::MIN)
+}
+
+pub(crate) fn keeps_failure(notice: &str) -> bool {
+    notice.starts_with("Message not sent") || notice.starts_with("Reaction didn't")
 }
 
 struct ReadOverride {
@@ -127,6 +171,33 @@ struct ReadOverride {
     previous_unread: bool,
     timestamp: String,
     acknowledged_after: Option<u64>,
+}
+
+#[derive(Clone)]
+struct PendingReaction {
+    chat_id: String,
+    message_id: String,
+    key: String,
+    desired: bool,
+    /// Revision and the add/remove state that request carried.
+    sent: Option<(u64, bool)>,
+    accepted: bool,
+}
+
+#[derive(Clone)]
+struct Outgoing {
+    chat_id: String,
+    token: String,
+    local_message_id: Option<String>,
+    edit_id: Option<String>,
+    previous_text: Option<String>,
+    text: String,
+    timestamp: String,
+    draft_text: String,
+    reply: Option<Message>,
+    attachment: Option<Value>,
+    accepted: bool,
+    server_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -145,6 +216,10 @@ struct CachedThread {
 }
 pub struct App {
     pub send_busy: bool,
+    reaction_seq: u64,
+    outgoing_seq: u64,
+    pending_reactions: Vec<PendingReaction>,
+    outgoing: Vec<Outgoing>,
     pub native_ui: bool,
     pub images: crate::images::Images,
     pub api: Option<Api>,
@@ -237,6 +312,10 @@ impl App {
         });
         let mut app = Self {
             send_busy: false,
+            reaction_seq: 0,
+            outgoing_seq: 0,
+            pending_reactions: Vec::new(),
+            outgoing: Vec::new(),
             native_ui: false,
             images: crate::images::Images::default(),
             api,
@@ -722,6 +801,8 @@ impl App {
             self.message_selection = cached.selection;
             self.notice = "Showing saved messages. Updating…".into();
         }
+        self.reconcile_outgoing();
+        self.overlay_reactions();
         self.scroll = 0;
         if !self.messages.is_empty() && self.pending_read.is_some() {
             self.set_read_state(true);
@@ -936,22 +1017,21 @@ impl App {
         }
         self.mode = Mode::Compose;
     }
-    pub fn prepare_send(&mut self) {
-        if self.send_busy {
-            return;
-        }
+    pub fn prepare_send(&mut self) -> Option<String> {
         if self.editor.text.trim().is_empty() && self.pending_attachment.is_none() {
-            return;
+            return None;
         }
-        let Some(c) = self.active.clone() else { return };
+        let Some(c) = self.active.clone() else {
+            return None;
+        };
         if self.reply.is_some() && self.pending_attachment.is_some() && c.kind == "chat" {
             self.notice = "Send the text reply and attachment separately. This bridge cannot attach a native reply to media yet.".into();
-            return;
+            return None;
         }
         let mut body = json!({"text":self.editor.text});
         if c.kind == "email" {
             let Some(m) = self.reply.clone().or_else(|| self.messages.last().cloned()) else {
-                return;
+                return None;
             };
             body["to"] = json!(if m.is_sender {
                 m.to.clone()
@@ -987,31 +1067,362 @@ impl App {
         }
         .into();
         self.mode = Mode::Confirm;
-        if self.native_ui {
-            self.confirm();
-        }
+        if self.native_ui { self.confirm() } else { None }
     }
-    pub fn confirm(&mut self) {
-        if self.send_busy {
-            return;
-        }
+    pub fn confirm(&mut self) -> Option<String> {
         let (Some(c), Some(mut b)) = (self.active.clone(), self.confirm_body.take()) else {
-            return;
+            return None;
         };
         if let Some(id) = self.edit_message.clone() {
             b["messageID"] = json!(id)
         }
-        self.send_busy = !self.demo;
+        let shown = self.stage_outgoing(&c, &b);
+        self.editor = Editor::default();
+        self.reply = None;
+        self.edit_message = None;
+        self.pending_attachment = None;
+        self.mode = Mode::Browse;
+        self.send_busy = false;
+        if self.notice.starts_with("Message not sent") || self.notice.starts_with("Submitting") {
+            self.notice.clear();
+        }
+        self.remember_messages();
+        let Some(token) = self.outgoing.last().map(|item| item.token.clone()) else {
+            return shown;
+        };
         if let Some(api) = self.api.clone() {
             let route = Api::conversation(&c.id, &self.confirm_action);
             let tx = self.tx.clone();
+            let chat_id = c.id.clone();
             tokio::spawn(async move {
                 let r = api.post(&route, b).await;
-                let _ = tx.send(Response::Sent(c.id, result(r)));
+                let _ = tx.send(Response::Sent(chat_id, token, result(r)));
             });
         }
-        self.notice = "Submitting your message…".into();
-        self.mode = Mode::Compose;
+        shown
+    }
+    fn self_id(&self) -> String {
+        self.status["userID"].as_str().unwrap_or("").to_owned()
+    }
+    fn stage_outgoing(&mut self, chat: &Conversation, body: &Value) -> Option<String> {
+        self.outgoing_seq += 1;
+        let token = format!("local-{}", self.outgoing_seq);
+        let text = body["text"].as_str().unwrap_or("").to_owned();
+        let timestamp = now_stamp();
+        let edit_id = body["messageID"].as_str().map(str::to_owned);
+        let previous_text = edit_id.as_ref().and_then(|id| {
+            self.messages
+                .iter()
+                .find(|message| &message.id == id)
+                .map(|message| message.text.clone())
+        });
+        let mut attachments = Vec::new();
+        if let Some(name) = body["attachment"]["fileName"].as_str() {
+            attachments.push(json!({"fileName": name, "type": "file"}));
+        }
+        let local_message_id = if let Some(id) = &edit_id {
+            if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
+                message.text = text.clone();
+                message.send_error = None;
+            }
+            None
+        } else {
+            self.messages.push(Message {
+                id: token.clone(),
+                text: text.clone(),
+                sender_name: "You".into(),
+                is_sender: true,
+                timestamp: timestamp.clone(),
+                linked_message_id: body["replyToMessageID"].as_str().map(str::to_owned),
+                attachments,
+                ..Default::default()
+            });
+            self.message_selection = self.messages.len().saturating_sub(1);
+            Some(token.clone())
+        };
+        let shown = edit_id.clone().unwrap_or_else(|| token.clone());
+        self.outgoing.push(Outgoing {
+            chat_id: chat.id.clone(),
+            token: token.clone(),
+            local_message_id,
+            edit_id,
+            previous_text,
+            text,
+            timestamp,
+            draft_text: body["text"].as_str().unwrap_or("").to_owned(),
+            reply: self.reply.clone(),
+            attachment: self.pending_attachment.clone(),
+            accepted: false,
+            server_id: None,
+        });
+        Some(shown)
+    }
+    fn fail_outgoing(&mut self, chat_id: &str, token: &str, error: &str) {
+        let Some(index) = self
+            .outgoing
+            .iter()
+            .position(|item| item.token == token && item.chat_id == chat_id)
+        else {
+            self.notice = format!("Message not sent. {error}");
+            return;
+        };
+        let item = self.outgoing.remove(index);
+        let active = self.active.as_ref().map(|chat| chat.id.as_str()) == Some(chat_id);
+        if active {
+            if let Some(edit_id) = &item.edit_id {
+                if let Some(message) = self
+                    .messages
+                    .iter_mut()
+                    .find(|message| &message.id == edit_id)
+                {
+                    if let Some(previous) = &item.previous_text {
+                        message.text = previous.clone();
+                    }
+                }
+            } else if let Some(local_id) = &item.local_message_id {
+                self.messages.retain(|message| &message.id != local_id);
+            }
+            let idle = self.editor.text.trim().is_empty()
+                && self.pending_attachment.is_none()
+                && self.reply.is_none()
+                && self.edit_message.is_none();
+            if idle {
+                self.editor.set(item.draft_text);
+                self.reply = item.reply;
+                self.pending_attachment = item.attachment;
+                self.edit_message = item.edit_id;
+            } else if item.edit_id.is_none() {
+                self.messages.push(Message {
+                    id: item.local_message_id.clone().unwrap_or(item.token),
+                    text: item.text,
+                    sender_name: "You".into(),
+                    is_sender: true,
+                    timestamp: item.timestamp,
+                    linked_message_id: item.reply.as_ref().map(|message| message.id.clone()),
+                    attachments: item
+                        .attachment
+                        .as_ref()
+                        .map(|attachment| {
+                            vec![json!({"fileName": attachment["fileName"].as_str().unwrap_or("Attachment"), "type": "file"})]
+                        })
+                        .unwrap_or_default(),
+                    send_error: Some(error.to_owned()),
+                    ..Default::default()
+                });
+            }
+            self.message_selection = self
+                .message_selection
+                .min(self.messages.len().saturating_sub(1));
+            self.remember_messages();
+        } else if let Some(cached) = self.message_cache.get_mut(chat_id) {
+            if let Some(local_id) = &item.local_message_id {
+                cached.messages.retain(|message| &message.id != local_id);
+            }
+            if let Some(edit_id) = &item.edit_id
+                && let Some(message) = cached
+                    .messages
+                    .iter_mut()
+                    .find(|message| &message.id == edit_id)
+                && let Some(previous) = &item.previous_text
+            {
+                message.text = previous.clone();
+            }
+            let draft = self.drafts.entry(chat_id.to_owned()).or_default();
+            if draft.text.is_empty() && draft.attachment.is_none() && draft.reply.is_none() {
+                draft.text = item.draft_text;
+                draft.reply = item.reply;
+                draft.attachment = item.attachment;
+                draft.edit_message = item.edit_id;
+            }
+        }
+        self.notice = format!("Message not sent. {error}");
+    }
+    fn reconcile_outgoing(&mut self) {
+        let Some(chat_id) = self.active.as_ref().map(|chat| chat.id.clone()) else {
+            return;
+        };
+        let pending: Vec<Outgoing> = self
+            .outgoing
+            .iter()
+            .filter(|item| item.chat_id == chat_id)
+            .cloned()
+            .collect();
+        let mut drop_tokens = Vec::new();
+        let mut used = std::collections::HashSet::new();
+        for item in &pending {
+            if let Some(edit_id) = &item.edit_id {
+                if let Some(message) = self
+                    .messages
+                    .iter_mut()
+                    .find(|message| &message.id == edit_id)
+                {
+                    if item.accepted && message.text == item.text {
+                        drop_tokens.push(item.token.clone());
+                    } else {
+                        message.text = item.text.clone();
+                        message.send_error = None;
+                    }
+                }
+                continue;
+            }
+            let Some(local_id) = &item.local_message_id else {
+                continue;
+            };
+            let server_hit = item.server_id.as_ref().is_some_and(|id| {
+                self.messages
+                    .iter()
+                    .any(|message| &message.id == id && message.text == item.text)
+            });
+            let text_hit = (item.accepted && item.server_id.is_none())
+                .then(|| {
+                    self.messages.iter().find(|message| {
+                        !used.contains(&message.id)
+                            && &message.id != local_id
+                            && !message.id.starts_with("local-")
+                            && message.is_sender
+                            && message.text == item.text
+                            && stamp_millis(&message.timestamp) + 15_000
+                                >= stamp_millis(&item.timestamp)
+                    })
+                })
+                .flatten()
+                .map(|message| message.id.clone());
+            if server_hit || text_hit.is_some() {
+                if let Some(id) = text_hit {
+                    used.insert(id);
+                }
+                self.messages.retain(|message| &message.id != local_id);
+                drop_tokens.push(item.token.clone());
+                continue;
+            }
+            if !self.messages.iter().any(|message| &message.id == local_id) {
+                self.messages.push(Message {
+                    id: local_id.clone(),
+                    text: item.text.clone(),
+                    sender_name: "You".into(),
+                    is_sender: true,
+                    timestamp: item.timestamp.clone(),
+                    linked_message_id: item.reply.as_ref().map(|message| message.id.clone()),
+                    attachments: item
+                        .attachment
+                        .as_ref()
+                        .map(|attachment| {
+                            vec![json!({"fileName": attachment["fileName"].as_str().unwrap_or("Attachment"), "type": "file"})]
+                        })
+                        .unwrap_or_default(),
+                    ..Default::default()
+                });
+            }
+        }
+        self.outgoing
+            .retain(|item| !drop_tokens.contains(&item.token));
+        self.messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    }
+    pub fn queue_reaction(&mut self, chat_id: &str, message_id: &str, key: &str, add: bool) {
+        if chat_id.is_empty() || message_id.is_empty() || key.is_empty() {
+            return;
+        }
+        self.apply_reaction_local(message_id, key, add);
+        if self.demo {
+            return;
+        }
+        if let Some(pending) = self.pending_reactions.iter_mut().find(|pending| {
+            pending.chat_id == chat_id && pending.message_id == message_id && pending.key == key
+        }) {
+            pending.desired = add;
+            pending.accepted = false;
+        } else {
+            self.pending_reactions.push(PendingReaction {
+                chat_id: chat_id.to_owned(),
+                message_id: message_id.to_owned(),
+                key: key.to_owned(),
+                desired: add,
+                sent: None,
+                accepted: false,
+            });
+        }
+        if self.notice.starts_with("Reaction didn't") {
+            self.notice.clear();
+        }
+        self.pump_reactions();
+    }
+    fn apply_reaction_local(&mut self, message_id: &str, key: &str, add: bool) {
+        let self_id = self.self_id();
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            apply_user_reaction(&mut message.reactions, key, &self_id, add);
+        }
+    }
+    fn pump_reactions(&mut self) {
+        let mut jobs = Vec::new();
+        for pending in &mut self.pending_reactions {
+            if pending.sent.is_some() {
+                continue;
+            }
+            self.reaction_seq += 1;
+            let revision = self.reaction_seq;
+            pending.sent = Some((revision, pending.desired));
+            jobs.push((
+                revision,
+                pending.chat_id.clone(),
+                pending.message_id.clone(),
+                pending.key.clone(),
+                pending.desired,
+            ));
+        }
+        let Some(api) = self.api.clone() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        for (revision, chat, message, key, add) in jobs {
+            let api = api.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let route = Api::conversation(&chat, "reaction");
+                let body = json!({"messageID": message, "reactionKey": key, "remove": !add});
+                let response = result(api.post(&route, body).await);
+                let _ = tx.send(Response::Reaction(revision, response));
+            });
+        }
+    }
+    fn settle_reactions(&mut self) {
+        let self_id = self.self_id();
+        self.pending_reactions.retain(|pending| {
+            if !pending.accepted {
+                return true;
+            }
+            let Some(message) = self
+                .messages
+                .iter()
+                .find(|message| message.id == pending.message_id)
+            else {
+                return true;
+            };
+            user_has_reaction(&message.reactions, &pending.key, &self_id) != pending.desired
+        });
+    }
+    fn overlay_reactions(&mut self) {
+        let Some(chat_id) = self.active.as_ref().map(|chat| chat.id.clone()) else {
+            return;
+        };
+        let pending: Vec<(String, String, bool)> = self
+            .pending_reactions
+            .iter()
+            .filter(|pending| pending.chat_id == chat_id)
+            .map(|pending| {
+                (
+                    pending.message_id.clone(),
+                    pending.key.clone(),
+                    pending.desired,
+                )
+            })
+            .collect();
+        for (message_id, key, desired) in pending {
+            self.apply_reaction_local(&message_id, &key, desired);
+        }
     }
     pub fn load_archive_status(&mut self) {
         if let Some(api) = self.api.clone() {
@@ -1191,25 +1602,64 @@ impl App {
                 self.send_busy = false;
             }
             match event {
-                Response::Sent(id, r) => {
+                Response::Sent(id, token, r) => {
                     self.send_busy = false;
                     match r {
-                        Ok(_) => {
+                        Ok(value) => {
+                            let server_id = value["pendingMessageID"]
+                                .as_str()
+                                .or_else(|| value["id"].as_str())
+                                .map(str::to_owned);
+                            if let Some(item) = self
+                                .outgoing
+                                .iter_mut()
+                                .find(|item| item.chat_id == id && item.token == token)
+                            {
+                                item.accepted = true;
+                                item.server_id = server_id;
+                            }
                             self.drafts.remove(&id);
-                            if self.active.as_ref().is_some_and(|c| c.id == id) {
-                                self.editor = Editor::default();
-                                self.reply = None;
-                                self.edit_message = None;
-                                self.pending_attachment = None;
-                                self.mode = Mode::Browse;
+                            if self.active.as_ref().is_some_and(|chat| chat.id == id) {
                                 self.load_messages(false);
                             }
-                            self.notice =
-                                "Submitted. Checking the conversation for confirmation.".into();
                             self.refresh(false);
                         }
-                        Err(e) => self.notice = format!("Send failed. Your text is retained. {e}"),
+                        Err(error) => self.fail_outgoing(&id, &token, &error),
                     }
+                }
+                Response::Reaction(revision, response) => {
+                    let Some(index) = self
+                        .pending_reactions
+                        .iter()
+                        .position(|pending| pending.sent.is_some_and(|(sent, _)| sent == revision))
+                    else {
+                        continue;
+                    };
+                    let sent_add = self.pending_reactions[index].sent.unwrap().1;
+                    self.pending_reactions[index].sent = None;
+                    match response {
+                        Ok(_) => {
+                            if self.pending_reactions[index].desired == sent_add {
+                                self.pending_reactions[index].accepted = true;
+                                let chat_id = self.pending_reactions[index].chat_id.clone();
+                                if self.active.as_ref().is_some_and(|chat| chat.id == chat_id) {
+                                    self.load_messages(false);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if self.pending_reactions[index].desired == sent_add {
+                                let pending = self.pending_reactions.remove(index);
+                                self.apply_reaction_local(
+                                    &pending.message_id,
+                                    &pending.key,
+                                    !pending.desired,
+                                );
+                                self.notice = format!("Reaction didn't go through. {error}");
+                            }
+                        }
+                    }
+                    self.pump_reactions();
                 }
                 Response::Uploaded(id, r) => {
                     if self.active.as_ref().is_none_or(|c| c.id != id) {
@@ -1310,19 +1760,21 @@ impl App {
                                     }
                                     self.selection =
                                         self.selection.min(self.visible().len().saturating_sub(1));
-                                    self.notice = if cached && cache_error {
-                                        "Showing saved inbox. Refresh is offline.".into()
-                                    } else if cached && refreshing {
-                                        "Showing saved inbox. Updating…".into()
-                                    } else if cached {
-                                        "Loaded saved inbox".into()
-                                    } else if self.errors.is_empty() {
-                                        "Synced locally".into()
-                                    } else {
-                                        format!(
-                                            "{} account issue(s) · a to inspect",
-                                            self.errors.len()
-                                        )
+                                    if !keeps_failure(&self.notice) {
+                                        self.notice = if cached && cache_error {
+                                            "Showing saved inbox. Refresh is offline.".into()
+                                        } else if cached && refreshing {
+                                            "Showing saved inbox. Updating…".into()
+                                        } else if cached {
+                                            "Loaded saved inbox".into()
+                                        } else if self.errors.is_empty() {
+                                            "Synced locally".into()
+                                        } else {
+                                            format!(
+                                                "{} account issue(s) · a to inspect",
+                                                self.errors.len()
+                                            )
+                                        }
                                     }
                                 }
                                 Err(e) => self.notice = e.to_string(),
@@ -1341,18 +1793,20 @@ impl App {
                     self.message_loading = false;
                     match r {
                         Ok(v) => {
-                            if v["_cache"]["cached"] == true {
-                                self.notice = if v["_cache"]["error"].is_string() {
-                                    "Showing saved messages. Refresh is offline.".into()
-                                } else if v["_cache"]["refreshing"] == true {
-                                    "Showing saved messages. Updating…".into()
-                                } else {
-                                    "Loaded saved messages".into()
-                                };
-                            } else if self.notice.starts_with("Showing saved")
-                                || self.notice == "Loaded saved messages"
-                            {
-                                self.notice = "Messages updated".into();
+                            if !keeps_failure(&self.notice) {
+                                if v["_cache"]["cached"] == true {
+                                    self.notice = if v["_cache"]["error"].is_string() {
+                                        "Showing saved messages. Refresh is offline.".into()
+                                    } else if v["_cache"]["refreshing"] == true {
+                                        "Showing saved messages. Updating…".into()
+                                    } else {
+                                        "Loaded saved messages".into()
+                                    };
+                                } else if self.notice.starts_with("Showing saved")
+                                    || self.notice == "Loaded saved messages"
+                                {
+                                    self.notice = "Messages updated".into();
+                                }
                             }
                             if let Ok(mut m) =
                                 serde_json::from_value::<Vec<Message>>(v["items"].clone())
@@ -1368,6 +1822,9 @@ impl App {
                                 }
                                 m.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
                                 self.messages = m;
+                                self.settle_reactions();
+                                self.overlay_reactions();
+                                self.reconcile_outgoing();
                                 self.message_selection = if preserve && !follow_latest {
                                     selected_id
                                         .and_then(|id| {
@@ -1414,6 +1871,9 @@ impl App {
                                     replies.retain(|m| seen.insert(m.id.clone()));
                                     replies.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
                                     self.messages = replies;
+                                    self.settle_reactions();
+                                    self.overlay_reactions();
+                                    self.reconcile_outgoing();
                                     if let Some(index) = selected.and_then(|id| {
                                         self.messages.iter().position(|m| m.id == id)
                                     }) {
@@ -1617,7 +2077,9 @@ impl App {
             }
             Mode::Confirm => {
                 match key.code {
-                    KeyCode::Enter | KeyCode::Char('y') => self.confirm(),
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        self.confirm();
+                    }
                     KeyCode::Esc | KeyCode::Char('n') => {
                         self.confirm_body = None;
                         self.mode = Mode::Compose
@@ -1692,11 +2154,9 @@ impl App {
                     }
                     KeyCode::Enter => {
                         if let (Some(c), Some(m)) = (self.active.clone(), self.selected_message()) {
-                            self.operation(
-                                "Reaction queued",
-                                Api::conversation(&c.id, "reaction"),
-                                json!({"messageID":m.id,"reactionKey":REACTIONS[self.reaction]}),
-                            );
+                            let key = REACTIONS[self.reaction];
+                            let add = !user_has_reaction(&m.reactions, key, &self.self_id());
+                            self.queue_reaction(&c.id, &m.id, key, add);
                             self.mode = Mode::Browse
                         }
                     }
@@ -2181,10 +2641,15 @@ mod tests {
         app.native_ui = true;
         app.editor.set("Test draft".into());
         app.prepare_send();
-        assert_eq!(app.mode, Mode::Compose);
+        assert_eq!(app.mode, Mode::Browse);
         assert!(app.confirm_body.is_none());
-        assert_eq!(app.notice, "Submitting your message…");
-        // Demo mode has no API and cannot transmit a message.
+        assert!(app.editor.text.is_empty());
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.text == "Test draft" && message.is_sender)
+        );
+        assert!(!app.notice.contains("Submitting"));
         assert!(app.api.is_none());
     }
     #[test]
@@ -2216,8 +2681,12 @@ mod tests {
         });
         a.editor.set("Keep this unsent text".into());
         a.send_busy = true;
-        a.tx.send(Response::Sent("first".into(), Ok(json!({}))))
-            .unwrap();
+        a.tx.send(Response::Sent(
+            "first".into(),
+            "missing".into(),
+            Ok(json!({})),
+        ))
+        .unwrap();
         a.tx.send(Response::Uploaded(
             "first".into(),
             Ok(json!({"uploadID":"first-upload"})),
@@ -2231,15 +2700,164 @@ mod tests {
     #[test]
     fn send_failure_keeps_text_and_allows_retry() {
         let mut a = App::new(None, true);
+        a.native_ui = true;
         let id = a.active.as_ref().unwrap().id.clone();
         a.editor.set("Keep me".into());
-        a.send_busy = true;
-        a.tx.send(Response::Sent(id, Err("offline".into())))
+        a.prepare_send();
+        let token = a.outgoing[0].token.clone();
+        assert!(a.editor.text.is_empty());
+        assert!(a.messages.iter().any(|message| message.text == "Keep me"));
+        a.tx.send(Response::Sent(id, token, Err("offline".into())))
             .unwrap();
         a.poll();
         assert_eq!(a.editor.text, "Keep me");
         assert!(!a.send_busy);
         assert!(a.notice.contains("offline"));
+        assert!(
+            !a.messages
+                .iter()
+                .any(|message| message.id.starts_with("local-"))
+        );
+    }
+    #[test]
+    fn send_stays_visible_when_a_reload_has_not_caught_up() {
+        let mut app = App::new(None, false);
+        app.native_ui = true;
+        app.active = Some(Conversation {
+            id: "room".into(),
+            kind: "chat".into(),
+            can_send: true,
+            ..Default::default()
+        });
+        app.messages.clear();
+        app.editor.set("On my way".into());
+        app.prepare_send();
+        let token = app.outgoing[0].token.clone();
+        app.message_request_seq = 1;
+        app.tx
+            .send(Response::Messages(
+                "room".into(),
+                1,
+                Ok(json!({"items":[{"id":"older","timestamp":"2026-11-18T00:00:00.000Z","text":"earlier"}]})),
+                false,
+                false,
+            ))
+            .unwrap();
+        app.poll();
+        assert!(
+            app.messages.iter().any(|message| message.id == token),
+            "a stale page must not hide the message that is still in flight"
+        );
+        app.tx
+            .send(Response::Sent(
+                "room".into(),
+                token.clone(),
+                Ok(json!({"pendingMessageID":"$server"})),
+            ))
+            .unwrap();
+        app.poll();
+        assert!(
+            app.outgoing
+                .iter()
+                .any(|item| item.server_id.as_deref() == Some("$server"))
+        );
+        app.message_request_seq = 2;
+        app.tx
+            .send(Response::Messages(
+                "room".into(),
+                2,
+                Ok(json!({"items":[
+                    {"id":"older","timestamp":"2026-11-18T00:00:00.000Z","text":"earlier"},
+                    {"id":"$server","timestamp":"2026-11-18T01:00:00.000Z","text":"On my way","isSender":true}
+                ]})),
+                false,
+                false,
+            ))
+            .unwrap();
+        app.poll();
+        assert!(app.outgoing.is_empty());
+        assert!(!app.messages.iter().any(|message| message.id == token));
+        assert!(app.messages.iter().any(|message| message.id == "$server"));
+    }
+    #[test]
+    fn reaction_shows_immediately_and_survives_a_stale_reload() {
+        let mut app = App::new(None, false);
+        app.active = Some(Conversation {
+            id: "room".into(),
+            can_react: true,
+            ..Default::default()
+        });
+        app.status = json!({"userID":"@max:chord.local"});
+        app.messages = vec![Message {
+            id: "m".into(),
+            timestamp: "2026-11-18T00:00:00.000Z".into(),
+            reactions: vec![
+                json!({"reactionKey":"👍","participantID":"sam","participantName":"Sam"}),
+            ],
+            ..Default::default()
+        }];
+        app.queue_reaction("room", "m", "👍", true);
+        assert!(user_has_reaction(
+            &app.messages[0].reactions,
+            "👍",
+            "@max:chord.local"
+        ));
+        let revision = app.pending_reactions[0].sent.unwrap().0;
+        app.message_request_seq = 1;
+        app.tx
+            .send(Response::Messages(
+                "room".into(),
+                1,
+                Ok(json!({"items":[{"id":"m","timestamp":"2026-11-18T00:00:00.000Z","reactions":[{"reactionKey":"👍","participantID":"sam","participantName":"Sam"}]}]})),
+                false,
+                false,
+            ))
+            .unwrap();
+        app.poll();
+        assert!(
+            user_has_reaction(&app.messages[0].reactions, "👍", "@max:chord.local"),
+            "the click stays visible while the request is still out"
+        );
+        app.tx
+            .send(Response::Reaction(revision, Err("offline".into())))
+            .unwrap();
+        app.poll();
+        assert!(!user_has_reaction(
+            &app.messages[0].reactions,
+            "👍",
+            "@max:chord.local"
+        ));
+        assert!(
+            app.messages[0]
+                .reactions
+                .iter()
+                .any(|reaction| reaction["participantName"] == "Sam")
+        );
+        assert!(app.notice.contains("offline"));
+    }
+    #[test]
+    fn a_later_reaction_click_wins_over_an_older_response() {
+        let mut app = App::new(None, false);
+        app.active = Some(Conversation {
+            id: "room".into(),
+            ..Default::default()
+        });
+        app.messages = vec![Message {
+            id: "m".into(),
+            ..Default::default()
+        }];
+        app.queue_reaction("room", "m", "❤️", true);
+        let first = app.pending_reactions[0].sent.unwrap().0;
+        app.queue_reaction("room", "m", "❤️", false);
+        assert!(app.pending_reactions[0].sent.is_some());
+        assert!(!app.pending_reactions[0].desired);
+        app.tx
+            .send(Response::Reaction(first, Ok(json!({"success": true}))))
+            .unwrap();
+        app.poll();
+        assert!(!user_has_reaction(&app.messages[0].reactions, "❤️", ""));
+        assert!(app.pending_reactions[0].sent.is_some());
+        assert!(!app.pending_reactions[0].desired);
     }
     #[test]
     fn switching_conversations_retains_reply_and_attachment_and_does_not_resurrect_erased_text() {

@@ -17,6 +17,7 @@ import {matrixAction,closeMatrixWorker} from './matrix-transport.mjs';
 import {searchMessages} from './search.mjs';
 import {connectionStates} from './connections.mjs';
 import {avatarService} from './avatars.mjs';
+import {downloadEmoji} from './emoji-media.mjs';
 import {applyLocalRules,rankInbox} from './importance.mjs';
 import {bridgeInfo,startBridgeLogin,submitBridgeLogin,loginState,guilds,enableGuild} from './bridge-manager.mjs';
 
@@ -59,7 +60,7 @@ async function cachedMessages(id,url){
   return archive.store.page(c.id,{before,around:before?null:c.anchor,version:before?null:c.version});
  }
  const context={conversationID:c.threadRoot?'matrix:'+c.remote:id};
- return readCache.get(key,async()=>{await directory.refresh();const page=await conversation(id,url);page.items=await directory.enrichMessages(page.items||[],{source:c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network});context.conversation=directory.conversations.get(id)||{source:c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network};return page},{context,maxAge:c.kind==='mail'?15000:2000,fresh:url.searchParams.get('fresh')==='true',seed:!url.searchParams.has('cursor')?async()=>{const sourceFor=()=>c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network;const local=archive.store.page(id);if(local.items.length){await directory.refresh();local.items=await directory.enrichMessages(local.items,{source:sourceFor()});return {...local,hasMore:false,oldestCursor:null}}const page=await timelineSeed.page(id);if(!page)return;page.items=await directory.enrichMessages(page.items,{source:timelineSeed.rooms.get(c.remote)?.accountID||sourceFor()});return page}:undefined});
+ return readCache.get(key,async()=>{await directory.refresh();const page=await conversation(id,url);page.items=await directory.enrichMessages(page.items||[],{source:c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network,workspaceID:directory.catalog.rooms.get(c.remote)?.workspaceID});context.conversation=directory.conversations.get(id)||{source:c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network};return page},{context,maxAge:c.kind==='mail'?15000:2000,fresh:url.searchParams.get('fresh')==='true',seed:!url.searchParams.has('cursor')?async()=>{const sourceFor=()=>c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network;const local=archive.store.page(id);if(local.items.length){await directory.refresh();local.items=await directory.enrichMessages(local.items,{source:sourceFor(),workspaceID:directory.catalog.rooms.get(c.remote)?.workspaceID});return {...local,hasMore:false,oldestCursor:null}}const page=await timelineSeed.page(id);if(!page)return;page.items=await directory.enrichMessages(page.items,{source:timelineSeed.rooms.get(c.remote)?.accountID||sourceFor(),workspaceID:directory.catalog.rooms.get(c.remote)?.workspaceID});return page}:undefined});
 }
 const warmQueue=[],warmSeen=new Map();let warmActive=0;
 function warmConversations(items){
@@ -190,6 +191,7 @@ export const server=http.createServer(async(req,res)=>{try{
  if(p==='/api/matrix/crypto')return json(res,await matrixAction({config,dataDir},'crypto'));
  if(p==='/api/matrix/diagnostics'){const roomId=url.searchParams.get('roomID');if(!roomId)throw new Error('A roomID is required');return json(res,await matrixAction({config,dataDir},'diagnostics',roomId))}
  if(p==='/api/matrix/refresh'&&req.method==='POST')return json(res,await matrixAction({config,dataDir},'refresh'));
+ if(p==='/api/matrix/emoji'&&req.method==='GET'){const mxc=url.searchParams.get('mxc')||'';return json(res,await readCache.get('media:emoji:'+mxc,()=>downloadEmoji(config.matrixAccount,mxc),{maxAge:30*86400000,kind:'media'}))}
  if(p==='/api/openapi.json')return json(res,JSON.parse(await readFile(path.join(root,'openapi.json'),'utf8')));
  if(p==='/api/audit')return json(res,JSON.parse(await readFile(path.join(dataDir,'audit.json'),'utf8')));
  return json(res,{error:'Not found'},404);

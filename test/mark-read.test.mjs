@@ -41,6 +41,23 @@ test('mark read survives a concurrent room refresh replacing the conversation ob
  assert.equal(p.chats.get('!room').unreadCount,0);assert.equal(p.chats.get('!room').isMarkedUnread,false);
  await p.refreshRoomsNow();assert.equal(p.chats.get('!room').unreadCount,0);
 });
+test('a thread-only sync does not unread the channel or replace its preview',async()=>{
+ const p=new MatrixProvider({}, {userId:'@me'},{save:false});
+ p.syncToken='s1';
+ p.chats.set('!room',{id:'!room',accountID:'discord',title:'General',lastActivity:'2026-11-01T00:00:00.000Z',unreadCount:0,highlightCount:0,rawHighlightCount:0,preview:{text:'channel hello',senderName:'Ada'}});
+ p.raw=async()=>({next_batch:'s2',rooms:{join:{'!room':{timeline:{events:[{type:'m.room.message',origin_server_ts:Date.parse('2026-11-18T00:00:00Z'),sender:'@other:chord.local',content:{body:'thread reply','m.relates_to':{rel_type:'m.thread',event_id:'$root'}}}]},unread_notifications:{notification_count:4,highlight_count:2}}}}});
+ await p.refreshRoomsNow();
+ const room=p.chats.get('!room');
+ assert.equal(room.unreadCount,0);
+ assert.equal(room.highlightCount,0);
+ assert.equal(room.preview.text,'channel hello');
+ assert.equal(room.lastActivity,'2026-11-01T00:00:00.000Z');
+ p.raw=async()=>({next_batch:'s3',rooms:{join:{'!room':{timeline:{events:[{type:'m.room.message',origin_server_ts:Date.parse('2026-11-18T02:00:00Z'),sender:'@other:chord.local',content:{body:'on the channel'}}]},unread_notifications:{notification_count:1,highlight_count:0}}}}});
+ await p.refreshRoomsNow();
+ assert.equal(p.chats.get('!room').unreadCount,1);
+ assert.equal(p.chats.get('!room').preview.text,'on the channel');
+ assert.equal(p.chats.get('!room').lastActivity,new Date(Date.parse('2026-11-18T02:00:00Z')).toISOString());
+});
 test('thread replies stay out of the channel unread and mention counts',async()=>{
  const p=new MatrixProvider({}, {userId:'@me'},{save:false});
  let filter;

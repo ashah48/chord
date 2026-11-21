@@ -1,6 +1,19 @@
 import {ContactBook,phoneIdentity,mailbox,text,usableName} from './contacts.mjs';
 import {readContactCatalog} from './contact-catalog.mjs';
 
+// Workspace custom emoji are keyed by the shortcode people type, and only when
+// the bridge has already stored an mxc image. Time ranges such as 7:30-4:00
+// contain a colon pair and must stay text unless that name is a real emoji.
+export function messageEmotes(text, emoji){
+ if(!emoji)return [];
+ const found=[],seen=new Set();
+ for(const match of String(text||'').matchAll(/:([A-Za-z0-9_+-]{1,64}):/g)){
+  const name=match[1],mxc=emoji.get(name);
+  if(!mxc||seen.has(name))continue;
+  seen.add(name);found.push({name,mxc});
+ }
+ return found;
+}
 export class Directory{
  constructor(book,{blue,config}){this.book=book;this.blue=blue;this.config=config;this.refreshed=0;this.catalog={rooms:new Map(),selfIds:new Set(),errors:[]};this.profiles=new Map();this.conversations=new Map()}
  static async open(dataDir,options){return new Directory(await new ContactBook(dataDir).load(),options)}
@@ -55,6 +68,7 @@ export class Directory{
   const mentionMap=new Map();
   for(const p of this.book.list())for(const i of p.identities){const match=i.key.match(/^@(slack|discord)_(.+):chord\.local$/);if(match){const remote=match[1]==='slack'?match[2].split('-').at(-1):match[2];const key=remote.toLowerCase();const prev=mentionMap.get(key);mentionMap.set(key,prev&&prev!==p.name?null:p.name)}}
   const participantName=id=>{if(!id)return null;if(this.catalog.selfIds.has(id))return 'You';return this.book.name(id)};
+  const emoji=source==='slack'?this.catalog.slackEmoji?.get(conversation.workspaceID):null;
   const result=items.map(m=>{
    const key=keyFor(m);if(source.startsWith('mail:'))this.observeMail(m.from||m.senderName);
    if(key&&!this.book.person(key))this.book.observe({key,source,name:usableName(m.senderName)?m.senderName:null});
@@ -62,7 +76,9 @@ export class Directory{
    const isSender=m.isSender||this.catalog.selfIds.has(key);
    const fallback=source==='iphone'?'Phone contact':source==='slack'?'Slack contact':source==='discord'?'Discord contact':'Unknown contact';
    const reactions=Array.isArray(m.reactions)?m.reactions.map(r=>{const name=participantName(r?.participantID);return name?{...r,participantName:name}:r}):m.reactions;
-   return {...m,isSender,senderName:isSender?'You':resolved||fallback,senderContactID:p?.id||null,contactResolved:!!resolved,reactions,text:String(m.text||'').replace(/<@!?([a-zA-Z0-9]+)>/g,(whole,id)=>mentionMap.get(id.toLowerCase())?'@'+mentionMap.get(id.toLowerCase()):whole)};
+   const text=String(m.text||'').replace(/<@!?([a-zA-Z0-9]+)>/g,(whole,id)=>mentionMap.get(id.toLowerCase())?'@'+mentionMap.get(id.toLowerCase()):whole);
+   const emotes=messageEmotes(text, emoji);
+   return {...m,isSender,senderName:isSender?'You':resolved||fallback,senderContactID:p?.id||null,contactResolved:!!resolved,reactions,text,...(emotes.length?{emotes}:{})};
   });
   const spoken=new Map();
   for(const m of result)if(m.senderID&&(m.isSender||m.contactResolved))spoken.set(m.senderID,m.senderName);

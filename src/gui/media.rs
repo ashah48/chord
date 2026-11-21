@@ -15,12 +15,14 @@ static IMAGE_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new
 pub enum Request {
     Image(Target),
     Avatar(String),
+    Emoji(String),
 }
 impl Request {
     pub fn key(&self) -> String {
         match self {
             Self::Image(t) => t.key(),
             Self::Avatar(id) => format!("avatar:{id}"),
+            Self::Emoji(mxc) => format!("emoji:{mxc}"),
         }
     }
 }
@@ -70,7 +72,7 @@ impl Media {
                 .get(&key)
                 .is_some_and(|(attempts, after)| *attempts < 3 && Instant::now() >= *after);
         if (self.cache.contains_key(&key) && !retry)
-            || self.pending >= 8
+            || self.pending >= 16
             || (avatar && self.pending_avatars >= 2)
         {
             return;
@@ -84,6 +86,7 @@ impl Media {
         if avatar {
             self.pending_avatars += 1;
         }
+        let emoji = matches!(&request, Request::Emoji(_));
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
@@ -91,13 +94,14 @@ impl Media {
     let value=match request {
      Request::Image(t)=>api.post(&Api::conversation(&t.chat,"attachment"),serde_json::json!({"messageID":t.message,"index":t.index,"attachmentID":t.attachment["id"]})).await?,
      Request::Avatar(id)=>api.get(&format!("/api/contacts/{}/avatar",urlencoding::encode(&id))).await?,
+     Request::Emoji(mxc)=>api.get(&format!("/api/matrix/emoji?mxc={}",urlencoding::encode(&mxc))).await?,
     };
     let encoded=value["data"].as_str().ok_or_else(||anyhow::anyhow!("No image data"))?.to_owned();
     let permit = IMAGE_DECODES.acquire().await?;
     tokio::task::spawn_blocking(move||{
         let _permit = permit;
         let mut decoded=images::decode(&encoded)?;
-        let size=if avatar {128} else {1440};
+        let size=if emoji {96} else if avatar {128} else {1440};
         decoded.image=decoded.image.thumbnail(size,size);
         Ok::<_,anyhow::Error>(decoded)
     }).await?

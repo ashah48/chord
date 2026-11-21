@@ -39,6 +39,13 @@ pub struct Conversation {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
+pub struct Emote {
+    pub name: String,
+    pub mxc: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Message {
     pub historical_version: bool,
     pub id: String,
@@ -54,11 +61,15 @@ pub struct Message {
     pub reply_count: usize,
     pub reactions: Vec<Value>,
     pub attachments: Vec<Value>,
+    /// Slack custom emoji used in `text`, as `:name:` plus the homeserver image.
+    pub emotes: Vec<Emote>,
     pub to: String,
     pub from: String,
     pub subject: String,
     pub message_id_header: String,
     pub references: String,
+    /// Set only for a message this client showed before the server accepted it.
+    pub send_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

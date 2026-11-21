@@ -4,7 +4,7 @@ import {mkdtemp} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {ContactBook} from '../contacts.mjs';
-import {Directory} from '../directory.mjs';
+import {Directory,messageEmotes} from '../directory.mjs';
 import {applyLocalRules,importance,rankInbox} from '../importance.mjs';
 
 const memoryBook=()=>{const book=new ContactBook('/unused');book.save=async()=>{};return book};
@@ -58,6 +58,19 @@ test('reaction names use contacts, call you You, and reuse senders on the page',
  assert.equal(first.reactions[1].participantName,'You');
  assert.equal(first.reactions[2].participantName,'Sam');
  assert.equal(second.senderName,'Sam');
+});
+
+test('slack custom emoji in a message point at that workspace image',async()=>{
+ const directory=new Directory(memoryBook(),{blue:async()=>[],config:()=>({})});
+ directory.catalog.slackEmoji=new Map([['TSAU3JLKZ',new Map([['boomparrot','mxc://chord.local/parrot']])]]);
+ const [m]=await directory.enrichMessages([
+  {senderID:'@slack_t1-u1:chord.local',senderName:'Vyju',text:':boomparrot:wawawa and 7:30-4:00'},
+ ],{source:'slack',workspaceID:'TSAU3JLKZ'});
+ assert.equal(m.text,':boomparrot:wawawa and 7:30-4:00');
+ assert.deepEqual(m.emotes,[{name:'boomparrot',mxc:'mxc://chord.local/parrot'}]);
+ const [other]=await directory.enrichMessages([{text:':boomparrot:'}],{source:'slack',workspaceID:'TEMMBGZU3'});
+ assert.equal(other.emotes,undefined);
+ assert.deepEqual(messageEmotes(':boomparrot::party_parrot:',directory.catalog.slackEmoji.get('TSAU3JLKZ')),[{name:'boomparrot',mxc:'mxc://chord.local/parrot'}]);
 });
 
 test('message senders use contact names and local renames across linked accounts',async()=>{

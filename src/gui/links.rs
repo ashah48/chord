@@ -1,4 +1,6 @@
+use crate::model::Emote;
 use eframe::egui::{self};
+use std::collections::HashSet;
 
 fn ranges(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut links = Vec::new();
@@ -50,6 +52,25 @@ fn ranges(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
 // Keep one selectable text galley, including newlines, and hit-test the link
 // spans so a URL click does not also expand its containing message's thread.
 pub fn text(ui: &mut egui::Ui, text: &str) -> bool {
+    rich_text(ui, text, &[], |_| None)
+}
+
+// Ready Slack emotes collapse to a square and the image is painted on top.
+// A shortcode whose picture has not loaded yet stays as readable text.
+pub fn rich_text(
+    ui: &mut egui::Ui,
+    text: &str,
+    emotes: &[Emote],
+    mut texture: impl FnMut(&str) -> Option<egui::TextureHandle>,
+) -> bool {
+    let mut ready = HashSet::new();
+    let mut images = Vec::new();
+    for emote in emotes {
+        if let Some(image) = texture(&emote.mxc) {
+            ready.insert(emote.name.as_str());
+            images.push((emote.name.as_str(), image));
+        }
+    }
     let links = ranges(text);
     let font = egui::TextStyle::Body.resolve(ui.style());
     let normal = egui::TextFormat {
@@ -61,7 +82,7 @@ pub fn text(ui: &mut egui::Ui, text: &str) -> bool {
     job.wrap.max_width = ui.available_width();
     let mut offset = 0;
     for (range, _) in &links {
-        super::emoji::append(&mut job, &text[offset..range.start], normal.clone());
+        super::emoji::append_ready(&mut job, &text[offset..range.start], normal.clone(), &ready);
         job.append(
             &text[range.clone()],
             0.,
@@ -74,10 +95,27 @@ pub fn text(ui: &mut egui::Ui, text: &str) -> bool {
         );
         offset = range.end;
     }
-    super::emoji::append(&mut job, &text[offset..], normal);
+    super::emoji::append_ready(&mut job, &text[offset..], normal, &ready);
     let galley = ui.fonts_mut(|fonts| fonts.layout_job(job.clone()));
     let response = ui.add(egui::Label::new(job).wrap().selectable(true));
     super::emoji::paint(ui, &galley, response.rect.min);
+    let slots = super::emoji::custom_spans(text, &ready)
+        .into_iter()
+        .filter(|(range, _)| {
+            !links
+                .iter()
+                .any(|(link, _)| link.start < range.end && range.start < link.end)
+        })
+        .filter_map(|(range, name)| {
+            let image = images
+                .iter()
+                .find(|(candidate, _)| *candidate == name)?
+                .1
+                .clone();
+            Some((text[..range.start].chars().count(), image))
+        })
+        .collect::<Vec<_>>();
+    super::emoji::paint_custom(ui, &galley, response.rect.min, &slots);
     if let Some(pos) = response.hover_pos() {
         let local = pos - response.rect.min;
         if local.x <= galley.size().x && local.y <= galley.size().y {

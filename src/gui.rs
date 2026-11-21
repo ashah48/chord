@@ -6,7 +6,7 @@ mod theme;
 
 use crate::{
     api::Api,
-    app::{App, Mode, REACTIONS},
+    app::{App, Mode, REACTIONS, keeps_failure, reaction_is_users, user_has_reaction},
     images::Target,
     model::{Conversation, Message, day_label, one_line, source_label, time_label},
 };
@@ -32,6 +32,7 @@ pub struct Gui {
     search_focus: bool,
     message_search: bool,
     reaction_target: Option<(Conversation, Message)>,
+    reaction_detail: Option<ReactionDetail>,
     expanded_thread: Option<(String, String)>,
     search_busy: bool,
     search_seq: u64,
@@ -85,6 +86,7 @@ impl Gui {
             search_focus: false,
             message_search: false,
             reaction_target: None,
+            reaction_detail: None,
             expanded_thread: None,
             search_busy: false,
             search_seq: 0,
@@ -129,6 +131,7 @@ impl Gui {
     }
     fn choose_chat(&mut self, chat: Conversation) {
         self.expanded_thread = None;
+        self.reaction_detail = None;
         self.app.mode = Mode::Browse;
         self.app.open(chat);
         self.scroll_to = None;
@@ -583,10 +586,11 @@ impl Gui {
             }
         }
         // Account color rings the profile image. A group rings each face.
-        let account_ring = egui::Stroke::new(3., color);
+        // Sit inside the photo so the ring does not crowd the unread dot.
+        let account_ring = egui::Stroke::new(2., color);
         if !multi {
             ui.painter()
-                .circle_stroke(avatar_rect.center(), 24., account_ring);
+                .circle_stroke(avatar_rect.center(), 19., account_ring);
         } else {
             for (index, _) in members.iter().enumerate() {
                 let offset = [
@@ -596,7 +600,7 @@ impl Gui {
                 ][index];
                 let cell = egui::Rect::from_min_size(avatar_rect.min + offset, Vec2::splat(25.));
                 ui.painter()
-                    .circle_stroke(cell.center(), 14.5, account_ring);
+                    .circle_stroke(cell.center(), 10.5, account_ring);
             }
         }
         let badge = egui::Rect::from_center_size(
@@ -1016,6 +1020,7 @@ impl Gui {
                     .any(|reply| reply.thread_root_id.as_ref() == Some(&m.id)));
         let mut thread_clicked = false;
         let reaction_hovered = std::cell::Cell::new(false);
+        let reaction_clicked = std::cell::Cell::new(false);
         let response = ui
             .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
                 egui::Frame::new()
@@ -1155,7 +1160,26 @@ impl Gui {
                                     );
                                 }
                                 if !m.text.is_empty() {
-                                    thread_clicked |= links::text(ui, &m.text);
+                                    for emote in &m.emotes {
+                                        if emote.mxc.starts_with("mxc://") {
+                                            self.media.request(
+                                                Request::Emoji(emote.mxc.clone()),
+                                                self.app.api.clone(),
+                                                ui.ctx(),
+                                            );
+                                        }
+                                    }
+                                    thread_clicked |=
+                                        links::rich_text(ui, &m.text, &m.emotes, |mxc| {
+                                            self.media.texture(&format!("emoji:{mxc}"))
+                                        });
+                                }
+                                if let Some(error) = &m.send_error {
+                                    ui.label(
+                                        RichText::new(format!("Not sent · {error}"))
+                                            .small()
+                                            .color(p.accent),
+                                    );
                                 }
                                 if has_thread {
                                     let count = m.reply_count.max(
@@ -1243,34 +1267,39 @@ impl Gui {
                                         }
                                     }
                                 }
-                                let reactions = reaction_summaries(
+                                let reactions = reaction_groups(
                                     &m.reactions,
                                     self.app.status["userID"].as_str().unwrap_or(""),
                                 );
                                 if !reactions.is_empty() {
                                     ui.horizontal_wrapped(|ui| {
-                                        for (key, summary) in reactions {
-                                            let response = ui
-                                                .add_enabled(
-                                                    chat.can_react,
-                                                    emoji::button(
-                                                        ui,
-                                                        &key,
-                                                        &summary.count.to_string(),
-                                                    )
-                                                    .fill(if summary.mine {
-                                                        p.own
-                                                    } else {
-                                                        p.raised
-                                                    })
-                                                    .corner_radius(10),
-                                                )
-                                                .on_hover_text(reaction_tooltip(&summary));
+                                        for summary in reactions {
+                                            let response = ui.add(paint_reaction(
+                                                self.reaction_button(
+                                                    ui,
+                                                    &summary.key,
+                                                    summary.image.as_deref(),
+                                                    summary.shortcode.as_deref(),
+                                                    &reaction_count_label(
+                                                        summary.count,
+                                                        summary.mine,
+                                                    ),
+                                                ),
+                                                summary.mine,
+                                                p,
+                                            ));
                                             if response.hovered() {
                                                 reaction_hovered.set(true);
                                             }
                                             if response.clicked() {
-                                                self.react(chat, m, &key, summary.mine);
+                                                reaction_clicked.set(true);
+                                                self.reaction_target = None;
+                                                self.reaction_detail = Some(ReactionDetail {
+                                                    chat: chat.clone(),
+                                                    message: m.clone(),
+                                                    anchor: response.rect.center_bottom()
+                                                        + egui::vec2(0., 6.),
+                                                });
                                             }
                                         }
                                     });
@@ -1287,7 +1316,10 @@ impl Gui {
                     .clone()
                     .on_hover_text("Click to expand or collapse replies");
             }
-            if (response.clicked() || thread_clicked) && !response.double_clicked() {
+            if !reaction_clicked.get()
+                && (response.clicked() || thread_clicked)
+                && !response.double_clicked()
+            {
                 let target = (chat.id.clone(), m.id.clone());
                 if self.expanded_thread.as_ref() == Some(&target) {
                     self.expanded_thread = None;
@@ -1326,11 +1358,184 @@ impl Gui {
         if !chat.can_react {
             return;
         }
-        self.app.operation(
-            "Reaction queued",
-            Api::conversation(&chat.id, "reaction"),
-            json!({"messageID":m.id,"reactionKey":key,"remove":remove}),
-        );
+        self.app.queue_reaction(&chat.id, &m.id, key, !remove);
+    }
+    fn show_reaction_detail(&mut self, ctx: &egui::Context) {
+        let Some(detail) = self.reaction_detail.clone() else {
+            return;
+        };
+        if self.app.active.as_ref().map(|chat| chat.id.as_str()) != Some(detail.chat.id.as_str()) {
+            self.reaction_detail = None;
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.reaction_detail = None;
+            return;
+        }
+        let message = self
+            .app
+            .messages
+            .iter()
+            .find(|item| item.id == detail.message.id)
+            .cloned()
+            .unwrap_or(detail.message.clone());
+        let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
+        let p = self.theme.palette();
+        let mut open = true;
+        let mut picked = false;
+        let below = detail.anchor.y + 360. <= ctx.content_rect().bottom();
+        let shown = egui::Window::new("Reactions")
+            .id(egui::Id::new(("reaction_detail", message.id.clone())))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.)
+            .pivot(if below {
+                egui::Align2::LEFT_TOP
+            } else {
+                egui::Align2::LEFT_BOTTOM
+            })
+            .fixed_pos(detail.anchor)
+            .show(ctx, |ui| {
+                ui.set_min_width(280.);
+                ui.label(RichText::new("Quick").small().color(p.muted));
+                let groups = reaction_groups(&message.reactions, &self_id);
+                let mut keys = Vec::new();
+                for group in groups.iter().take(12) {
+                    keys.push((
+                        group.key.clone(),
+                        group.image.clone(),
+                        group.shortcode.clone(),
+                    ));
+                }
+                for key in QUICK_REACTIONS {
+                    if !keys.iter().any(|(known, _, _)| known == key) {
+                        keys.push(((*key).to_owned(), None, None));
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for (key, image, shortcode) in &keys {
+                        let mine = message
+                            .reactions
+                            .iter()
+                            .any(|reaction| reaction_is_users(reaction, key, &self_id));
+                        let button = paint_reaction(
+                            self.reaction_button(
+                                ui,
+                                key,
+                                image.as_deref(),
+                                shortcode.as_deref(),
+                                if mine { "you" } else { "" },
+                            ),
+                            mine,
+                            p,
+                        );
+                        if ui.add_enabled(detail.chat.can_react, button).clicked() {
+                            self.react(&detail.chat, &message, key, mine);
+                            picked = true;
+                        }
+                    }
+                });
+                ui.separator();
+                ui.label(RichText::new("Who reacted").small().color(p.muted));
+                egui::ScrollArea::vertical()
+                    .max_height(340.)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_max_width(300.);
+                        if groups.is_empty() {
+                            ui.label(RichText::new("No reactions yet").color(p.muted));
+                        }
+                        for group in &groups {
+                            ui.add_space(6.);
+                            ui.horizontal(|ui| {
+                                let _ = ui.add(paint_reaction(
+                                    self.reaction_button(
+                                        ui,
+                                        &group.key,
+                                        group.image.as_deref(),
+                                        group.shortcode.as_deref(),
+                                        &reaction_count_label(group.count, group.mine),
+                                    ),
+                                    group.mine,
+                                    p,
+                                ));
+                                if let Some(name) = group
+                                    .shortcode
+                                    .as_deref()
+                                    .map(emoji_name)
+                                    .filter(|name| !name.is_empty())
+                                {
+                                    ui.label(RichText::new(name).color(p.muted).size(12.));
+                                }
+                            });
+                            for name in &group.names {
+                                let you = name == "You";
+                                let mut text = RichText::new(name);
+                                if you {
+                                    text = text.strong().color(p.accent);
+                                }
+                                ui.add(egui::Label::new(text).truncate());
+                            }
+                            if group.unnamed > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} unnamed {}",
+                                        group.unnamed,
+                                        if group.unnamed == 1 {
+                                            "person"
+                                        } else {
+                                            "people"
+                                        }
+                                    ))
+                                    .small()
+                                    .color(p.muted),
+                                );
+                            }
+                        }
+                    });
+            });
+        if shown.is_some_and(|shown| shown.response.clicked_elsewhere()) {
+            open = false;
+        }
+        if !open || picked {
+            self.reaction_detail = None;
+        }
+    }
+    fn reaction_button(
+        &mut self,
+        ui: &egui::Ui,
+        key: &str,
+        image: Option<&str>,
+        shortcode: Option<&str>,
+        label: &str,
+    ) -> egui::Button<'static> {
+        let mxc = image
+            .filter(|value| value.starts_with("mxc://"))
+            .or_else(|| key.starts_with("mxc://").then_some(key));
+        if let Some(mxc) = mxc {
+            let cache_key = format!("emoji:{mxc}");
+            self.media.request(
+                Request::Emoji(mxc.to_owned()),
+                self.app.api.clone(),
+                ui.ctx(),
+            );
+            if let Some(texture) = self.media.texture(&cache_key) {
+                let image = egui::Image::new((texture.id(), egui::vec2(22., 22.)));
+                return egui::Button::image_and_text(image, label.to_owned());
+            }
+            let name = shortcode
+                .map(emoji_name)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("emoji");
+            let text = if label.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name} {label}")
+            };
+            return egui::Button::new(text);
+        }
+        emoji::button(ui, key, label)
     }
     fn reaction_picker(&mut self, ctx: &egui::Context) {
         let Some((chat, message)) = self.reaction_target.clone() else {
@@ -1352,15 +1557,20 @@ impl Gui {
                 ui.label(RichText::new(&chat.title).strong());
                 ui.label(&message.sender_name);
                 ui.add(egui::Label::new(one_line(&message.text)).truncate());
-                ui.label("Choose an emoji. Select your existing reaction to remove it.");
+                ui.label("Yours are marked you. Select one again to remove it.");
+                let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
                 ui.horizontal_wrapped(|ui| {
                     for key in REACTIONS {
-                        let mine = message.reactions.iter().any(|r| {
-                            r["reactionKey"] == *key
-                                && r["participantID"].is_string()
-                                && r["participantID"] == self.app.status["userID"]
-                        });
-                        if ui.add(emoji::button(ui, key, "").selected(mine)).clicked() {
+                        let mine = message
+                            .reactions
+                            .iter()
+                            .any(|reaction| reaction_is_users(reaction, key, &self_id));
+                        let button = paint_reaction(
+                            emoji::button(ui, key, if mine { "you" } else { "" }),
+                            mine,
+                            self.theme.palette(),
+                        );
+                        if ui.add(button).clicked() {
                             self.react(&chat, &message, key, mine);
                             picked = true;
                         }
@@ -1374,10 +1584,17 @@ impl Gui {
     fn reaction_menu(&mut self, ui: &mut egui::Ui, chat: &Conversation, m: &Message, p: Palette) {
         ui.menu_button(RichText::new("☺").color(p.muted), |ui| {
             ui.set_max_width(260.);
+            let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
             ui.horizontal_wrapped(|ui| {
                 for key in REACTIONS {
-                    if ui.add(emoji::button(ui, key, "")).clicked() {
-                        self.react(chat, m, key, false);
+                    let mine = user_has_reaction(&m.reactions, key, &self_id);
+                    let button = paint_reaction(
+                        emoji::button(ui, key, if mine { "you" } else { "" }),
+                        mine,
+                        p,
+                    );
+                    if ui.add(button).clicked() {
+                        self.react(chat, m, key, mine);
                         ui.close();
                     }
                 }
@@ -1473,7 +1690,7 @@ impl Gui {
                 }
             });
         }
-        let enabled = chat.can_send && !self.file_busy && !self.app.send_busy;
+        let enabled = chat.can_send && !self.file_busy;
         egui::Frame::new()
             .fill(p.panel)
             .stroke(egui::Stroke::new(1.0_f32, p.line))
@@ -1562,7 +1779,9 @@ impl Gui {
                             .clicked()
                             || (can_send && send_key)
                         {
-                            self.app.prepare_send();
+                            if let Some(id) = self.app.prepare_send() {
+                                self.scroll_to = Some(id);
+                            }
                         }
                     });
                 });
@@ -2243,6 +2462,7 @@ impl Gui {
 impl eframe::App for Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.reaction_picker(ctx);
+        self.show_reaction_detail(ctx);
         self.app.poll();
         if self.gallery.is_empty()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -2308,8 +2528,14 @@ impl eframe::App for Gui {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::Label::new(RichText::new(&self.app.notice).size(11.).color(p.muted))
-                            .truncate(),
+                        egui::Label::new(RichText::new(&self.app.notice).size(11.).color(
+                            if keeps_failure(&self.app.notice) {
+                                p.accent
+                            } else {
+                                p.muted
+                            },
+                        ))
+                        .truncate(),
                     );
                     if !self.app.errors.is_empty()
                         && ui
@@ -2347,62 +2573,122 @@ impl eframe::App for Gui {
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
-#[derive(Default)]
-struct ReactionSummary {
+#[derive(Clone)]
+struct ReactionDetail {
+    chat: Conversation,
+    message: Message,
+    anchor: egui::Pos2,
+}
+struct ReactionGroup {
+    key: String,
+    image: Option<String>,
+    shortcode: Option<String>,
     count: usize,
     mine: bool,
     names: Vec<String>,
+    unnamed: usize,
+}
+const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🎉"];
+
+fn emoji_name(shortcode: &str) -> &str {
+    shortcode.trim().trim_matches(':')
 }
 
-fn reaction_summaries(reactions: &[Value], self_id: &str) -> BTreeMap<String, ReactionSummary> {
-    let mut grouped = BTreeMap::<String, ReactionSummary>::new();
-    let mut seen = BTreeMap::<String, Vec<String>>::new();
+fn reaction_count_label(count: usize, mine: bool) -> String {
+    if mine {
+        format!("{count} · you")
+    } else {
+        count.to_string()
+    }
+}
+
+fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui::Button<'static> {
+    button
+        .fill(if mine {
+            theme::tint(p.raised, p.accent, 0.62)
+        } else {
+            p.raised
+        })
+        .stroke(egui::Stroke::new(if mine { 2. } else { 0. }, p.accent))
+        .corner_radius(10)
+}
+
+fn reaction_groups(reactions: &[Value], self_id: &str) -> Vec<ReactionGroup> {
+    let mut groups = Vec::<ReactionGroup>::new();
+    let mut seen = Vec::<(String, String)>::new();
     for reaction in reactions {
         let key = reaction["reactionKey"].as_str().unwrap_or("?").to_owned();
         let id = reaction["participantID"]
             .as_str()
-            .filter(|id| !id.is_empty());
-        if let Some(id) = id {
-            let seen_ids = seen.entry(key.clone()).or_default();
-            if seen_ids.iter().any(|known| known == id) {
-                continue;
-            }
-            seen_ids.push(id.to_owned());
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        if let Some(id) = id.as_ref()
+            && seen
+                .iter()
+                .any(|(known_key, known_id)| known_key == &key && known_id == id)
+        {
+            continue;
         }
-        let summary = grouped.entry(key).or_default();
-        summary.count += 1;
+        if let Some(id) = id.clone() {
+            seen.push((key.clone(), id));
+        }
         let named = reaction["participantName"]
             .as_str()
             .map(str::trim)
-            .filter(|name| !name.is_empty());
-        let mine = id.is_some_and(|id| id == self_id) || named == Some("You");
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        let mine = reaction_is_users(reaction, &key, self_id);
+        let image = reaction["image"]
+            .as_str()
+            .filter(|value| value.starts_with("mxc://"))
+            .map(str::to_owned)
+            .or_else(|| key.starts_with("mxc://").then(|| key.clone()));
+        let shortcode = reaction["shortcode"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        if !groups.iter().any(|group| group.key == key) {
+            groups.push(ReactionGroup {
+                key: key.clone(),
+                image: image.clone(),
+                shortcode: shortcode.clone(),
+                count: 0,
+                mine: false,
+                names: Vec::new(),
+                unnamed: 0,
+            });
+        }
+        let group = groups
+            .iter_mut()
+            .find(|group| group.key == key)
+            .expect("reaction group exists");
+        if group.image.is_none() {
+            group.image = image;
+        }
+        if group.shortcode.is_none() {
+            group.shortcode = shortcode;
+        }
+        // Discord and Slack echo your reaction from a bridge puppet as well as
+        // your Matrix user. Both are you, so the chip can only move by one.
         if mine {
-            summary.mine = true;
-            if !summary.names.iter().any(|name| name == "You") {
-                summary.names.insert(0, "You".into());
+            if !group.mine {
+                group.count += 1;
+                group.mine = true;
+                if !group.names.iter().any(|name| name == "You") {
+                    group.names.insert(0, "You".into());
+                }
             }
-        } else if let Some(name) = named {
-            summary.names.push(name.to_owned());
+        } else {
+            group.count += 1;
+            if let Some(name) = named {
+                group.names.push(name);
+            } else {
+                group.unnamed += 1;
+            }
         }
     }
-    grouped
-}
-
-fn reaction_tooltip(summary: &ReactionSummary) -> String {
-    if summary.names.is_empty() {
-        return if summary.mine {
-            "Remove your reaction".into()
-        } else {
-            "React".into()
-        };
-    }
-    const LIMIT: usize = 12;
-    if summary.names.len() <= LIMIT {
-        return summary.names.join("\n");
-    }
-    let mut lines = summary.names[..LIMIT].to_vec();
-    lines.push(format!("and {} more", summary.names.len() - LIMIT));
-    lines.join("\n")
+    groups
 }
 
 // Keep loaded Slack replies beside their parent while retaining their original
@@ -2496,35 +2782,47 @@ pub fn run(app: App) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn reaction_hover_lists_people_and_puts_you_first() {
+    fn reaction_list_names_everyone_and_puts_you_first() {
         let reactions = vec![
             json!({"reactionKey":"👍","participantID":"alex","participantName":"Alex Chen"}),
             json!({"reactionKey":"👍","participantID":"alex","participantName":"Alex Chen"}),
             json!({"reactionKey":"👍","participantID":"@max:chord.local","participantName":"Max"}),
+            json!({"reactionKey":"👍","participantID":"@discord_max:chord.local","participantName":"You"}),
+            json!({"reactionKey":"👍","participantID":"local-you","participantName":"You","local":true}),
             json!({"reactionKey":"👍","participantID":"sam","participantName":"Sam"}),
             json!({"reactionKey":"❤️","participantID":"unknown"}),
+            json!({"reactionKey":"mxc://chord.local/blob","shortcode":":blobcat:","participantID":"pat","participantName":"Pat"}),
         ];
-        let grouped = reaction_summaries(&reactions, "@max:chord.local");
-        let thumbs = &grouped["👍"];
+        let grouped = reaction_groups(&reactions, "@max:chord.local");
+        let thumbs = grouped.iter().find(|group| group.key == "👍").unwrap();
         assert_eq!(thumbs.count, 3);
         assert!(thumbs.mine);
         assert_eq!(thumbs.names, ["You", "Alex Chen", "Sam"]);
-        assert_eq!(reaction_tooltip(thumbs), "You\nAlex Chen\nSam");
-        let heart = &grouped["❤️"];
+        let heart = grouped.iter().find(|group| group.key == "❤️").unwrap();
         assert_eq!(heart.count, 1);
         assert!(!heart.mine);
         assert!(heart.names.is_empty());
-        assert_eq!(reaction_tooltip(heart), "React");
+        assert_eq!(heart.unnamed, 1);
+        let custom = grouped
+            .iter()
+            .find(|group| group.key == "mxc://chord.local/blob")
+            .unwrap();
+        assert_eq!(custom.image.as_deref(), Some("mxc://chord.local/blob"));
+        assert_eq!(custom.shortcode.as_deref(), Some(":blobcat:"));
+        assert_eq!(custom.names, ["Pat"]);
         let mut many = Vec::new();
-        for index in 0..14 {
+        for index in 0..40 {
             many.push(json!({"reactionKey":"🎉","participantID":format!("p{index}"),"participantName":format!("Person {index}")}));
         }
-        let party = &reaction_summaries(&many, "")["🎉"];
-        assert_eq!(party.count, 14);
-        assert_eq!(
-            reaction_tooltip(party),
-            "Person 0\nPerson 1\nPerson 2\nPerson 3\nPerson 4\nPerson 5\nPerson 6\nPerson 7\nPerson 8\nPerson 9\nPerson 10\nPerson 11\nand 2 more"
-        );
+        let party = reaction_groups(&many, "")
+            .into_iter()
+            .find(|group| group.key == "🎉")
+            .unwrap();
+        assert_eq!(party.count, 40);
+        assert_eq!(party.names.len(), 40);
+        assert_eq!(party.names[0], "Person 0");
+        assert_eq!(party.names[39], "Person 39");
+        assert!(party.names.iter().all(|name| !name.contains("more")));
     }
     #[test]
     fn bundled_fonts_cover_message_and_reaction_emoji() {
@@ -2942,7 +3240,7 @@ mod tests {
         let ring = |color: Color32| {
             marks
                 .iter()
-                .any(|mark| mark.stroke == color && mark.stroke_width >= 2.5 && mark.radius >= 14.)
+                .any(|mark| mark.stroke == color && mark.stroke_width >= 2. && mark.radius >= 10.)
         };
         assert!(ring(lab_color), "lab ring missing");
         assert!(
@@ -2956,7 +3254,7 @@ mod tests {
         assert_eq!(dots.len(), 1, "unread dot should be the one large mark");
         let lab_ring = marks
             .iter()
-            .find(|mark| mark.stroke == lab_color && mark.stroke_width >= 2.5)
+            .find(|mark| mark.stroke == lab_color && mark.stroke_width >= 2.)
             .expect("lab ring");
         assert!(
             dots[0].center.x < lab_ring.center.x,

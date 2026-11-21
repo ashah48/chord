@@ -356,16 +356,26 @@ impl App {
                     && (!self.unread || c.unread)
             })
             .collect();
-        if let Some(pins) = self.pins.get(SOURCES[self.source].0) {
-            // Stable, so unpinned chats keep the inbox's most-recent-first order.
-            chats.sort_by_key(|c| pins.iter().position(|id| *id == c.id).unwrap_or(usize::MAX));
-        }
+        let pins = self.tab_pins();
+        // Stable, so unpinned chats keep the inbox's most-recent-first order.
+        chats.sort_by_key(|c| pins.iter().position(|id| *id == c.id).unwrap_or(usize::MAX));
         chats
     }
+    // An app tab shows its own pins first, then anything pinned in All accounts.
+    fn tab_pins(&self) -> Vec<String> {
+        let key = SOURCES[self.source].0;
+        let mut pins = self.pins.get(key).cloned().unwrap_or_default();
+        if key != SOURCES[0].0 {
+            for id in self.pins.get(SOURCES[0].0).into_iter().flatten() {
+                if !pins.contains(id) {
+                    pins.push(id.clone());
+                }
+            }
+        }
+        pins
+    }
     pub fn is_pinned(&self, id: &str) -> bool {
-        self.pins
-            .get(SOURCES[self.source].0)
-            .is_some_and(|pins| pins.iter().any(|p| p == id))
+        self.tab_pins().iter().any(|p| p == id)
     }
     pub fn pinned_count(&self) -> usize {
         self.visible()
@@ -375,26 +385,35 @@ impl App {
     }
     // Pin `id` at `position` among the visible pinned chats of this tab, or unpin it with None.
     // Pinned chats that are not loaded right now keep their place after the visible ones.
+    // Unpinning in All also unpins every app tab, and unpinning in an app tab also unpins All,
+    // so a chat never stays pinned through the other view.
     pub fn move_pin(&mut self, id: &str, position: Option<usize>) {
+        let pins = self.tab_pins();
         let shown: Vec<String> = self
             .visible()
             .into_iter()
-            .filter(|c| self.is_pinned(&c.id) && c.id != id)
+            .filter(|c| pins.contains(&c.id) && c.id != id)
             .map(|c| c.id.clone())
             .collect();
-        let active = self.active.as_ref().map(|c| c.id.clone());
-        let pins = self.pins.entry(SOURCES[self.source].0.into()).or_default();
         let hidden: Vec<String> = pins
-            .iter()
-            .filter(|p| *p != id && !shown.contains(p))
-            .cloned()
+            .into_iter()
+            .filter(|p| p != id && !shown.contains(p))
             .collect();
         let mut order = shown;
         if let Some(position) = position {
             order.insert(position.min(order.len()), id.to_owned());
         }
         order.extend(hidden);
-        *pins = order;
+        let key = SOURCES[self.source].0;
+        if position.is_none() {
+            for (tab, tab_pins) in self.pins.iter_mut() {
+                if key == SOURCES[0].0 || tab == SOURCES[0].0 {
+                    tab_pins.retain(|p| p != id);
+                }
+            }
+        }
+        self.pins.insert(key.into(), order);
+        let active = self.active.as_ref().map(|c| c.id.clone());
         if let Some(active) = active
             && let Some(index) = self.visible().iter().position(|c| c.id == active)
         {
@@ -2072,8 +2091,35 @@ mod tests {
         let mut rest = ids.clone();
         rest.retain(|id| *id != ids[3]);
         assert_eq!(order(&app), [vec![ids[3].clone()], rest].concat());
-        app.source = 1;
-        assert!(!app.is_pinned(&ids[3]));
+    }
+    #[test]
+    fn pins_from_all_accounts_carry_into_each_app_tab() {
+        let mut app = App::new(None, true);
+        let slack = SOURCES.iter().position(|s| s.0 == "slack").unwrap();
+        let chat = app
+            .conversations
+            .iter()
+            .find(|c| c.source == "slack")
+            .unwrap()
+            .id
+            .clone();
+        app.source = 0;
+        app.move_pin(&chat, Some(0));
+        app.source = slack;
+        assert!(app.is_pinned(&chat));
+        assert_eq!(app.visible()[0].id, chat);
+        app.move_pin(&chat, None);
+        assert!(!app.is_pinned(&chat));
+        app.source = 0;
+        assert!(!app.is_pinned(&chat));
+        app.source = slack;
+        app.move_pin(&chat, Some(0));
+        app.source = 0;
+        assert!(!app.is_pinned(&chat));
+        app.move_pin(&chat, Some(0));
+        app.move_pin(&chat, None);
+        app.source = slack;
+        assert!(!app.is_pinned(&chat));
     }
 
     use super::*;

@@ -138,8 +138,14 @@ pub fn rich_text(
     response.clicked()
 }
 
-pub fn open(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("brave")
+pub fn open(url: impl AsRef<std::ffi::OsStr>) -> std::io::Result<()> {
+    // macOS hands URLs and files to the user's default browser or viewer.
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "brave"
+    };
+    std::process::Command::new(program)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

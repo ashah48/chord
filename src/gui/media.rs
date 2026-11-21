@@ -12,6 +12,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 // Large phone photos can require hundreds of MB before resizing.
 static IMAGE_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+const MAX_IMAGES: usize = 96;
+const MAX_IMAGE_BYTES: usize = 48 * 1024 * 1024;
+const MAX_AVATARS: usize = 2048;
+
 pub enum Request {
     Image(Target),
     Avatar(String),
@@ -136,6 +140,11 @@ impl Media {
                                 egui::TextureOptions::LINEAR,
                             );
                             data.image = image::DynamicImage::new_rgba8(0, 0);
+                            // Avatars are only ever drawn from their texture, so keeping the
+                            // original encoded bytes just wastes the shared byte budget.
+                            if key.starts_with("avatar:") {
+                                data.bytes = Vec::new();
+                            }
                             self.cache.insert(
                                 key,
                                 Entry::Ready {
@@ -163,29 +172,49 @@ impl Media {
                 event => others.push(event),
             }
         }
-        // Bound original-file and texture storage, retaining the most recently shown media.
-        let mut bytes: usize = self
-            .cache
-            .values()
-            .map(|e| match e {
-                Entry::Ready { data, .. } => data.bytes.len(),
-                _ => 0,
-            })
-            .sum();
-        while bytes > 48 * 1024 * 1024 || self.cache.len() > 96 {
+        self.evict();
+        others
+    }
+    // Bound original-file and texture storage, retaining the most recently shown media.
+    // Only Ready entries count toward the limits: Loading and Failed placeholders cannot be
+    // evicted, so counting them made every Ready texture (including all sidebar avatars)
+    // get dropped and reloaded each frame once enough placeholders had piled up.
+    // Avatars are small and redrawn constantly, so they get their own, larger budget and
+    // do not compete with full-size images.
+    fn evict(&mut self) {
+        loop {
+            let (mut bytes, mut images, mut avatars) = (0usize, 0usize, 0usize);
+            for (k, v) in &self.cache {
+                if let Entry::Ready { data, .. } = v {
+                    if k.starts_with("avatar:") {
+                        avatars += 1;
+                    } else {
+                        images += 1;
+                        bytes += data.bytes.len();
+                    }
+                }
+            }
+            let evict_avatar = if images <= MAX_IMAGES && bytes <= MAX_IMAGE_BYTES {
+                if avatars <= MAX_AVATARS {
+                    return;
+                }
+                true
+            } else {
+                false
+            };
             let oldest = self
                 .cache
                 .iter()
                 .filter_map(|(k, v)| match v {
-                    Entry::Ready { used, data, .. } => Some((k.clone(), *used, data.bytes.len())),
+                    Entry::Ready { used, .. } if k.starts_with("avatar:") == evict_avatar => {
+                        Some((k.clone(), *used))
+                    }
                     _ => None,
                 })
-                .min_by_key(|(_, used, _)| *used);
-            let Some((key, _, size)) = oldest else { break };
+                .min_by_key(|(_, used)| *used);
+            let Some((key, _)) = oldest else { return };
             self.cache.remove(&key);
-            bytes = bytes.saturating_sub(size);
         }
-        others
     }
     pub fn texture(&mut self, key: &str) -> Option<TextureHandle> {
         match self.cache.get_mut(key) {
@@ -250,13 +279,7 @@ impl Media {
         };
         let file = images::save(data, target.name()).map_err(|e| e.to_string())?;
         if brave {
-            std::process::Command::new("brave")
-                .arg(&file)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| e.to_string())?;
+            crate::gui::links::open(&file).map_err(|e| e.to_string())?;
         }
         Ok(file)
     }

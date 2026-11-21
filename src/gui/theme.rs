@@ -121,10 +121,10 @@ pub fn service_color(source: usize) -> Color32 {
 /// Sidebar color for one connected account. Slack workspaces are separate
 /// accounts: `slack:T…` picks a stable color that stays off the other networks.
 pub fn account_color(account_key: &str) -> Color32 {
-    if let Some(team) = account_key.strip_prefix("slack:") {
-        if !team.is_empty() {
-            return slack_workspace_color(team);
-        }
+    if let Some(team) = account_key.strip_prefix("slack:")
+        && !team.is_empty()
+    {
+        return slack_workspace_color(team);
     }
     let index = crate::model::SOURCES
         .iter()

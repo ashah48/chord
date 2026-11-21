@@ -1,6 +1,6 @@
 mod emoji;
 mod icons;
-mod links;
+pub(crate) mod links;
 mod media;
 mod theme;
 
@@ -59,7 +59,7 @@ impl Gui {
                 .push("emoji".into());
         }
         ctx.set_fonts(fonts);
-        let settings_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("private/ui.json");
+        let settings_path = settings_path();
         let settings: Value = std::fs::read(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
@@ -110,6 +110,9 @@ impl Gui {
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
+            }
+            if let Some(dir) = self.settings_path.parent() {
+                std::fs::create_dir_all(dir)?;
             }
             opts.open(&self.settings_path)?
                 .write_all(value.to_string().as_bytes())
@@ -587,7 +590,7 @@ impl Gui {
         }
         // Account color rings the profile image. A group rings each face.
         // Sit inside the photo so the ring does not crowd the unread dot.
-        let account_ring = egui::Stroke::new(2., color);
+        let account_ring = egui::Stroke::new(2.0_f32, color);
         if !multi {
             ui.painter()
                 .circle_stroke(avatar_rect.center(), 19., account_ring);
@@ -2398,8 +2401,12 @@ impl Gui {
                         open = false;
                     }
                     ui.add_enabled_ui(ready, |ui| {
-                        if icons::gallery_button(ui, icons::GalleryIcon::External, "Open in Brave")
-                            .clicked()
+                        if icons::gallery_button(
+                            ui,
+                            icons::GalleryIcon::External,
+                            "Open in browser",
+                        )
+                        .clicked()
                             && let Err(error) = self.media.save(&target, true)
                         {
                             self.app.notice = error;
@@ -2567,7 +2574,7 @@ impl eframe::App for Gui {
         });
         for url in urls {
             if let Err(error) = links::open(&url) {
-                self.app.notice = format!("Could not open Brave: {error}");
+                self.app.notice = format!("Could not open the link: {error}");
             }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -2758,13 +2765,36 @@ fn initials(name: &str) -> String {
         result
     }
 }
+// Where UI preferences (the chosen theme) persist between launches. A release build's
+// CARGO_MANIFEST_DIR is the build machine's checkout, which does not exist on the user's
+// Mac, so a packaged app must store settings under its per-user Application Support folder.
+// Other platforms and source checkouts keep using private/ui.json next to the source.
+fn settings_path() -> PathBuf {
+    if cfg!(all(target_os = "macos", not(test)))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join("Library/Application Support/Chord/ui.json");
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("private/ui.json")
+}
 pub fn run(app: App) -> anyhow::Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Chord")
+        .with_app_id("dev.chord.Chord")
+        .with_inner_size([1240., 820.])
+        .with_min_inner_size([760., 520.]);
+    // Without an explicit icon, eframe replaces the bundle's Dock icon with the egui logo.
+    if cfg!(target_os = "macos") {
+        let icon =
+            image::load_from_memory(include_bytes!("../assets/macos/icon.png"))?.into_rgba8();
+        viewport = viewport.with_icon(egui::IconData {
+            width: icon.width(),
+            height: icon.height(),
+            rgba: icon.into_raw(),
+        });
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Chord")
-            .with_app_id("dev.chord.Chord")
-            .with_inner_size([1240., 820.])
-            .with_min_inner_size([760., 520.]),
+        viewport,
         renderer: eframe::Renderer::Glow,
         // Wayland already schedules presentation. Waiting for a swap interval can
         // block the event loop when a scratchpad surface is hidden.

@@ -1370,7 +1370,7 @@ fn render_accounts(frame: &mut Frame, app: &App, t: Theme) {
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            "iPhone     direct BlueFerry over Bluetooth",
+            "iMessages  direct BlueFerry over Bluetooth",
             Style::new().fg(t.aqua),
         )),
     ]);

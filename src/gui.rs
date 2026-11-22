@@ -2814,7 +2814,7 @@ fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui
         } else {
             p.raised
         })
-        .stroke(egui::Stroke::new(if mine { 2. } else { 0. }, p.accent))
+        .stroke(egui::Stroke::new(if mine { 2.0_f32 } else { 0. }, p.accent))
         .corner_radius(10)
 }
 

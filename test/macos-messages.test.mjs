@@ -114,6 +114,9 @@ test('helpers', () => {
     assert.equal(groupName(['A', 'B', 'C']), 'A, B, C');
     assert.equal(groupName(['A', 'B', 'C', 'D', 'E']), 'A, B & 3 more');
     assert.equal(attributedText(null), null);
+    for (const marker of [0x81, 0x82]) {
+        assert.equal(attributedText(Buffer.concat([Buffer.from('NSString+'), Buffer.from([marker])])), null);
+    }
     assert.equal(attributedText(richBody('héllo')), 'héllo');
     assert.equal(accessApp({TERM_PROGRAM: 'Apple_Terminal'}), 'Terminal');
     assert.equal(accessApp({}), 'Chord');

@@ -89,6 +89,9 @@ iMessage conversation, macOS may ask whether Chord's backend can control
 Messages. Replies to groups and SMS, and attachments, are outside this
 preview. Keep using the Messages app for those.
 
+Turning off Messages stops live access and hides its inbox rows. Previously
+archived conversations remain available in archive search.
+
 ## Checks for an assistant
 
 - `sw_vers -productVersion` checks macOS. `sysctl -n hw.optional.arm64`

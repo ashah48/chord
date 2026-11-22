@@ -42,9 +42,11 @@ export function attributedText(blob) {
     let length = bytes[at];
     at += 1;
     if (length === 0x81) {
+        if (at + 2 > bytes.length) return null;
         length = bytes.readUInt16LE(at);
         at += 2;
     } else if (length === 0x82) {
+        if (at + 4 > bytes.length) return null;
         length = bytes.readUInt32LE(at);
         at += 4;
     }

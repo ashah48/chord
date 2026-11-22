@@ -65,8 +65,8 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "set_importance",
-            "Set a local conversation rule. priority is auto, important, or quiet. muteMinutes is 60, 240, 1440, 4320, or 10080, or null to unmute. Does not change network mute or read state.",
-            json!({"conversationID":{"type":"string"},"priority":{"type":"string","enum":["auto","important","quiet"]},"muteMinutes":{"type":["integer","null"]}}),
+            "Set a local conversation rule. priority is auto or important. muteMinutes is 60, 240, 1440, 4320, or 10080, or null to unmute. Does not change network mute or read state.",
+            json!({"conversationID":{"type":"string"},"priority":{"type":"string","enum":["auto","important"]},"muteMinutes":{"type":["integer","null"]}}),
             vec!["conversationID"],
             false,
         ),

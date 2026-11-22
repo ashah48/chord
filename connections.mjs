@@ -15,7 +15,7 @@ export async function connectionStates({config, bridgeInfo, mailAccounts, checkM
    try {await checkMail(a.id);return {id:'mail:'+a.id,name:a.id==='home'?'Personal email':'CMU email',email:a.email,connected:true,state:'connected',detail:'Gmail account verified',canConnect:false}}
    catch(e){return {id:'mail:'+a.id,name:a.id==='home'?'Personal email':'CMU email',email:a.email,connected:false,state:'offline',detail:e.message,canConnect:false}}
   }),
-  (async()=>{try{const s=await blue('GetStatus');return {id:'iphone',name:'iMessages',connected:!!s.map,state:s.map?'connected':'offline',detail:s.map?'Bluetooth messages available':s.connectivity_detail||'Reconnect your iPhone over Bluetooth',cached:true,canConnect:false}}catch(e){return {id:'iphone',name:'iMessages',connected:false,state:'offline',detail:'BlueFerry is unavailable',canConnect:false}}})(),
+  (async()=>{try{const s=await blue('GetStatus');return {id:'iphone',name:'Messages',connected:!!s.map,state:s.map?'connected':'offline',detail:s.map?'Bluetooth messages available':s.connectivity_detail||'Reconnect your iPhone over Bluetooth',cached:true,canConnect:false}}catch(e){return {id:'iphone',name:'Messages',connected:false,state:'offline',detail:'BlueFerry is unavailable',canConnect:false}}})(),
  ]);
  return {checkedAt,items};
 }

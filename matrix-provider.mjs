@@ -10,7 +10,7 @@ const enc=encodeURIComponent;
 const ACTIVITY_VERSION=4;
 const MESSAGE_TYPES=['m.room.message','m.room.encrypted','m.sticker'];
 const isMessageEvent=e=>!!e&&e.state_key===undefined&&(!e.type||MESSAGE_TYPES.includes(e.type));
-const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'iMessages':'Matrix';
+const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'Messages':'Matrix';
 const page=(items,limit=200,offset=0)=>({items:items.slice(offset,offset+limit),hasMore:items.length>offset+limit,oldestCursor:String(offset+limit),newestCursor:null});
 const threadEvent=event=>event?.content?.['m.relates_to']?.rel_type==='m.thread';
 const isChannelEvent=e=>isMessageEvent(e)&&!threadEvent(e)&&e.content?.['m.relates_to']?.rel_type!=='m.replace';
@@ -281,6 +281,7 @@ export class MatrixProvider{
    if(Date.now()-(this.lastRoomRefresh||0)>5000)await this.refreshRooms();
    let rooms=[...this.chats.values()].filter(c=>!q.has('accountIDs')||q.getAll('accountIDs').includes(c.accountID));
    if(q.get('query'))rooms=rooms.filter(c=>c.title.toLowerCase().includes(q.get('query').toLowerCase()));if(q.get('type')&&q.get('type')!=='any')rooms=rooms.filter(c=>c.type===q.get('type'));if(q.get('unreadOnly')==='true')rooms=rooms.filter(c=>c.unreadCount||c.isMarkedUnread);if(q.get('inbox'))rooms=rooms.filter(c=>q.get('inbox')==='archive'?c.isArchived:!c.isArchived);
+   const only=new Set(q.getAll('onlyRoom'));if(only.size)rooms=rooms.filter(room=>only.has(room.id));
    rooms=rooms.map(c=>roomListing(c,this.timelines.get(c.id)));
    const compare=(a,b)=>((Date.parse(b.lastActivity)||0)-(Date.parse(a.lastActivity)||0))||a.id.localeCompare(b.id);
    rooms.sort(compare);

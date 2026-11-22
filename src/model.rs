@@ -93,7 +93,7 @@ pub const SOURCES: &[(&str, &str, &str)] = &[
     ("slack", "Slack", "2"),
     ("discord", "Discord", "3"),
     ("whatsapp", "WhatsApp", "4"),
-    ("iphone", "iMessages", "5"),
+    ("iphone", "Messages", "5"),
     ("mail:home", "Personal mail", "6"),
     ("mail:cmu", "CMU mail", "7"),
 ];
@@ -113,7 +113,7 @@ pub fn source_label(source: &str) -> &str {
         "slack" => "Slack",
         "discord" => "Discord",
         "whatsapp" => "WhatsApp",
-        "iphone" => "iPhone",
+        "iphone" => "Messages",
         "mail:home" => "Personal mail",
         "mail:cmu" => "CMU mail",
         _ => "Matrix",

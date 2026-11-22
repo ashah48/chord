@@ -32,11 +32,11 @@ function decode(s){return Buffer.from(s||'','base64url').toString('utf8')}
 function content(payload){let plain=[],html=[];function visit(p){if(p.mimeType==='text/plain'&&p.body?.data)plain.push(decode(p.body.data));if(p.mimeType==='text/html'&&p.body?.data)html.push(decode(p.body.data));for(const child of p.parts||[])visit(child)}visit(payload);return plain.join('\n')||convert(html.join('\n'),{wordwrap:false,selectors:[{selector:'img',format:'skip'}]})}
 function attachments(payload){const result=[];function visit(p){if(p.filename&&p.body?.attachmentId)result.push({id:p.body.attachmentId,fileName:p.filename,mimeType:p.mimeType,fileSize:p.body.size});for(const child of p.parts||[])visit(child)}visit(payload);return result}
 function preview(m){return {id:m.id,threadId:m.threadId,subject:header(m,'subject')||'(No subject)',from:header(m,'from'),to:header(m,'to'),date:new Date(Number(m.internalDate)||Date.now()).toISOString(),snippet:m.snippet||'',unread:m.labelIds?.includes('UNREAD')||false,labels:m.labelIds||[],automated:!!header(m,'list-id')||!!header(m,'list-unsubscribe')||/bulk|list/i.test(header(m,'precedence'))||(!['','no'].includes(header(m,'auto-submitted').toLowerCase()))}}
-export async function listMail(id,{query='in:inbox',cursor,limit=30,includeThreads=[]}={}){
+export async function listMail(id,{query='in:inbox',cursor,limit=30,includeThreads=[],onlyThreads=null}={}){
  await verify(id);const q=new URLSearchParams({q:query,maxResults:String(Math.min(100,limit))});if(cursor)q.set('pageToken',cursor);
- const list=await request(id,'/threads?'+q),threads=[];
+ const list=onlyThreads?{threads:[]}:await request(id,'/threads?'+q),threads=[];
  const listed=new Set((list.threads||[]).map(t=>t.id));
- const ids=[...new Set([...listed,...includeThreads])];
+ const ids=[...new Set(onlyThreads??[...listed,...includeThreads])];
  for(let i=0;i<ids.length;i+=6){
   const batch=await Promise.all(ids.slice(i,i+6).map(async threadId=>{
    try{return await request(id,'/threads/'+encodeURIComponent(threadId)+'?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-ID&metadataHeaders=List-Unsubscribe&metadataHeaders=Precedence')}

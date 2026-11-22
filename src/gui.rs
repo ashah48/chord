@@ -259,7 +259,7 @@ impl Gui {
                     (1, "Slack", "S"),
                     (2, "Discord", "D"),
                     (3, "WhatsApp", "W"),
-                    (4, "iMessages", "M"),
+                    (4, "Messages", "M"),
                 ] {
                     let response =
                         icons::button(ui, index, label, compact, self.app.source == index, p);
@@ -335,7 +335,7 @@ impl Gui {
             }
             .to_owned()
         } else {
-            format!("iMessages · {state}")
+            format!("Messages · {state}")
         };
         if ui
             .add(
@@ -514,7 +514,7 @@ impl Gui {
                 ui.add_space(6.);
                 ui.horizontal(|ui| {
                     let mut focus = self.app.focus_enabled();
-                    if ui.selectable_value(&mut focus, true, "Focus").clicked()
+                    if ui.selectable_value(&mut focus, true, "Important").clicked()
                         || ui.selectable_value(&mut focus, false, "All").clicked()
                     {
                         if self.app.discord_scope.is_some() {
@@ -529,7 +529,7 @@ impl Gui {
                     }
                 });
                 if let (Some(total), Some(important)) = (self.app.inbox_summary["total"].as_u64(), self.app.inbox_summary["important"].as_u64()) {
-                    ui.label(RichText::new(format!("{important} in Focus · {total} on page")).small().color(p.muted));
+                    ui.label(RichText::new(format!("{important} important · {total} on page")).small().color(p.muted));
                 }
                 ui.add_space(10.);
                 ui.separator();
@@ -543,8 +543,10 @@ impl Gui {
                             ui.label(
                                 RichText::new(if self.app.loading {
                                     "Loading your conversations…"
+                                } else if self.app.focus_enabled() {
+                                    "Mark a conversation Important in All to see it here."
                                 } else {
-                                    "Nothing here yet. Try All, another account, or refresh."
+                                    "Nothing here yet. Try another account or refresh."
                                 })
                                 .color(p.muted),
                             );
@@ -811,8 +813,6 @@ impl Gui {
         let now_ms = chrono::Utc::now().timestamp_millis();
         if chat.mute_until.is_some_and(|until| until > now_ms) {
             stamp = format!("Muted · {stamp}");
-        } else if chat.local_priority == "quiet" {
-            stamp = format!("Unimportant · {stamp}");
         }
         let stamp_font = egui::FontId::proportional(11.);
         let stamp_width = ui
@@ -851,11 +851,21 @@ impl Gui {
         } else {
             format!("{}: {}", chat.preview_sender_name, one_line(&chat.preview))
         };
+        // Pinned chats show a pin under the time, where the preview would otherwise end.
+        let pinned = self.app.is_pinned(&chat.id);
+        if pinned {
+            icons::pin(
+                ui.painter(),
+                egui::pos2(right - 6., rect.top() + 59.),
+                13.,
+                p.muted,
+            );
+        }
         row_text(
             ui,
             &preview,
             egui::pos2(text_left, rect.top() + 50.),
-            right - text_left - 8.,
+            right - text_left - if pinned { 26. } else { 8. },
             14.,
             p.muted,
         );
@@ -907,30 +917,25 @@ impl Gui {
             ui.close();
         }
         ui.separator();
-        let priority = if chat.local_priority.is_empty() {
-            "auto"
-        } else {
-            chat.local_priority.as_str()
-        };
-        for (label, value) in [
-            ("Important", "important"),
-            ("Unimportant", "quiet"),
-            ("Automatic", "auto"),
-        ] {
-            let text = if priority == value {
-                format!("✓ {label}")
+        // Important is a toggle; turning it off removes the chat from Important.
+        let important = chat.local_priority == "important";
+        if ui
+            .button(if important {
+                "✓ Important"
             } else {
-                label.to_owned()
-            };
-            if ui.button(text).clicked() {
-                self.app.apply_channel_rule(&id, Some(value), None);
-                self.app.operation(
-                    "Channel updated",
-                    "/api/preferences/conversation".into(),
-                    json!({"conversationID":id,"priority":value}),
-                );
-                ui.close();
-            }
+                "Important"
+            })
+            .on_hover_text("Important chats always show in Important mode.")
+            .clicked()
+        {
+            let value = if important { "auto" } else { "important" };
+            self.app.apply_channel_rule(&id, Some(value), None);
+            self.app.operation(
+                "Channel updated",
+                "/api/preferences/conversation".into(),
+                json!({"conversationID":id,"priority":value}),
+            );
+            ui.close();
         }
         ui.separator();
         for (label, minutes) in [
@@ -1019,7 +1024,7 @@ impl Gui {
                         self.show_logo(ui, 64., RichText::new("c·").size(58.).color(p.accent));
                         ui.heading("Your conversations");
                         ui.label(
-                            RichText::new("Slack, Discord, WhatsApp, iMessages, and email")
+                            RichText::new("Slack, Discord, WhatsApp, Messages, and email")
                                 .color(p.muted),
                         );
                         ui.add_space(15.);
@@ -3430,8 +3435,6 @@ mod tests {
         let text = found.join("\n");
         for label in [
             "Important",
-            "Unimportant",
-            "Automatic",
             "Mute for 1 hour",
             "Mute for 4 hours",
             "Mute for 24 hours",
@@ -3441,14 +3444,16 @@ mod tests {
             assert!(text.contains(label), "missing {label} in {text}");
         }
         assert_eq!(text.matches("Mute for").count(), 5, "{text}");
+        assert!(!text.contains("Unimportant"), "{text}");
+        assert!(!text.contains("Automatic"), "{text}");
     }
     #[test]
-    fn unimportant_row_is_labeled_and_has_no_unread_dot() {
+    fn muted_row_is_labeled_and_has_no_unread_dot() {
         let ctx = egui::Context::default();
         let mut gui = Gui::new(App::new(None, true), &ctx);
         let mut chat = gui.app.conversations[0].clone();
         chat.unread = true;
-        chat.local_priority = "quiet".into();
+        chat.mute_until = Some(chrono::Utc::now().timestamp_millis() + 60_000);
         chat.title = "snipes".into();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -3471,7 +3476,7 @@ mod tests {
             texts(&shape.shape, &mut found);
         }
         let text = found.join("\n");
-        assert!(text.contains("Unimportant ·"), "{text}");
+        assert!(text.contains("Muted ·"), "{text}");
         gui.app.conversations[0] = chat.clone();
         gui.app.apply_channel_rule(&chat.id, None, Some(Some(60)));
         assert!(!gui.app.conversations[0].unread);

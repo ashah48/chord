@@ -241,7 +241,6 @@ pub struct App {
     pub inbox_cursors: Value,
     inbox_paged: bool,
     inbox_keep_tail: bool,
-    inbox_first_page: std::collections::HashSet<String>,
     pub scroll: u16,
     pub quit: bool,
     pub account_selection: usize,
@@ -342,7 +341,6 @@ impl App {
             inbox_cursors: Value::Null,
             inbox_paged: false,
             inbox_keep_tail: false,
-            inbox_first_page: Default::default(),
             scroll: 0,
             quit: false,
             account_selection: 0,
@@ -372,7 +370,7 @@ impl App {
             read_tx,
             archive_status: Value::Null,
             last_connection_refresh: Instant::now(),
-            focus_view: true,
+            focus_view: false,
             discord_scope: None,
             server_focus: false,
             server_label: String::new(),
@@ -698,7 +696,7 @@ impl App {
     pub fn refresh(&mut self, append: bool) {
         self.refresh_inbox(append, false, false);
     }
-    /// Apply a right-click rule immediately. Quiet and mute stop counting as unread
+    /// Apply a right-click rule immediately. A mute stops counting as unread
     /// until the fresh inbox agrees. Passing `mute_minutes` of `Some(None)` unmutes.
     pub fn apply_channel_rule(
         &mut self,
@@ -718,7 +716,7 @@ impl App {
                 chat.mute_until = minutes.map(|minutes| now + minutes * 60_000);
             }
             let muted = chat.mute_until.is_some_and(|until| until > now);
-            if muted || chat.local_priority == "quiet" {
+            if muted {
                 chat.unread = false;
                 chat.unread_count = 0;
             }
@@ -752,7 +750,6 @@ impl App {
         } else if !keep_tail {
             self.inbox_paged = false;
             self.inbox_cursors = Value::Null;
-            self.inbox_first_page.clear();
         }
         self.request_seq += 1;
         let seq = self.request_seq;
@@ -1768,12 +1765,13 @@ impl App {
                                             data.items.extend(self.conversations.drain(..).filter(
                                                 |chat| {
                                                     !updated.contains(&chat.id)
-                                                        && !self.inbox_first_page.contains(&chat.id)
                                                 },
                                             ));
                                         }
-                                        self.inbox_first_page = updated;
                                         self.conversations = data.items;
+                                    }
+                                    if append || self.inbox_keep_tail {
+                                        self.conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                                     }
                                     if !self.inbox_keep_tail {
                                         self.inbox_cursors = data.cursors;
@@ -2327,7 +2325,7 @@ impl App {
                 self.selection = 0;
                 self.refresh(false);
             }
-            KeyCode::Char('*') | KeyCode::Char('z') | KeyCode::Char('=') => {
+            KeyCode::Char('*') | KeyCode::Char('=') => {
                 let chat = if self.focus == Focus::Messages {
                     self.active.clone()
                 } else {
@@ -2335,8 +2333,7 @@ impl App {
                 };
                 if let Some(c) = chat {
                     let priority = match key.code {
-                        KeyCode::Char('*') if c.importance["rule"] != "important" => "important",
-                        KeyCode::Char('z') if c.importance["rule"] != "quiet" => "quiet",
+                        KeyCode::Char('*') if c.local_priority != "important" => "important",
                         _ => "auto",
                     };
                     self.apply_channel_rule(&c.id, Some(priority), None);
@@ -2572,7 +2569,7 @@ mod tests {
 
     use super::*;
     #[test]
-    fn unimportant_and_mute_stop_counting_as_unread_immediately() {
+    fn mute_stops_counting_as_unread_immediately() {
         let mut app = App::new(None, true);
         let mut chat = app.conversations[0].clone();
         chat.unread = true;
@@ -2580,16 +2577,15 @@ mod tests {
         let id = chat.id.clone();
         app.conversations[0] = chat.clone();
         app.active = Some(chat);
-        app.apply_channel_rule(&id, Some("quiet"), None);
-        assert!(!app.conversations[0].unread);
-        assert!(!app.active.as_ref().unwrap().unread);
-        assert_eq!(app.conversations[0].unread_count, 0);
-        assert_eq!(app.conversations[0].local_priority, "quiet");
-        app.conversations[0].unread = true;
+        app.apply_channel_rule(&id, Some("important"), None);
+        assert!(app.conversations[0].unread);
+        assert_eq!(app.conversations[0].local_priority, "important");
         app.apply_channel_rule(&id, None, Some(Some(60)));
         assert!(app.conversations[0].mute_until.is_some());
         assert!(!app.conversations[0].unread);
-        assert_eq!(app.conversations[0].local_priority, "quiet");
+        assert!(!app.active.as_ref().unwrap().unread);
+        assert_eq!(app.conversations[0].unread_count, 0);
+        assert_eq!(app.conversations[0].local_priority, "important");
         app.apply_channel_rule(&id, Some("auto"), Some(None));
         assert!(app.conversations[0].mute_until.is_none());
         assert_eq!(app.conversations[0].local_priority, "auto");

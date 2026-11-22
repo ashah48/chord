@@ -1486,6 +1486,27 @@ impl App {
                             self.notice = "Last contact link undone".into();
                         }
 
+                        "iMessages updated" => {
+                            if v["enabled"] == false {
+                                self.conversations.retain(|chat| chat.source != "iphone");
+                                self.message_cache
+                                    .retain(|id, _| !id.starts_with("blueferry:"));
+                                if self
+                                    .active
+                                    .as_ref()
+                                    .is_some_and(|chat| chat.source == "iphone")
+                                {
+                                    self.active = None;
+                                    self.messages.clear();
+                                    self.message_cursor = None;
+                                    self.message_selection = 0;
+                                    self.pending_read = None;
+                                }
+                            }
+                            self.notice = label;
+                            self.load_connections();
+                            self.refresh_inbox(false, true);
+                        }
                         "Channel updated"
                         | "Channel muted"
                         | "Channel unmuted"

@@ -2,7 +2,7 @@ import http from 'node:http';
 import {isStatusConversation} from './status-conversations.mjs';
 import {applyAttention} from './attention.mjs';
 import {cacheSlackProfiles} from './slack-profiles.mjs';
-import {readFile,writeFile,mkdir} from 'node:fs/promises';
+import {readFile,writeFile,mkdir,rename} from 'node:fs/promises';
 import {randomBytes,timingSafeEqual,createHash} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
@@ -33,7 +33,12 @@ archive.start();
 const timelineSeed=new TimelineSeed(dataDir);
 const directory=await Directory.open(dataDir,{blue:blueCached,config:()=>config});
 function queryKey(url){const q=new URLSearchParams(url.searchParams);q.delete('fresh');q.sort();return q.toString()}
-function blueCached(method,signature='',args=[]){return readCache.get('blue:'+method+':'+JSON.stringify(args),()=>blue(method,signature,args),{maxAge:method==='ListContacts'?3600000:5000})}
+const localMacMessages=process.platform==='darwin'&&process.env.CHORD_MACOS_LOCAL==='1';
+const messagesEnabled=()=>config.messagesEnabled??(process.env.CHORD_MACOS_MESSAGES==='1');
+const messagesPaused=()=>localMacMessages&&!messagesEnabled();
+function blueCached(method,signature='',args=[]){
+ if(messagesPaused())return blue(method,signature,args);
+ return readCache.get('blue:'+method+':'+JSON.stringify(args),()=>blue(method,signature,args),{maxAge:method==='ListContacts'?3600000:5000})}
 async function seedInbox(url){
  const source=url.searchParams.get('source')||'all';if(url.searchParams.get('cursor'))return undefined;
  const query=(url.searchParams.get('query')||'').toLowerCase(),unread=url.searchParams.get('unread')==='true',server=url.searchParams.get('server');
@@ -45,7 +50,7 @@ async function seedInbox(url){
   const id='matrix:'+c.id;
   if(!known.has(id))known.set(id,{...c,id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||'',unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,direct:c.type==='single',participants:(c.participants?.items||[]).map(p=>p.id),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly});
  }
- let items=[...known.values()].filter(c=>!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query))).map(c=>directory.enrichConversation(c));
+ let items=[...known.values()].filter(c=>(!messagesPaused()||c.source!=='iphone')&&!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query))).map(c=>directory.enrichConversation(c));
  if(!items.length)return undefined;
  items=applyLocalRules(applyAttention(items,config.discordAttention,{server,query}),directory.book);
  if(unread)items=items.filter(c=>c.unread);if(server)items=items.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));
@@ -54,6 +59,7 @@ async function seedInbox(url){
 
 async function cachedMessages(id,url){
  const c=parseConversation(id),key='messages:'+id+':'+queryKey(url);
+ if(c.kind==='blueferry'&&messagesPaused())throw Object.assign(new Error('Messages is turned off'),{status:409});
  if(c.kind==='archive'){
   let before=null;
   if(url.searchParams.has('cursor')){try{before=JSON.parse(Buffer.from(url.searchParams.get('cursor'),'base64url').toString());if(!Number.isSafeInteger(before.at)||!Number.isSafeInteger(before.seq))throw new Error()}catch{throw Object.assign(new Error('Invalid archive cursor'),{status:400})}}
@@ -89,7 +95,8 @@ async function input(req){let raw='';for await(const chunk of req){raw+=chunk;if
 function json(res,value,status=200){res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(value))}
 export async function blue(method,signature='',args=[]){
  if(process.env.CHORD_TEST_TRANSPORT_URL)return method==='GetStatus'?{map:false}:[];
- if(process.platform==='darwin' && process.env.CHORD_MACOS_LOCAL==='1')return macMessages(method,args);
+ // The Accounts toggle (messagesEnabled) wins over the --messages start flag.
+ if(localMacMessages)return macMessages(method,args,{enabled:messagesEnabled()});
  const {stdout}=await run('busctl',['--user','--json=short','call','io.weirdware.BlueFerry','/io/weirdware/BlueFerry','io.weirdware.BlueFerry.Messages1',method,...(signature?[signature,...args.map(String)]:[])],{timeout:30000,maxBuffer:12*1024*1024});
  const data=JSON.parse(stdout).data,value=data?.[0];if(typeof value!=='string')return value;try{return JSON.parse(value)}catch{return value}
 }
@@ -105,7 +112,7 @@ async function inbox(url){
  const source=url.searchParams.get('source')||'all',query=url.searchParams.get('query')||'',cursor=url.searchParams.get('cursor'),unread=url.searchParams.get('unread')==='true';let items=[],errors=[],cursors={};
  const jobs=[];
  if(source==='all'||['slack','discord','whatsapp','matrix'].includes(source))jobs.push((async()=>{try{const q=new URLSearchParams({limit:'200'});if(source!=='all')q.append('accountIDs',source);if(cursor)q.set('cursor',cursor);if(query)q.set('query',query);let d=await matrix('/v1/chats'+(query?'/search':'')+'?'+q);if(!cursor){const all=[...(d.items||[])];while(d.hasMore){q.set('cursor',d.oldestCursor);d=await matrix('/v1/chats'+(query?'/search':'')+'?'+q);all.push(...(d.items||[]))}d={...d,items:all}}items.push(...(d.items||[]).filter(c=>!c.accountID?.includes('blueferry')).map(c=>({...c,id:'matrix:'+c.id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||c.network||'',previewSenderName:c.preview?.senderName||'',previewSenderID:c.preview?.senderID,unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,participants:(Array.isArray(c.participants)?c.participants:(c.participants?.items||[])).map(p=>typeof p==='string'?p:p.id).filter(Boolean),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly})));if(d.hasMore)cursors.matrix=d.oldestCursor}catch(e){errors.push({source:'matrix',error:e?.message||String(e)})}})());
- if(source==='all'||source==='iphone')jobs.push((async()=>{try{const threads=presentThreads(await blueCached('ListThreads','u',[200]));items.push(...threads.filter(t=>!query||t.name.toLowerCase().includes(query.toLowerCase())).map(t=>({id:'blueferry:'+t.key,remoteId:t.key,kind:'phone',source:'iphone',title:t.name,preview:t.messages?.at(-1)?.body||'',unread:!!t.unread,timestamp:t.last_ts,participants:t.recipients||[],canReply:false,canReact:false,canSend:!!t.reply_ready,blue:t})))}catch(e){errors.push({source:'iphone',error:e?.message||String(e)})}})());
+ if(source==='all'||source==='iphone')jobs.push((async()=>{try{const threads=presentThreads(await blueCached('ListThreads','u',[200]));items.push(...threads.filter(t=>!query||[t.name,...(t.participant_names||[])].some(n=>String(n).toLowerCase().includes(query.toLowerCase()))).map(t=>({id:'blueferry:'+t.key,remoteId:t.key,kind:'phone',source:'iphone',title:t.name,preview:t.messages?.at(-1)?.body||'',previewSenderName:t.is_group&&!t.messages?.at(-1)?.outgoing?t.messages?.at(-1)?.sender||'':'',unread:!!t.unread,unreadCount:t.unread_count||0,timestamp:t.last_ts,activity:{lastMessageAt:Date.parse(t.last_ts)||0,lastSentAt:Date.parse(t.last_sent_ts)||0},participants:t.recipients||[],canReply:false,canReact:false,canSend:!!t.reply_ready,blue:t})))}catch(e){errors.push({source:'iphone',error:e?.message||String(e)})}})());
  for(const a of mailAccounts())if(source==='all'||source==='mail:'+a.id)jobs.push((async()=>{try{const d=await listMail(a.id,{query:query||'in:inbox',cursor:source==='all'?undefined:cursor,limit:source==='all'?12:35});items.push(...d.items.map(m=>({...m,id:'mail:'+a.id+':'+m.id,remoteId:m.id,kind:'email',source:'mail:'+a.id,title:m.subject,preview:m.from+' · '+m.snippet,timestamp:m.date,canReply:true,canReact:false,canSend:true})));if(d.hasMore)cursors['mail:'+a.id]=d.oldestCursor}catch(e){errors.push({source:'mail:'+a.id,error:e?.message||String(e)})}})());
  await Promise.all(jobs);items=items.filter(c=>!c.isArchived&&!isStatusConversation(c,config.matrixAccount?.userId));const server=url.searchParams.get('server');if(server&&!/^(all|dm|[0-9]+)$/.test(server))throw Object.assign(new Error('Invalid Discord server'),{status:400});let enriched=applyLocalRules(applyAttention(items.map(c=>directory.enrichConversation(c)),config.discordAttention,{server,query}),directory.book);if(unread)enriched=enriched.filter(c=>c.unread);if(server)enriched=enriched.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));const ranked=rankInbox(enriched,directory.book,{view});await directory.book.save();return {...ranked,errors,cursors,hasMore:Object.keys(cursors).length>0};
 }
@@ -133,7 +140,7 @@ export const server=http.createServer(async(req,res)=>{try{
   return json(res,archive.store.search(url.searchParams.get('query')||'',{limit:url.searchParams.get('limit')||60,offset:url.searchParams.get('offset')||0}));
  }
  if(p==='/api/connections'&&req.method==='GET')return json(res,await connections(url.searchParams.get('refresh')==='true'));
- if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:human-v2:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
+ if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:human-v2:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+(messagesPaused()?'messages-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
  if(p==='/api/discord/servers'&&req.method==='GET'){await directory.refresh();const rooms=[...directory.catalog.rooms.values()].filter(r=>r.network==='discord');return json(res,{items:directory.catalog.servers.map(g=>({...g,preferred:!config.discordAttention||(config.discordAttention.visibleServerIDs||[]).includes(g.id),channelCount:rooms.filter(r=>r.serverID===g.id).length})).sort((a,b)=>a.name.localeCompare(b.name)),directMessageCount:rooms.filter(r=>!r.serverID).length})}
  if(p==='/api/contacts'&&req.method==='GET'){directory.refresh().catch(()=>{});return json(res,{items:directory.book.list(url.searchParams.get('query')||''),errors:directory.catalog.errors})}
  if(p==='/api/slack/cache-profiles'&&req.method==='POST'){const b=await input(req);return json(res,await cacheSlackProfiles(b.workspace,{dataDir,directory,cache:readCache,photos:b.photos!==false}))}
@@ -143,6 +150,7 @@ export const server=http.createServer(async(req,res)=>{try{
  const photo=p.match(/^\/api\/contacts\/(person_[a-f0-9]+)\/avatar$/);
  if(photo&&req.method==='GET'){await directory.refresh();const contact=directory.book.data.people[photo[1]];if(!contact||contact.redirect)return json(res,{error:'Contact not found'},404);const result=await readCache.get('media:avatar:'+photo[1],()=>avatar(contact,config.matrixAccount),{maxAge:86400000,kind:'media'});return result?json(res,result):json(res,{error:'No profile photo available'},404)}
  const person=p.match(/^\/api\/contacts\/(person_[a-f0-9]+)$/);if(person&&req.method==='GET'){await directory.refresh();const contact=directory.book.data.people[person[1]];if(!contact||contact.redirect)return json(res,{error:'Contact not found'},404);return json(res,{...directory.book.present(contact),conversations:[...directory.conversations.values()].filter(c=>c.contactIDs.includes(contact.id)).sort((a,b)=>Date.parse(b.timestamp)-Date.parse(a.timestamp))})}if(person&&req.method==='POST')return json(res,await directory.book.update(person[1],await input(req)));
+ if(p==='/api/messages'&&req.method==='POST'){if(!localMacMessages)return json(res,{error:'Requires the local macOS backend'},404);const b=await input(req);if(typeof b.enabled!=='boolean')throw Object.assign(new Error('enabled must be true or false'),{status:400});const saved=await readFile(file,'utf8').then(JSON.parse);saved.messagesEnabled=b.enabled;const temporary=file+'.'+randomBytes(8).toString('hex')+'.tmp';await writeFile(temporary,JSON.stringify(saved,null,2),{mode:0o600});await rename(temporary,file);config=saved;connectionCache=null;readCache.invalidate('blue:');return json(res,{enabled:b.enabled})}
  if(p==='/api/preferences/conversation'&&req.method==='POST'){const b=await input(req);parseConversation(b.conversationID);return json(res,await directory.book.setPreference(b.conversationID,b))}
 
  if(p.startsWith('/api/conversations/')){

@@ -90,4 +90,7 @@ test('Matrix inbox pages advance independently of pinned rows',async()=>{
  const next=await p.request('/v1/chats?limit=2&accountIDs=slack&cursor='+encodeURIComponent(first.oldestCursor)+'&includeRoom=!1');
  assert.deepEqual(next.items.map(x=>x.id),['!2','!1']);
  assert.equal(next.hasMore,false);
+ const important=await p.request('/v1/chats?limit=1&accountIDs=slack&onlyRoom=!1&includeRoom=!4');
+ assert.deepEqual(important.items.map(x=>x.id),['!1']);
+ assert.equal(important.hasMore,false);
 });

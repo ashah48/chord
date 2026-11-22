@@ -119,7 +119,7 @@ test('a mute lasts for one of five durations, hides unread, and keeps the priori
  assert.equal(hidden[0].unread,false);
  assert.equal(hidden[0].sourceUnread,true);
  assert.equal(hidden[0].localPriority,'important');
- assert.equal(rankInbox(hidden,book,{view:'focus',now}).items.length,0);
+ assert.equal(rankInbox(hidden,book,{view:'focus',now}).items[0].unread,false);
  const later=now+10080*60000+1;
  assert.equal(book.preference('chat:one',later).muted,false);
  const back=applyLocalRules([{...chat,unread:true}],book,later);

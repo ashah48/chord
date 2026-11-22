@@ -1762,16 +1762,17 @@ impl App {
                                         let updated: std::collections::HashSet<_> =
                                             data.items.iter().map(|chat| chat.id.clone()).collect();
                                         if self.inbox_keep_tail {
-                                            data.items.extend(self.conversations.drain(..).filter(
-                                                |chat| {
-                                                    !updated.contains(&chat.id)
-                                                },
-                                            ));
+                                            data.items.extend(
+                                                self.conversations
+                                                    .drain(..)
+                                                    .filter(|chat| !updated.contains(&chat.id)),
+                                            );
                                         }
                                         self.conversations = data.items;
                                     }
                                     if append || self.inbox_keep_tail {
-                                        self.conversations.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                                        self.conversations
+                                            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                                     }
                                     if !self.inbox_keep_tail {
                                         self.inbox_cursors = data.cursors;
@@ -2569,6 +2570,43 @@ mod tests {
 
     use super::*;
     #[test]
+    fn refreshing_a_paged_inbox_keeps_a_row_displaced_from_the_first_page() {
+        let mut app = App::new(None, true);
+        app.source = 0;
+        app.conversations = vec![
+            Conversation {
+                id: "first".into(),
+                timestamp: "2026-11-22T12:00:00Z".into(),
+                ..Default::default()
+            },
+            Conversation {
+                id: "displaced".into(),
+                timestamp: "2026-11-22T11:00:00Z".into(),
+                ..Default::default()
+            },
+            Conversation {
+                id: "older".into(),
+                timestamp: "2026-11-22T10:00:00Z".into(),
+                ..Default::default()
+            },
+        ];
+        app.inbox_keep_tail = true;
+        app.inbox_cursors = json!({"matrix":"older-cursor"});
+        app.tx.send(Response::Inbox(app.request_seq, Ok(json!({
+            "items":[{"id":"new","timestamp":"2026-11-22T13:00:00Z"},{"id":"first","timestamp":"2026-11-22T12:00:00Z"}],
+            "cursors":{"matrix":"new-cursor"}
+        })),false)).unwrap();
+        app.poll();
+        assert_eq!(
+            app.conversations
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "first", "displaced", "older"]
+        );
+        assert_eq!(app.inbox_cursors["matrix"], "older-cursor");
+    }
+    #[test]
     fn mute_stops_counting_as_unread_immediately() {
         let mut app = App::new(None, true);
         let mut chat = app.conversations[0].clone();
@@ -3272,6 +3310,8 @@ mod tests {
     #[test]
     fn selecting_a_discord_server_shows_channels_without_changing_global_focus() {
         let mut app = App::new(None, true);
+        assert!(!app.focus_view);
+        app.focus_view = true;
         app.servers = vec![json!({"id":"123","name":"SDC Buggy","channelCount":23})];
         app.unread = true;
         app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));

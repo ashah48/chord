@@ -103,13 +103,13 @@ pub fn one_line(text: &str) -> String {
 
 pub fn source_label(source: &str) -> &str {
     match source {
-        "slack" => "slack",
-        "discord" => "discord",
-        "whatsapp" => "whatsapp",
-        "iphone" => "iphone",
-        "mail:home" => "personal",
-        "mail:cmu" => "cmu",
-        _ => "matrix",
+        "slack" => "Slack",
+        "discord" => "Discord",
+        "whatsapp" => "WhatsApp",
+        "iphone" => "iPhone",
+        "mail:home" => "Personal mail",
+        "mail:cmu" => "CMU mail",
+        _ => "Matrix",
     }
 }
 

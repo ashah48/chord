@@ -32,8 +32,8 @@ const readCache=new ReadCache(path.join(dataDir,'read-cache.sqlite'),{namespace,
 archive.start();
 const timelineSeed=new TimelineSeed(dataDir);
 const directory=await Directory.open(dataDir,{blue:blueCached,config:()=>config});
-function importantConversationIDs(){
- return Object.keys(directory.book.data.conversations).filter(id=>directory.book.preference(id).priority==='important');
+function conversationIDsWithPriority(priority){
+ return Object.keys(directory.book.data.conversations).filter(id=>directory.book.preference(id).priority===priority);
 }
 function queryKey(url){const q=new URLSearchParams(url.searchParams);q.delete('fresh');q.sort();return q.toString()}
 function blueCached(method,signature='',args=[]){return readCache.get('blue:'+method+':'+JSON.stringify(args),()=>blue(method,signature,args),{maxAge:method==='ListContacts'?3600000:5000})}
@@ -49,8 +49,8 @@ async function seedInbox(url){
   if(!known.has(id))known.set(id,{...c,id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||'',unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,direct:c.type==='single',participants:(c.participants?.items||[]).map(p=>p.id),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly});
  }
  const view=url.searchParams.get('view')||'all',pinned=new Set(url.searchParams.getAll('pin'));
- const marked=view==='focus'?new Set(importantConversationIDs()):null;
- const candidates=[...known.values()].filter(c=>(!marked||marked.has(c.id))&&!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query)));
+ const marked=view==='focus'?new Set(conversationIDsWithPriority('important')):null;
+ const candidates=[...known.values()].filter(c=>(view!=='inbox'||directory.book.preference(c.id).priority!=='unimportant')&&(!marked||marked.has(c.id))&&!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query)));
  candidates.sort((a,b)=>(Date.parse(b.timestamp)||0)-(Date.parse(a.timestamp)||0));
  let matrixCount=0;
  let items=candidates.filter(c=>!c.id.startsWith('matrix:')||matrixCount++<200||pinned.has(c.id)).map(c=>directory.enrichConversation(c));
@@ -113,8 +113,9 @@ async function inbox(url){
  const server=params.get('server');
  if(server&&!/^(all|dm|[0-9]+)$/.test(server))throw Object.assign(new Error('Invalid Discord server'),{status:400});
  const pinSet=new Set(params.getAll('pin')),items=[],errors=[],cursors={},jobs=[];
- const marked=view==='focus'?importantConversationIDs():null;
+ const marked=view==='focus'?conversationIDsWithPriority('important'):null;
  const matrixMarked=marked?.filter(id=>id.startsWith('matrix:'))??[];
+ const hidden=view==='inbox'?conversationIDsWithPriority('unimportant'):[];
  let continuation;
  if(cursor?.startsWith('{')){
   try{continuation=JSON.parse(cursor)}catch{throw Object.assign(new Error('Invalid inbox cursor'),{status:400})}
@@ -132,6 +133,7 @@ async function inbox(url){
   if(continuation?.matrix)q.set('cursor',continuation.matrix);
   if(query)q.set('query',query);
   if(marked)for(const id of matrixMarked)q.append('onlyRoom',id.slice(7));
+  for(const id of hidden)if(id.startsWith('matrix:'))q.append('excludeRoom',id.slice(7));
   if(!continuation)for(const id of pinSet)if(id.startsWith('matrix:'))q.append('includeRoom',id.slice(7));
   const d=await matrix('/v1/chats'+(query?'/search':'')+'?'+q);
   items.push(...(d.items||[]).filter(c=>!c.accountID?.includes('blueferry')).map(c=>({...c,id:'matrix:'+c.id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||c.network||'',previewSenderName:c.preview?.senderName||'',previewSenderID:c.preview?.senderID,unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,participants:(Array.isArray(c.participants)?c.participants:(c.participants?.items||[])).map(p=>typeof p==='string'?p:p.id).filter(Boolean),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly})));
@@ -185,7 +187,7 @@ export const server=http.createServer(async(req,res)=>{try{
   return json(res,archive.store.search(url.searchParams.get('query')||'',{limit:url.searchParams.get('limit')||60,offset:url.searchParams.get('offset')||0}));
  }
  if(p==='/api/connections'&&req.method==='GET')return json(res,await connections(url.searchParams.get('refresh')==='true'));
- if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:important-v1:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
+ if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:visibility-v1:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
  if(p==='/api/discord/servers'&&req.method==='GET'){await directory.refresh();const rooms=[...directory.catalog.rooms.values()].filter(r=>r.network==='discord');return json(res,{items:directory.catalog.servers.map(g=>({...g,preferred:!config.discordAttention||(config.discordAttention.visibleServerIDs||[]).includes(g.id),channelCount:rooms.filter(r=>r.serverID===g.id).length})).sort((a,b)=>a.name.localeCompare(b.name)),directMessageCount:rooms.filter(r=>!r.serverID).length})}
  if(p==='/api/contacts'&&req.method==='GET'){directory.refresh().catch(()=>{});return json(res,{items:directory.book.list(url.searchParams.get('query')||''),errors:directory.catalog.errors})}
  if(p==='/api/slack/cache-profiles'&&req.method==='POST'){const b=await input(req);return json(res,await cacheSlackProfiles(b.workspace,{dataDir,directory,cache:readCache,photos:b.photos!==false}))}

@@ -90,7 +90,7 @@ test('only a manual mark makes a conversation Important',()=>{
 test('important overrides persist, the retired quiet rule reads as automatic, All contains every conversation',async()=>{
  const book=memoryBook();const now=Date.now(),timestamp=new Date(now).toISOString();
  const conversations=[{id:'chat:one',timestamp,direct:false},{id:'chat:two',timestamp,direct:false}];
- await assert.rejects(()=>book.setPreference('chat:one',{priority:'quiet'}),/auto or important/);
+ await assert.rejects(()=>book.setPreference('chat:one',{priority:'quiet'}),/auto, important, or unimportant/);
  book.data.conversations['chat:one']={priority:'quiet'};
  assert.equal(book.preference('chat:one').priority,'auto');
  await book.setPreference('chat:two',{priority:'important'});
@@ -185,4 +185,17 @@ test('pins do not affect Important membership and Important does not affect badg
  assert.equal(rankInbox(chats,book).items.length,4);
  const quiet={id:'important',unread:false,sourceUnread:true};
  assert.equal(rankInbox([quiet],book,{view:'focus'}).items[0].unread,false);
+});
+
+test('unimportant conversations can be revealed or restored with unread state intact',async()=>{
+ const book=memoryBook();
+ const chats=[{id:'matrix:!chat',unread:true,unreadCount:3},{id:'mail:home:thread',unread:false}];
+ await book.setPreference(chats[0].id,{priority:'unimportant'});
+ assert.deepEqual(rankInbox(chats,book,{view:'inbox'}).items.map(c=>c.id),[chats[1].id]);
+ const shown=rankInbox(chats,book,{view:'all'}).items[0];
+ assert.equal(shown.localPriority,'unimportant');
+ assert.equal(shown.unread,true);
+ assert.equal(shown.unreadCount,3);
+ await book.setPreference(chats[0].id,{priority:'auto'});
+ assert.equal(rankInbox(chats,book,{view:'inbox'}).items.length,2);
 });

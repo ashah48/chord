@@ -282,6 +282,7 @@ export class MatrixProvider{
    let rooms=[...this.chats.values()].filter(c=>!q.has('accountIDs')||q.getAll('accountIDs').includes(c.accountID));
    if(q.get('query'))rooms=rooms.filter(c=>c.title.toLowerCase().includes(q.get('query').toLowerCase()));if(q.get('type')&&q.get('type')!=='any')rooms=rooms.filter(c=>c.type===q.get('type'));if(q.get('unreadOnly')==='true')rooms=rooms.filter(c=>c.unreadCount||c.isMarkedUnread);if(q.get('inbox'))rooms=rooms.filter(c=>q.get('inbox')==='archive'?c.isArchived:!c.isArchived);
    const only=new Set(q.getAll('onlyRoom'));if(only.size)rooms=rooms.filter(room=>only.has(room.id));
+   const excluded=new Set(q.getAll('excludeRoom'));if(excluded.size)rooms=rooms.filter(room=>!excluded.has(room.id));
    rooms=rooms.map(c=>roomListing(c,this.timelines.get(c.id)));
    const compare=(a,b)=>((Date.parse(b.lastActivity)||0)-(Date.parse(a.lastActivity)||0))||a.id.localeCompare(b.id);
    rooms.sort(compare);

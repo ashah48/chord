@@ -551,6 +551,49 @@ impl Gui {
             ctx.request_repaint();
         });
     }
+    fn inbox_header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Inbox");
+            if self.app.loading {
+                ui.spinner();
+            }
+        });
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.spacing_mut().icon_width = 12.0;
+            ui.spacing_mut().icon_width_inner = 8.0;
+            let size = if ui.available_width() < 260.0 {
+                11.0
+            } else {
+                12.0
+            };
+            if !self.message_search {
+                let show = ui
+                    .add(egui::Checkbox::new(
+                        &mut self.app.show_unimportant,
+                        RichText::new("Show unimportant").size(size),
+                    ))
+                    .changed();
+                let unread = ui
+                    .add(egui::Checkbox::new(
+                        &mut self.app.unread,
+                        RichText::new("Unread only").size(size),
+                    ))
+                    .changed();
+                if show || unread {
+                    self.app.selection = 0;
+                    self.app.refresh(false);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("↻").on_hover_text("Refresh").clicked() {
+                    self.app.refresh_now();
+                }
+            });
+        });
+    }
+
     fn inbox(&mut self, ctx: &egui::Context, p: Palette) {
         egui::SidePanel::left("conversations")
             .default_width(360.)
@@ -561,17 +604,7 @@ impl Gui {
                     .inner_margin(egui::Margin::symmetric(12, 18)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Messages");
-                    if self.app.loading {
-                        ui.spinner();
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("↻").on_hover_text("Refresh").clicked() {
-                            self.app.refresh_now();
-                        }
-                    });
-                });
+                self.inbox_header(ui);
                 ui.add_space(10.);
                 ui.horizontal(|ui| {
                     if ui.selectable_label(!self.message_search, "Conversations").clicked() { self.message_search = false; }
@@ -620,26 +653,6 @@ impl Gui {
                     for error in self.search_results["errors"].as_array().into_iter().flatten() { ui.label(RichText::new(format!("{}: {}", error["source"].as_str().unwrap_or("Account"), error["error"].as_str().unwrap_or("Unavailable"))).small().color(p.muted)); }
                     return;
                 }
-                ui.add_space(6.);
-                ui.horizontal(|ui| {
-                    let mut focus = self.app.focus_enabled();
-                    if ui.selectable_value(&mut focus, true, "Important").clicked()
-                        || ui.selectable_value(&mut focus, false, "All").clicked()
-                    {
-                        if self.app.discord_scope.is_some() {
-                            self.app.server_focus = focus;
-                        } else {
-                            self.app.focus_view = focus;
-                        }
-                        self.app.refresh(false);
-                    }
-                    if ui.checkbox(&mut self.app.unread, "Unread").changed() {
-                        self.app.refresh(false);
-                    }
-                });
-                if let (Some(total), Some(important)) = (self.app.inbox_summary["total"].as_u64(), self.app.inbox_summary["important"].as_u64()) {
-                    ui.label(RichText::new(format!("{important} important · {total} on page")).small().color(p.muted));
-                }
                 ui.add_space(10.);
                 ui.separator();
                 let chats: Vec<Conversation> = self.app.visible().into_iter().cloned().collect();
@@ -652,18 +665,13 @@ impl Gui {
                             ui.label(
                                 RichText::new(if self.app.loading {
                                     "Loading your conversations…"
-                                } else if self.app.focus_enabled() {
-                                    "Mark a conversation Important in All to see it here."
+                                } else if self.app.unread {
+                                    "No unread conversations in this view."
                                 } else {
                                     "Nothing here yet. Try another account or refresh."
                                 })
                                 .color(p.muted),
                             );
-                        }
-                        if chats.is_empty() && !self.app.loading && self.app.focus_enabled() && self.app.inbox_summary["total"].as_u64().unwrap_or(0) > 0
-                            && ui.button("Switch to All").clicked() {
-                            if self.app.discord_scope.is_some() { self.app.server_focus = false; } else { self.app.focus_view = false; }
-                            self.app.refresh(false);
                         }
                         let pinned = self.app.pinned_count();
                         let mut rows = Vec::with_capacity(chats.len());
@@ -928,6 +936,8 @@ impl Gui {
         let now_ms = chrono::Utc::now().timestamp_millis();
         if chat.mute_until.is_some_and(|until| until > now_ms) {
             stamp = format!("Muted · {stamp}");
+        } else if chat.local_priority == "unimportant" {
+            stamp = format!("Unimportant · {stamp}");
         }
         let stamp_font = egui::FontId::proportional(11.);
         let stamp_width = ui
@@ -1032,24 +1042,16 @@ impl Gui {
             ui.close();
         }
         ui.separator();
-        // Important is a toggle; turning it off removes the chat from Important.
-        let important = chat.local_priority == "important";
+        let unimportant = chat.local_priority == "unimportant";
         if ui
-            .button(if important {
-                "✓ Important"
+            .button(if unimportant {
+                "Restore to Inbox"
             } else {
-                "Important"
+                "Mark as unimportant"
             })
-            .on_hover_text("Important chats always show in Important mode.")
             .clicked()
         {
-            let value = if important { "auto" } else { "important" };
-            self.app.apply_channel_rule(&id, Some(value), None);
-            self.app.operation(
-                "Channel updated",
-                "/api/preferences/conversation".into(),
-                json!({"conversationID":id,"priority":value}),
-            );
+            self.app.set_unimportant(&id, !unimportant);
             ui.close();
         }
         ui.separator();
@@ -3266,6 +3268,44 @@ mod tests {
     }
 
     #[test]
+    fn narrow_inbox_keeps_both_filters_and_refresh_on_one_row() {
+        let ctx = egui::Context::default();
+        let mut gui = Gui::new(App::new(None, true), &ctx);
+        Gui::apply_fonts(&ctx, FontStyle::Terminal);
+        let mut right_edge = 0.0;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // The smallest Inbox pane is 260 points including 12-point side margins.
+                ui.set_width(236.0);
+                right_edge = ui.max_rect().right();
+                gui.inbox_header(ui);
+            });
+        });
+        let rect = |label| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.job.text == label
+                    {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| panic!("missing Inbox control {label}"))
+        };
+        let show = rect("Show unimportant");
+        let unread = rect("Unread only");
+        let refresh = rect("↻");
+        assert!((show.center().y - unread.center().y).abs() < 2.0);
+        assert!((show.center().y - refresh.center().y).abs() < 3.0);
+        assert!(show.right() < unread.left() && unread.right() < refresh.left());
+        assert!(refresh.right() <= right_edge);
+    }
+
+    #[test]
     fn color_scheme_expands_and_can_be_selected_in_the_settings_menu() {
         let ctx = egui::Context::default();
         let path = std::env::temp_dir().join(format!(
@@ -3716,7 +3756,7 @@ mod tests {
         }
         let text = found.join("\n");
         for label in [
-            "Important",
+            "Mark as unimportant",
             "Mute for 1 hour",
             "Mute for 4 hours",
             "Mute for 24 hours",
@@ -3726,7 +3766,6 @@ mod tests {
             assert!(text.contains(label), "missing {label} in {text}");
         }
         assert_eq!(text.matches("Mute for").count(), 5, "{text}");
-        assert!(!text.contains("Unimportant"), "{text}");
         assert!(!text.contains("Automatic"), "{text}");
     }
     #[test]

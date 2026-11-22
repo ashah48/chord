@@ -16,6 +16,12 @@ test('HTTP cache survives restart, serves reads during a stalled refresh, and in
  const transport=http.createServer(async(req,res)=>{
   if(offline){res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Synthetic offline'}));return}
   if(req.method==='POST'){for await(const _ of req){}text='After send';res.end('{}');return}
+  const url=new URL(req.url,'http://localhost');
+  if(url.pathname==='/v1/chats'){
+   const excluded=new Set(url.searchParams.getAll('excludeRoom'));
+   const items=[{id:'!test',accountID:'slack',title:'Quiet channel',unreadCount:3},{id:'!other',accountID:'slack',title:'Other channel'}];
+   res.setHeader('Content-Type','application/json');res.end(JSON.stringify({items:items.filter(chat=>!excluded.has(chat.id)),hasMore:false}));return;
+  }
   if(blocked){waiting?.();await new Promise(r=>release=r)}
   res.setHeader('Content-Type','application/json');res.end(JSON.stringify({items:[{id:'one',text,isSender:true,timestamp:'2026-11-08T20:00:00Z'}],hasMore:false}));
  });transport.listen(0,'127.0.0.1');await once(transport,'listening');
@@ -49,4 +55,15 @@ test('HTTP cache survives restart, serves reads during a stalled refresh, and in
  }
  assert.equal((await api('/api/archive/status')).retention,'indefinite');
  await stop(child);await start();assert.equal((await api('/api/search?query=First%20version')).items.length,1);
+ offline=false;
+ const inbox='/api/inbox?source=slack&fresh=true';
+ const unimportant='matrix:!test';
+ const preference='/api/preferences/conversation';
+ await api(preference,{conversationID:unimportant,priority:'unimportant'});
+ assert.deepEqual((await api(inbox+'&view=inbox&pin=matrix%3A!test')).items.map(chat=>chat.id),['matrix:!other']);
+ const revealed=await api(inbox+'&view=all&unread=true');
+ assert.deepEqual(revealed.items.map(chat=>chat.id),[unimportant]);
+ assert.equal(revealed.items[0].unreadCount,3);
+ await api(preference,{conversationID:unimportant,priority:'auto'});
+ assert.equal((await api(inbox+'&view=inbox')).items.length,2);
 });

@@ -85,7 +85,6 @@ pub struct Inbox {
     pub items: Vec<Conversation>,
     pub errors: Vec<Value>,
     pub cursors: Value,
-    pub summary: Value,
 }
 
 pub const SOURCES: &[(&str, &str, &str)] = &[

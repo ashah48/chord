@@ -51,7 +51,7 @@ export class ContactBook{
  async undoMerge(){const previous=this.data.lastMerge;if(!previous)throw new Error('No contact link to undo');const current=this.data.people[previous.target.id];if((current.customName||null)!==previous.mergedName||current.favorite!==previous.mergedFavorite||current.identities.some(i=>!previous.target.identities.some(j=>j.key===i.key)&&!previous.source.identities.some(j=>j.key===i.key)))throw new Error('Contacts changed since linking; review the current links before undoing');for(const p of [previous.source,previous.target]){this.data.people[p.id]=p;for(const i of p.identities)this.data.links[i.key]=p.id}delete this.data.lastMerge;this.dirty=true;await this.save();return {success:true}}
  preference(id,now=Date.now()){
   const saved=this.data.conversations[id]||{};
-  const priority=['auto','important'].includes(saved.priority)?saved.priority:'auto';
+  const priority=['auto','important','unimportant'].includes(saved.priority)?saved.priority:'auto';
   const muteUntil=Number(saved.muteUntil);
   const muted=Number.isFinite(muteUntil)&&muteUntil>now;
   return {priority,muteUntil:muted?muteUntil:null,muted};
@@ -59,10 +59,10 @@ export class ContactBook{
  async setPreference(id,changes={},now=Date.now()){
   if(!Object.hasOwn(changes,'priority')&&!Object.hasOwn(changes,'muteMinutes'))throw new Error('Set a priority or a mute duration');
   const current=this.data.conversations[id]||{};
-  const next={priority:['auto','important'].includes(current.priority)?current.priority:'auto'};
+  const next={priority:['auto','important','unimportant'].includes(current.priority)?current.priority:'auto'};
   if(Number(current.muteUntil)>now)next.muteUntil=Number(current.muteUntil);
   if(Object.hasOwn(changes,'priority')){
-   if(!['auto','important'].includes(changes.priority))throw new Error('Priority must be auto or important');
+   if(!['auto','important','unimportant'].includes(changes.priority))throw new Error('Priority must be auto, important, or unimportant');
    next.priority=changes.priority;
   }
   if(Object.hasOwn(changes,'muteMinutes')){

@@ -164,7 +164,7 @@ API reads return `_cache` metadata when served from storage. `fresh=true` or the
 `X-Chord-Refresh: true` header requests revalidation while keeping cached content
 available to concurrent readers.
 
-## Search and Important mode
+## Search and Inbox filters
 
 Ctrl+K focuses search. Choose Conversations to search conversation names and
 Gmail, or Message text to search every locally retained message, including older
@@ -178,11 +178,10 @@ Local coverage expands as history syncs or is fetched. Gmail syntax remains avai
 in Conversations and the mail search API. `/api/search?remote=true&query=...` explicitly
 searches providers using the original unified search.
 
-The All tab opens by default. Mark a conversation Important from its menu to
-include it in the Important tab. Drag a conversation to the top or choose Pin
-to place it above other conversations in the current list. A conversation can
-be both pinned and Important. Muting still controls unread badges. Existing
-Unimportant rules revert to the normal setting.
+Inbox shows conversations by default. Use **Mark as unimportant** in a
+conversation's menu to hide it, then check **Show unimportant** to reveal it
+or choose **Restore to Inbox**. **Unread only** works with either view.
+Pins still control ordering, and muting still controls unread badges.
 
 Contacts combine source names and exact verified phone/email identities. Matching
 names alone never merge people. Profiles support local names, favorites, explicit
@@ -220,7 +219,7 @@ operation documentation is available at `GET /api/openapi.json`.
 | Endpoint | Use |
 | --- | --- |
 | `GET /api/connections` | Live connection states, `refresh=true` bypasses the 30-second cache |
-| `GET /api/inbox?view=focus` | Conversations manually marked Important |
+| `GET /api/inbox?view=inbox` | Inbox without conversations marked unimportant |
 | `GET /api/inbox?view=all&source=slack` | Per-source inbox, with pagination |
 | `GET /api/search?query=...` | Unified message and email search |
 | `GET /api/conversations/{id}/messages` | Conversation history with attachments and reactions |

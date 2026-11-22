@@ -65,8 +65,8 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "set_importance",
-            "Set a local conversation rule. priority is auto or important. muteMinutes is 60, 240, 1440, 4320, or 10080, or null to unmute. Does not change network mute or read state.",
-            json!({"conversationID":{"type":"string"},"priority":{"type":"string","enum":["auto","important"]},"muteMinutes":{"type":["integer","null"]}}),
+            "Set a local conversation rule. priority is auto, important, or unimportant. Unimportant conversations are hidden from Inbox. muteMinutes is 60, 240, 1440, 4320, or 10080, or null to unmute. Does not change network mute or read state.",
+            json!({"conversationID":{"type":"string"},"priority":{"type":"string","enum":["auto","important","unimportant"]},"muteMinutes":{"type":["integer","null"]}}),
             vec!["conversationID"],
             false,
         ),
@@ -79,8 +79,8 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "list_conversations",
-            "Unified chat and email inbox with per-source pagination.",
-            json!({"source":{"type":"string"},"server":{"type":"string"},"query":{"type":"string"},"unread":{"type":"boolean"},"view":{"type":"string","enum":["all","focus"]},"cursor":{"type":"string"}}),
+            "Unified chat and email inbox with per-source pagination. Use view=inbox to hide unimportant conversations.",
+            json!({"source":{"type":"string"},"server":{"type":"string"},"query":{"type":"string"},"unread":{"type":"boolean"},"view":{"type":"string","enum":["inbox","all","focus"]},"cursor":{"type":"string"}}),
             vec![],
             true,
         ),

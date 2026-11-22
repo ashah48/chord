@@ -271,15 +271,13 @@ pub struct App {
     read_overrides: HashMap<String, ReadOverride>,
     pub archive_status: Value,
     pub last_connection_refresh: Instant,
-    pub focus_view: bool,
+    pub show_unimportant: bool,
     pub discord_scope: Option<String>,
-    pub server_focus: bool,
     pub server_label: String,
     pub servers: Vec<Value>,
     pub server_query: String,
     pub show_other_servers: bool,
     pub server_selection: usize,
-    pub inbox_summary: Value,
     pub contacts: Vec<Value>,
     pub contact_selection: usize,
     pub contact_query: String,
@@ -370,15 +368,13 @@ impl App {
             read_tx,
             archive_status: Value::Null,
             last_connection_refresh: Instant::now(),
-            focus_view: false,
+            show_unimportant: false,
             discord_scope: None,
-            server_focus: false,
             server_label: String::new(),
             servers: vec![],
             server_query: String::new(),
             show_other_servers: false,
             server_selection: 0,
-            inbox_summary: Value::Null,
             contacts: vec![],
             contact_selection: 0,
             contact_query: String::new(),
@@ -429,6 +425,7 @@ impl App {
             .filter(|c| {
                 (self.source == 0 || c.source == SOURCES[self.source].0)
                     && (!self.unread || c.unread)
+                    && (self.show_unimportant || c.local_priority != "unimportant")
             })
             .collect();
         let pins = self.tab_pins();
@@ -501,13 +498,6 @@ impl App {
     pub fn selected_message(&self) -> Option<Message> {
         self.messages.get(self.message_selection).cloned()
     }
-    pub fn focus_enabled(&self) -> bool {
-        if self.discord_scope.is_some() {
-            self.server_focus
-        } else {
-            self.focus_view
-        }
-    }
     pub fn source_title(&self) -> &str {
         if self.source == 2 && self.discord_scope.is_some() {
             &self.server_label
@@ -578,7 +568,6 @@ impl App {
                     self.discord_scope = server["id"].as_str().map(str::to_owned);
                     self.server_label = server["name"].as_str().unwrap_or("Discord").to_owned();
                     self.source = 2;
-                    self.server_focus = false;
                     self.unread = false;
                     self.search.clear();
                     self.selection = 0;
@@ -729,6 +718,19 @@ impl App {
         }
         self.read_overrides.remove(id);
     }
+    pub fn set_unimportant(&mut self, id: &str, unimportant: bool) {
+        let priority = if unimportant { "unimportant" } else { "auto" };
+        if self.demo {
+            self.apply_channel_rule(id, Some(priority), None);
+        } else {
+            self.operation(
+                "Inbox visibility updated",
+                "/api/preferences/conversation".into(),
+                json!({"conversationID":id,"priority":priority}),
+            );
+        }
+    }
+
     pub fn has_more_inbox(&self) -> bool {
         self.inbox_cursors
             .as_object()
@@ -759,10 +761,10 @@ impl App {
             let api = if fresh { api.fresh() } else { api };
             let source = SOURCES[self.source].0.to_string();
             let query = self.search.clone();
-            let view = if self.focus_enabled() && query.is_empty() {
-                "focus"
-            } else {
+            let view = if self.show_unimportant {
                 "all"
+            } else {
+                "inbox"
             };
             let unread = self.unread;
             let pins = self.tab_pins();
@@ -1776,7 +1778,6 @@ impl App {
                                     }
                                     if !self.inbox_keep_tail {
                                         self.inbox_cursors = data.cursors;
-                                        self.inbox_summary = data.summary;
                                     }
                                     self.errors = data
                                         .errors
@@ -1985,6 +1986,7 @@ impl App {
                         }
 
                         "Channel updated"
+                        | "Inbox visibility updated"
                         | "Channel muted"
                         | "Channel unmuted"
                         | "Local importance rule saved" => {
@@ -1997,6 +1999,13 @@ impl App {
                             self.load_messages(false)
                         }
                     },
+                    Err(e)
+                        if label == "Inbox visibility updated"
+                            && e.contains("Priority must be auto") =>
+                    {
+                        self.notice =
+                            "Restart the Chord backend to save Inbox visibility settings.".into();
+                    }
                     Err(e) => self.notice = e,
                 },
                 Response::Accounts(r) => match r {
@@ -2318,11 +2327,7 @@ impl App {
             }
             KeyCode::Char('C') => self.open_contacts(),
             KeyCode::Char('v') => {
-                if self.discord_scope.is_some() {
-                    self.server_focus = !self.server_focus;
-                } else {
-                    self.focus_view = !self.focus_view;
-                }
+                self.show_unimportant = !self.show_unimportant;
                 self.selection = 0;
                 self.refresh(false);
             }
@@ -2332,16 +2337,10 @@ impl App {
                 } else {
                     self.selected()
                 };
-                if let Some(c) = chat {
-                    let priority = match key.code {
-                        KeyCode::Char('*') if c.local_priority != "important" => "important",
-                        _ => "auto",
-                    };
-                    self.apply_channel_rule(&c.id, Some(priority), None);
-                    self.operation(
-                        "Local importance rule saved",
-                        "/api/preferences/conversation".into(),
-                        json!({"conversationID":c.id,"priority":priority}),
+                if let Some(chat) = chat {
+                    self.set_unimportant(
+                        &chat.id,
+                        key.code == KeyCode::Char('*') && chat.local_priority != "unimportant",
                     );
                 }
             }
@@ -3308,10 +3307,30 @@ mod tests {
         assert_eq!(app.visible_servers().len(), 4);
     }
     #[test]
-    fn selecting_a_discord_server_shows_channels_without_changing_global_focus() {
+    fn unimportant_visibility_and_unread_filters_are_independent_of_pins() {
         let mut app = App::new(None, true);
-        assert!(!app.focus_view);
-        app.focus_view = true;
+        app.source = 0;
+        let hidden = app.conversations[0].id.clone();
+        app.conversations[0].unread = true;
+        app.move_pin(&hidden, Some(0));
+        app.set_unimportant(&hidden, true);
+
+        assert!(app.visible().iter().all(|chat| chat.id != hidden));
+        assert!(app.is_pinned(&hidden));
+        app.show_unimportant = true;
+        app.unread = true;
+        assert_eq!(app.visible()[0].id, hidden);
+        assert!(app.visible().iter().all(|chat| chat.unread));
+        app.set_unimportant(&hidden, false);
+        app.show_unimportant = false;
+        assert_eq!(app.visible()[0].id, hidden);
+    }
+
+    #[test]
+    fn selecting_a_discord_server_keeps_show_unimportant_setting() {
+        let mut app = App::new(None, true);
+        assert!(!app.show_unimportant);
+        app.show_unimportant = true;
         app.servers = vec![json!({"id":"123","name":"SDC Buggy","channelCount":23})];
         app.unread = true;
         app.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
@@ -3320,12 +3339,11 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.source, 2);
         assert_eq!(app.discord_scope.as_deref(), Some("123"));
-        assert!(!app.focus_enabled());
         assert!(!app.unread);
-        assert!(app.focus_view);
+        assert!(app.show_unimportant);
         app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(app.discord_scope.is_none());
-        assert!(app.focus_enabled());
+        assert!(app.show_unimportant);
     }
     #[test]
     fn background_messages_keep_the_reading_position_and_loaded_history() {

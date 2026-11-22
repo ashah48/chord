@@ -154,6 +154,27 @@ pub fn button(
     response.on_hover_text(label)
 }
 
+/// A pushpin tilted 45°, head up and right, like the pin in macOS lists.
+pub fn pin(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    // Drawn upright in a unit box (needle down), then rotated about its middle.
+    let (sin, cos) = std::f32::consts::FRAC_PI_4.sin_cos();
+    let at = |x: f32, y: f32| {
+        let (x, y) = (x * size, (y - 0.5) * size);
+        center + Vec2::new(x * cos - y * sin, x * sin + y * cos)
+    };
+    let fill = |points: &[(f32, f32)]| {
+        p.add(egui::Shape::convex_polygon(
+            points.iter().map(|&(x, y)| at(x, y)).collect(),
+            color,
+            Stroke::NONE,
+        ));
+    };
+    fill(&[(-0.22, 0.0), (0.22, 0.0), (0.22, 0.13), (-0.22, 0.13)]);
+    fill(&[(-0.13, 0.13), (0.13, 0.13), (0.13, 0.42), (-0.13, 0.42)]);
+    fill(&[(-0.13, 0.42), (0.13, 0.42), (0.3, 0.6), (-0.3, 0.6)]);
+    p.line_segment([at(0., 0.6), at(0., 1.)], Stroke::new(1.3_f32, color));
+}
+
 /// Paint navigation arrows directly so they do not depend on font fallback.
 pub fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let response = ui.button(format!("    {label}"));

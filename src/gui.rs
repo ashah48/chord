@@ -48,6 +48,7 @@ impl Gui {
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or(Value::Null);
         app.pins = serde_json::from_value(settings["pins"].clone()).unwrap_or_default();
+        app.pins_important = settings["pinImportant"].as_bool().unwrap_or(true);
         let theme = Theme::from_setting(settings["theme"].as_str());
         theme.apply(ctx);
         Self::apply_fonts(ctx, theme);
@@ -160,7 +161,7 @@ impl Gui {
         self.save_settings();
     }
     fn save_settings(&mut self) {
-        let value = json!({"theme": self.theme.setting(), "pins": self.app.pins});
+        let value = json!({"theme": self.theme.setting(), "pins": self.app.pins, "pinImportant": self.app.pins_important});
         let result = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
@@ -369,6 +370,16 @@ impl Gui {
                         self.save_theme(ui.ctx());
                     }
                     ui.separator();
+                    ui.label(RichText::new("Pinning").small().color(p.muted));
+                    if ui
+                        .checkbox(&mut self.app.pins_important, "Pinned chats are Important")
+                        .on_hover_text("Pinned chats always show in Important mode.")
+                        .changed()
+                    {
+                        self.save_settings();
+                        self.app.refresh(false);
+                    }
+                    ui.separator();
                     if ui.button("Manage accounts").clicked() {
                         self.app.load_accounts();
                         ui.close();
@@ -502,7 +513,7 @@ impl Gui {
                 ui.add_space(6.);
                 ui.horizontal(|ui| {
                     let mut focus = self.app.focus_enabled();
-                    if ui.selectable_value(&mut focus, true, "Focus").clicked()
+                    if ui.selectable_value(&mut focus, true, "Important").clicked()
                         || ui.selectable_value(&mut focus, false, "All").clicked()
                     {
                         if self.app.discord_scope.is_some() {
@@ -517,7 +528,7 @@ impl Gui {
                     }
                 });
                 if let (Some(total), Some(important)) = (self.app.inbox_summary["total"].as_u64(), self.app.inbox_summary["important"].as_u64()) {
-                    ui.label(RichText::new(format!("{important} in Focus · {total} total")).small().color(p.muted));
+                    ui.label(RichText::new(format!("{important} important · {total} total")).small().color(p.muted));
                 }
                 ui.add_space(10.);
                 ui.separator();
@@ -799,8 +810,6 @@ impl Gui {
         let now_ms = chrono::Utc::now().timestamp_millis();
         if chat.mute_until.is_some_and(|until| until > now_ms) {
             stamp = format!("Muted · {stamp}");
-        } else if chat.local_priority == "quiet" {
-            stamp = format!("Unimportant · {stamp}");
         }
         let stamp_font = egui::FontId::proportional(11.);
         let stamp_width = ui
@@ -839,11 +848,21 @@ impl Gui {
         } else {
             format!("{}: {}", chat.preview_sender_name, one_line(&chat.preview))
         };
+        // Pinned chats show a pin under the time, where the preview would otherwise end.
+        let pinned = self.app.is_pinned(&chat.id);
+        if pinned {
+            icons::pin(
+                ui.painter(),
+                egui::pos2(right - 6., rect.top() + 59.),
+                13.,
+                p.muted,
+            );
+        }
         row_text(
             ui,
             &preview,
             egui::pos2(text_left, rect.top() + 50.),
-            right - text_left - 8.,
+            right - text_left - if pinned { 26. } else { 8. },
             14.,
             p.muted,
         );
@@ -895,30 +914,25 @@ impl Gui {
             ui.close();
         }
         ui.separator();
-        let priority = if chat.local_priority.is_empty() {
-            "auto"
-        } else {
-            chat.local_priority.as_str()
-        };
-        for (label, value) in [
-            ("Important", "important"),
-            ("Unimportant", "quiet"),
-            ("Automatic", "auto"),
-        ] {
-            let text = if priority == value {
-                format!("✓ {label}")
+        // Important is a toggle; turning it off returns the chat to automatic ranking.
+        let important = chat.local_priority == "important";
+        if ui
+            .button(if important {
+                "✓ Important"
             } else {
-                label.to_owned()
-            };
-            if ui.button(text).clicked() {
-                self.app.apply_channel_rule(&id, Some(value), None);
-                self.app.operation(
-                    "Channel updated",
-                    "/api/preferences/conversation".into(),
-                    json!({"conversationID":id,"priority":value}),
-                );
-                ui.close();
-            }
+                "Important"
+            })
+            .on_hover_text("Important chats always show in Important mode.")
+            .clicked()
+        {
+            let value = if important { "auto" } else { "important" };
+            self.app.apply_channel_rule(&id, Some(value), None);
+            self.app.operation(
+                "Channel updated",
+                "/api/preferences/conversation".into(),
+                json!({"conversationID":id,"priority":value}),
+            );
+            ui.close();
         }
         ui.separator();
         for (label, minutes) in [
@@ -2809,7 +2823,7 @@ fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui
         } else {
             p.raised
         })
-        .stroke(egui::Stroke::new(if mine { 2. } else { 0. }, p.accent))
+        .stroke(egui::Stroke::new(if mine { 2.0_f32 } else { 0. }, p.accent))
         .corner_radius(10)
 }
 
@@ -3346,8 +3360,6 @@ mod tests {
         let text = found.join("\n");
         for label in [
             "Important",
-            "Unimportant",
-            "Automatic",
             "Mute for 1 hour",
             "Mute for 4 hours",
             "Mute for 24 hours",
@@ -3357,14 +3369,29 @@ mod tests {
             assert!(text.contains(label), "missing {label} in {text}");
         }
         assert_eq!(text.matches("Mute for").count(), 5, "{text}");
+        assert!(!text.contains("Unimportant"), "{text}");
+        assert!(!text.contains("Automatic"), "{text}");
     }
     #[test]
-    fn unimportant_row_is_labeled_and_has_no_unread_dot() {
+    fn pin_setting_is_saved_with_the_other_settings() {
+        let ctx = egui::Context::default();
+        let mut gui = Gui::new(App::new(None, true), &ctx);
+        gui.settings_path =
+            std::env::temp_dir().join(format!("chord-ui-test-{}.json", std::process::id()));
+        gui.app.pins_important = false;
+        gui.save_settings();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(&gui.settings_path).unwrap()).unwrap();
+        assert_eq!(saved["pinImportant"], false);
+        let _ = std::fs::remove_file(&gui.settings_path);
+    }
+    #[test]
+    fn muted_row_is_labeled_and_has_no_unread_dot() {
         let ctx = egui::Context::default();
         let mut gui = Gui::new(App::new(None, true), &ctx);
         let mut chat = gui.app.conversations[0].clone();
         chat.unread = true;
-        chat.local_priority = "quiet".into();
+        chat.mute_until = Some(chrono::Utc::now().timestamp_millis() + 60_000);
         chat.title = "snipes".into();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -3387,7 +3414,7 @@ mod tests {
             texts(&shape.shape, &mut found);
         }
         let text = found.join("\n");
-        assert!(text.contains("Unimportant ·"), "{text}");
+        assert!(text.contains("Muted ·"), "{text}");
         gui.app.conversations[0] = chat.clone();
         gui.app.apply_channel_rule(&chat.id, None, Some(Some(60)));
         assert!(!gui.app.conversations[0].unread);

@@ -14,7 +14,6 @@ test('only selected Buggy channels and unread WRCT pings count, quiet channels r
  const social=applyAttention(items,rules,{server:'buggy'}).find(c=>c.channelID==='social');
  assert.equal(importance(social).important,false);
  assert.equal(importance(social,{preference:{priority:'important'}}).important,true);
- assert.equal(importance(social,{preference:{priority:'quiet'}}).important,false);
  const all=applyAttention(items,rules,{server:'all'});assert.equal(all.length,items.length);assert.equal(all.find(c=>c.serverID==='other').unread,false);
  assert.equal(applyAttention(items,rules,{query:'something'}).length,items.length);
 });

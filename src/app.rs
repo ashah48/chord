@@ -258,6 +258,8 @@ pub struct App {
     pub login_busy: bool,
     // Per-tab (SOURCES key) conversation IDs the user dragged into a pinned group, in order.
     pub pins: HashMap<String, Vec<String>>,
+    // Settings: pinned chats always show in Important mode.
+    pub pins_important: bool,
     pub request_seq: u64,
     pub last_refresh: Instant,
     pub last_message_refresh: Instant,
@@ -355,6 +357,7 @@ impl App {
             login_values: HashMap::new(),
             login_busy: false,
             pins: HashMap::new(),
+            pins_important: true,
             request_seq: 0,
             last_refresh: Instant::now(),
             last_message_refresh: Instant::now(),
@@ -697,10 +700,18 @@ impl App {
             _ => {}
         }
     }
+    /// Pinned chats sent with an Important-mode request, so the backend always includes them.
+    fn important_pins(&self, view: &str) -> Vec<String> {
+        if view == "focus" && self.pins_important {
+            self.tab_pins()
+        } else {
+            Vec::new()
+        }
+    }
     pub fn refresh(&mut self, append: bool) {
         self.refresh_inbox(append, false);
     }
-    /// Apply a right-click rule immediately. Quiet and mute stop counting as unread
+    /// Apply a right-click rule immediately. A mute stops counting as unread
     /// until the fresh inbox agrees. Passing `mute_minutes` of `Some(None)` unmutes.
     pub fn apply_channel_rule(
         &mut self,
@@ -720,7 +731,7 @@ impl App {
                 chat.mute_until = minutes.map(|minutes| now + minutes * 60_000);
             }
             let muted = chat.mute_until.is_some_and(|until| until > now);
-            if muted || chat.local_priority == "quiet" {
+            if muted {
                 chat.unread = false;
                 chat.unread_count = 0;
             }
@@ -756,11 +767,7 @@ impl App {
                 "all"
             };
             let unread = self.unread;
-            let pins = if view == "focus" {
-                self.tab_pins()
-            } else {
-                Vec::new()
-            };
+            let pins = self.important_pins(view);
             let server = self.discord_scope.clone();
             let cursor = if append {
                 self.inbox_cursors
@@ -2354,7 +2361,7 @@ impl App {
                 self.selection = 0;
                 self.refresh(false);
             }
-            KeyCode::Char('*') | KeyCode::Char('z') | KeyCode::Char('=') => {
+            KeyCode::Char('*') | KeyCode::Char('=') => {
                 let chat = if self.focus == Focus::Messages {
                     self.active.clone()
                 } else {
@@ -2363,7 +2370,6 @@ impl App {
                 if let Some(c) = chat {
                     let priority = match key.code {
                         KeyCode::Char('*') if c.importance["rule"] != "important" => "important",
-                        KeyCode::Char('z') if c.importance["rule"] != "quiet" => "quiet",
                         _ => "auto",
                     };
                     self.apply_channel_rule(&c.id, Some(priority), None);
@@ -2583,7 +2589,18 @@ mod tests {
 
     use super::*;
     #[test]
-    fn unimportant_and_mute_stop_counting_as_unread_immediately() {
+    fn pinned_chats_join_important_mode_only_when_the_setting_is_on() {
+        let mut app = App::new(None, true);
+        let id = app.conversations[0].id.clone();
+        app.move_pin(&id, Some(0));
+        assert_eq!(app.important_pins("focus"), vec![id.clone()]);
+        assert!(app.important_pins("all").is_empty());
+        app.pins_important = false;
+        assert!(app.important_pins("focus").is_empty());
+        assert!(app.is_pinned(&id));
+    }
+    #[test]
+    fn mute_stops_counting_as_unread_immediately() {
         let mut app = App::new(None, true);
         let mut chat = app.conversations[0].clone();
         chat.unread = true;
@@ -2591,16 +2608,15 @@ mod tests {
         let id = chat.id.clone();
         app.conversations[0] = chat.clone();
         app.active = Some(chat);
-        app.apply_channel_rule(&id, Some("quiet"), None);
-        assert!(!app.conversations[0].unread);
-        assert!(!app.active.as_ref().unwrap().unread);
-        assert_eq!(app.conversations[0].unread_count, 0);
-        assert_eq!(app.conversations[0].local_priority, "quiet");
-        app.conversations[0].unread = true;
+        app.apply_channel_rule(&id, Some("important"), None);
+        assert!(app.conversations[0].unread);
+        assert_eq!(app.conversations[0].local_priority, "important");
         app.apply_channel_rule(&id, None, Some(Some(60)));
         assert!(app.conversations[0].mute_until.is_some());
         assert!(!app.conversations[0].unread);
-        assert_eq!(app.conversations[0].local_priority, "quiet");
+        assert!(!app.active.as_ref().unwrap().unread);
+        assert_eq!(app.conversations[0].unread_count, 0);
+        assert_eq!(app.conversations[0].local_priority, "important");
         app.apply_channel_rule(&id, Some("auto"), Some(None));
         assert!(app.conversations[0].mute_until.is_none());
         assert_eq!(app.conversations[0].local_priority, "auto");

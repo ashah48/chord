@@ -164,7 +164,7 @@ API reads return `_cache` metadata when served from storage. `fresh=true` or the
 `X-Chord-Refresh: true` header requests revalidation while keeping cached content
 available to concurrent readers.
 
-## Search and focus
+## Search and Important mode
 
 Ctrl+K focuses search. Choose Conversations to search conversation names and
 Gmail, or Message text to search every locally retained message, including older
@@ -178,12 +178,15 @@ Local coverage expands as history syncs or is fetched. Gmail syntax remains avai
 in Conversations and the mail search API. `/api/search?remote=true&query=...` explicitly
 searches providers using the original unified search.
 
-All inbox views sort by newest activity first. Focus includes recent direct
+All inbox views sort by newest activity first. Important mode includes recent direct
 conversations, personal unread messages, mentions and
-replies, conversations you have participated in, favorite contacts, and important
-email. Rows explain their importance. All remains available. Search includes
-conversations hidden by Focus. Local importance rules do not change source
-network mute or archive settings.
+replies, conversations you have participated in, favorite contacts, important
+email, and chats you mark Important. Rows explain their importance. All remains
+available. Search includes conversations hidden by Important mode. Drag a chat to
+the top, or right-click it and choose Pin, to pin it; pinned chats show a pin under
+the time. By default pinned chats always show in Important mode, which you can
+turn off under Settings → Pinning. Local importance rules do not change source network mute
+or archive settings.
 
 Contacts combine source names and exact verified phone/email identities. Matching
 names alone never merge people. Profiles support local names, favorites, explicit

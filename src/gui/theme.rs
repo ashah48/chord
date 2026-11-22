@@ -1,13 +1,70 @@
 use eframe::egui::{self, Color32, FontId, TextStyle};
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum Theme {
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    Light,
+    Dark,
+}
+
+impl DisplayMode {
+    pub fn current(theme: egui::Theme) -> Self {
+        match theme {
+            egui::Theme::Light => Self::Light,
+            egui::Theme::Dark => Self::Dark,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorScheme {
+    #[cfg_attr(target_os = "macos", default)]
+    Standard,
     #[cfg_attr(not(target_os = "macos"), default)]
     Gruvbox,
-    Dark,
-    Light,
-    #[cfg_attr(target_os = "macos", default)]
-    MacOs,
+    Solarized,
+    Dracula,
+    Nord,
 }
+
+impl ColorScheme {
+    pub const OPTIONS: [Self; 5] = [
+        Self::Standard,
+        Self::Gruvbox,
+        Self::Solarized,
+        Self::Dracula,
+        Self::Nord,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Gruvbox => "Gruvbox",
+            Self::Solarized => "Solarized",
+            Self::Dracula => "Dracula",
+            Self::Nord => "Nord",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FontStyle {
+    Terminal,
+    #[default]
+    MacOS,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Theme {
+    pub mode: Option<DisplayMode>,
+    pub scheme: ColorScheme,
+    pub font: FontStyle,
+}
+
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub bg: Color32,
@@ -22,93 +79,199 @@ pub struct Palette {
     pub select: Color32,
 }
 impl Theme {
-    pub const OPTIONS: [Self; 4] = [Self::Gruvbox, Self::Dark, Self::Light, Self::MacOs];
+    pub fn from_settings(settings: &serde_json::Value) -> Self {
+        if let Ok(theme) = serde_json::from_value(settings["appearance"].clone()) {
+            return theme;
+        }
+        match settings["theme"].as_str() {
+            Some("light") => Self {
+                mode: Some(DisplayMode::Light),
+                scheme: ColorScheme::Standard,
+                ..Self::default()
+            },
+            Some("dark") => Self {
+                mode: Some(DisplayMode::Dark),
+                scheme: ColorScheme::Standard,
+                ..Self::default()
+            },
+            Some("gruvbox") => Self {
+                mode: Some(DisplayMode::Dark),
+                scheme: ColorScheme::Gruvbox,
+                ..Self::default()
+            },
+            Some("macos") => Self {
+                scheme: ColorScheme::Standard,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
 
     pub fn palette(self, appearance: egui::Theme) -> Palette {
-        let rgb = |r, g, b| Color32::from_rgb(r, g, b);
-        match self {
-            Self::Gruvbox => Palette {
-                bg: rgb(29, 32, 33),
-                panel: rgb(60, 56, 54),
-                raised: rgb(102, 92, 84),
-                text: rgb(251, 241, 199),
-                muted: rgb(189, 174, 147),
-                line: rgb(124, 111, 100),
-                accent: rgb(254, 128, 25),
-                blue: rgb(137, 180, 250),
-                own: rgb(72, 52, 36),
-                select: rgb(102, 92, 84),
+        let hex = |rgb: u32| Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+        match (self.scheme, appearance) {
+            (ColorScheme::Standard, egui::Theme::Light) if cfg!(target_os = "macos") => Palette {
+                bg: hex(0xf5f5f7),
+                panel: hex(0xffffff),
+                raised: hex(0xe8e8ed),
+                text: hex(0x000000),
+                muted: hex(0x6e6e73),
+                line: hex(0xdedee2),
+                accent: hex(0x007aff),
+                blue: hex(0x005ecc),
+                own: hex(0xe5efff),
+                select: hex(0xd6e4ff),
             },
-            Self::Dark => Palette {
-                bg: rgb(22, 24, 28),
-                panel: rgb(29, 32, 37),
-                raised: rgb(44, 48, 56),
-                text: rgb(233, 236, 242),
-                muted: rgb(151, 160, 176),
-                line: rgb(53, 59, 69),
-                accent: rgb(137, 180, 250),
-                blue: rgb(137, 180, 250),
-                own: rgb(33, 46, 64),
-                select: rgb(44, 48, 56),
+            (ColorScheme::Standard, egui::Theme::Dark) if cfg!(target_os = "macos") => Palette {
+                bg: hex(0x1e1e1e),
+                panel: hex(0x28282a),
+                raised: hex(0x3a3a3c),
+                text: hex(0xf5f5f7),
+                muted: hex(0x98989d),
+                line: hex(0x38383a),
+                accent: hex(0x0a84ff),
+                blue: hex(0x64aaff),
+                own: hex(0x1c3454),
+                select: hex(0x264066),
             },
-            Self::Light => Palette {
-                bg: rgb(245, 246, 248),
-                panel: Color32::WHITE,
-                raised: rgb(232, 235, 241),
-                text: rgb(35, 40, 49),
-                muted: rgb(104, 113, 130),
-                line: rgb(219, 224, 233),
-                accent: rgb(69, 101, 166),
-                blue: rgb(69, 101, 166),
-                own: rgb(232, 239, 250),
-                select: rgb(232, 235, 241),
+            (ColorScheme::Standard, egui::Theme::Light) => Palette {
+                bg: hex(0xf5f6f8),
+                panel: hex(0xffffff),
+                raised: hex(0xe8ebf1),
+                text: hex(0x232831),
+                muted: hex(0x687182),
+                line: hex(0xdbe0e9),
+                accent: hex(0x4565a6),
+                blue: hex(0x4565a6),
+                own: hex(0xe8effa),
+                select: hex(0xe8ebf1),
             },
-            Self::MacOs if appearance == egui::Theme::Light => Palette {
-                bg: rgb(245, 245, 247),
-                panel: Color32::WHITE,
-                raised: rgb(232, 232, 237),
-                text: Color32::BLACK,
-                muted: rgb(110, 110, 115),
-                line: rgb(222, 222, 226),
-                accent: rgb(0, 122, 255),
-                blue: rgb(0, 94, 204),
-                own: rgb(229, 239, 255),
-                select: rgb(214, 228, 255),
+            (ColorScheme::Standard, egui::Theme::Dark) => Palette {
+                bg: hex(0x16181c),
+                panel: hex(0x1d2025),
+                raised: hex(0x2c3038),
+                text: hex(0xe9ecf2),
+                muted: hex(0x97a0b0),
+                line: hex(0x353b45),
+                accent: hex(0x89b4fa),
+                blue: hex(0x89b4fa),
+                own: hex(0x212e40),
+                select: hex(0x2c3038),
             },
-            Self::MacOs => Palette {
-                bg: rgb(30, 30, 30),
-                panel: rgb(40, 40, 42),
-                raised: rgb(58, 58, 60),
-                text: rgb(245, 245, 247),
-                muted: rgb(152, 152, 157),
-                line: rgb(56, 56, 58),
-                accent: rgb(10, 132, 255),
-                blue: rgb(100, 170, 255),
-                own: rgb(28, 52, 84),
-                select: rgb(38, 64, 102),
+            (ColorScheme::Gruvbox, egui::Theme::Light) => Palette {
+                bg: hex(0xfbf1c7),
+                panel: hex(0xf9f5d7),
+                raised: hex(0xebdbb2),
+                text: hex(0x3c3836),
+                muted: hex(0x665c54),
+                line: hex(0xd5c4a1),
+                accent: hex(0xaf3a03),
+                blue: hex(0x076678),
+                own: hex(0xf2e5bc),
+                select: hex(0xd5c4a1),
+            },
+            (ColorScheme::Gruvbox, egui::Theme::Dark) => Palette {
+                bg: hex(0x1d2021),
+                panel: hex(0x3c3836),
+                raised: hex(0x665c54),
+                text: hex(0xfbf1c7),
+                muted: hex(0xbdae93),
+                line: hex(0x7c6f64),
+                accent: hex(0xfe8019),
+                blue: hex(0x89b4fa),
+                own: hex(0x483424),
+                select: hex(0x665c54),
+            },
+            (ColorScheme::Solarized, egui::Theme::Light) => Palette {
+                bg: hex(0xfdf6e3),
+                panel: hex(0xf7efd9),
+                raised: hex(0xeee8d5),
+                text: hex(0x073642),
+                muted: hex(0x586e75),
+                line: hex(0xe0d6b6),
+                accent: hex(0x9c3b0c),
+                blue: hex(0x07618d),
+                own: hex(0xe5efd9),
+                select: hex(0xe5e2ca),
+            },
+            (ColorScheme::Solarized, egui::Theme::Dark) => Palette {
+                bg: hex(0x002b36),
+                panel: hex(0x073642),
+                raised: hex(0x154653),
+                text: hex(0xeee8d5),
+                muted: hex(0x93a1a1),
+                line: hex(0x34545b),
+                accent: hex(0xb58900),
+                blue: hex(0x60b7e8),
+                own: hex(0x12444a),
+                select: hex(0x215361),
+            },
+            (ColorScheme::Dracula, egui::Theme::Light) => Palette {
+                bg: hex(0xfffbeb),
+                panel: hex(0xefeddc),
+                raised: hex(0xece9df),
+                text: hex(0x1f1f1f),
+                muted: hex(0x6c664b),
+                line: hex(0xdedccf),
+                accent: hex(0x644ac9),
+                blue: hex(0x036a96),
+                own: hex(0xe8e4fa),
+                select: hex(0xcfcfde),
+            },
+            (ColorScheme::Dracula, egui::Theme::Dark) => Palette {
+                bg: hex(0x282a36),
+                panel: hex(0x21222c),
+                raised: hex(0x343746),
+                text: hex(0xf8f8f2),
+                muted: hex(0xb3b7cc),
+                line: hex(0x424450),
+                accent: hex(0xbd93f9),
+                blue: hex(0x8be9fd),
+                own: hex(0x353747),
+                select: hex(0x44475a),
+            },
+            (ColorScheme::Nord, egui::Theme::Light) => Palette {
+                bg: hex(0xeceff4),
+                panel: hex(0xf5f7fa),
+                raised: hex(0xe5e9f0),
+                text: hex(0x2e3440),
+                muted: hex(0x4c566a),
+                line: hex(0xd8dee9),
+                accent: hex(0x3b608c),
+                blue: hex(0x3b608c),
+                own: hex(0xe1edf2),
+                select: hex(0xd8e4f1),
+            },
+            (ColorScheme::Nord, egui::Theme::Dark) => Palette {
+                bg: hex(0x2e3440),
+                panel: hex(0x3b4252),
+                raised: hex(0x434c5e),
+                text: hex(0xeceff4),
+                muted: hex(0xb3becf),
+                line: hex(0x4c566a),
+                accent: hex(0x88c0d0),
+                blue: hex(0x8fbcbb),
+                own: hex(0x344554),
+                select: hex(0x48566d),
             },
         }
     }
+
     pub fn apply(self, ctx: &egui::Context) {
-        let preference = match self {
-            Self::MacOs => egui::ThemePreference::System,
-            Self::Light => egui::ThemePreference::Light,
-            Self::Gruvbox | Self::Dark => egui::ThemePreference::Dark,
-        };
-        ctx.set_theme(preference);
-        for system in [egui::Theme::Light, egui::Theme::Dark] {
-            let appearance = match preference {
-                egui::ThemePreference::Light => egui::Theme::Light,
-                egui::ThemePreference::Dark => egui::Theme::Dark,
-                egui::ThemePreference::System => system,
-            };
-            ctx.set_style_of(system, self.style(appearance));
+        ctx.set_theme(match self.mode {
+            Some(DisplayMode::Light) => egui::ThemePreference::Light,
+            Some(DisplayMode::Dark) => egui::ThemePreference::Dark,
+            None if cfg!(target_os = "macos") => egui::ThemePreference::System,
+            None => egui::ThemePreference::Dark,
+        });
+        for appearance in [egui::Theme::Light, egui::Theme::Dark] {
+            ctx.set_style_of(appearance, self.style(appearance));
         }
     }
 
     fn style(self, appearance: egui::Theme) -> egui::Style {
         let p = self.palette(appearance);
-        let native = self == Self::MacOs;
+        let native = cfg!(target_os = "macos");
         let mut style = egui::Style {
             visuals: match appearance {
                 egui::Theme::Light => egui::Visuals::light(),
@@ -169,31 +332,6 @@ impl Theme {
             style.text_styles.insert(kind, FontId::proportional(size));
         }
         style
-    }
-
-    pub fn from_setting(value: Option<&str>) -> Self {
-        Self::OPTIONS
-            .into_iter()
-            .find(|theme| Some(theme.setting()) == value)
-            .unwrap_or_default()
-    }
-
-    pub fn setting(self) -> &'static str {
-        match self {
-            Self::Gruvbox => "gruvbox",
-            Self::Dark => "dark",
-            Self::Light => "light",
-            Self::MacOs => "macos",
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Gruvbox => "Gruvbox dark",
-            Self::Dark => "Dark",
-            Self::Light => "Light",
-            Self::MacOs => "macOS",
-        }
     }
 }
 
@@ -272,47 +410,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn macos_follows_system_appearance_and_explicit_themes_keep_their_style() {
+    fn display_mode_switches_each_scheme_independently_of_font() {
         let ctx = egui::Context::default();
-        let expected_default = if cfg!(target_os = "macos") {
-            Theme::MacOs
-        } else {
-            Theme::Gruvbox
-        };
-        assert!(Theme::from_setting(None) == expected_default);
-        for theme in Theme::OPTIONS {
-            assert!(Theme::from_setting(Some(theme.setting())) == theme);
-            theme.apply(&ctx);
-            for system in [egui::Theme::Light, egui::Theme::Dark] {
+        for scheme in ColorScheme::OPTIONS {
+            for (mode, expected) in [
+                (DisplayMode::Light, egui::Theme::Light),
+                (DisplayMode::Dark, egui::Theme::Dark),
+            ] {
+                let theme = Theme {
+                    mode: Some(mode),
+                    scheme,
+                    font: FontStyle::Terminal,
+                };
+                theme.apply(&ctx);
                 let _ = ctx.run(
                     egui::RawInput {
-                        system_theme: Some(system),
+                        system_theme: Some(if expected == egui::Theme::Dark {
+                            egui::Theme::Light
+                        } else {
+                            egui::Theme::Dark
+                        }),
                         ..Default::default()
                     },
                     |ctx| {
-                        let expected = match theme {
-                            Theme::MacOs => system,
-                            Theme::Light => egui::Theme::Light,
-                            Theme::Gruvbox | Theme::Dark => egui::Theme::Dark,
-                        };
                         assert_eq!(ctx.theme(), expected);
                         assert_eq!(
                             ctx.style().visuals.text_color(),
                             theme.palette(expected).text
                         );
-                        assert_eq!(
-                            TextStyle::Body.resolve(&ctx.style()).size,
-                            if theme == Theme::MacOs { 14. } else { 15. }
-                        );
                     },
                 );
             }
+            let theme = Theme {
+                scheme,
+                ..Theme::default()
+            };
+            assert_ne!(
+                theme.palette(egui::Theme::Light).bg,
+                theme.palette(egui::Theme::Dark).bg
+            );
         }
     }
 
     #[test]
+    fn legacy_settings_keep_their_scheme_and_mode() {
+        let theme = |name| Theme::from_settings(&serde_json::json!({"theme":name}));
+        assert_eq!(theme("gruvbox").scheme, ColorScheme::Gruvbox);
+        assert_eq!(theme("gruvbox").mode, Some(DisplayMode::Dark));
+        assert_eq!(theme("light").mode, Some(DisplayMode::Light));
+        assert_eq!(theme("dark").mode, Some(DisplayMode::Dark));
+        assert_eq!(theme("macos").scheme, ColorScheme::Standard);
+        assert_eq!(theme("macos").mode, None);
+    }
+
+    #[test]
     fn gruvbox_keeps_surfaces_and_accents_apart() {
-        let p = Theme::Gruvbox.palette(egui::Theme::Dark);
+        let p = Theme {
+            scheme: ColorScheme::Gruvbox,
+            ..Theme::default()
+        }
+        .palette(egui::Theme::Dark);
         let dist = |a: Color32, b: Color32| {
             u16::from(a.r().abs_diff(b.r()))
                 + u16::from(a.g().abs_diff(b.g()))

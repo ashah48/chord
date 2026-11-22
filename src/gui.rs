@@ -14,7 +14,7 @@ use eframe::egui::{self, Color32, RichText, Vec2};
 use media::{Entry, Event, Media, Request};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
-use theme::{Palette, Theme};
+use theme::{ColorScheme, DisplayMode, FontStyle, Palette, Theme};
 
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum AppearanceSmokeTest {
@@ -32,6 +32,7 @@ pub struct Gui {
     pub app: App,
     media: Media,
     theme: Theme,
+    icon_style: icons::IconStyle,
     search: String,
     gallery: Vec<Target>,
     gallery_index: usize,
@@ -53,21 +54,25 @@ pub struct Gui {
     logo: Option<egui::TextureHandle>,
 }
 impl Gui {
-    pub fn new(mut app: App, ctx: &egui::Context) -> Self {
+    pub fn new(app: App, ctx: &egui::Context) -> Self {
+        Self::with_settings_path(app, ctx, settings_path())
+    }
+
+    fn with_settings_path(mut app: App, ctx: &egui::Context, settings_path: PathBuf) -> Self {
         app.native_ui = true;
-        let settings_path = settings_path();
         let settings: Value = std::fs::read(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or(Value::Null);
         app.pins = serde_json::from_value(settings["pins"].clone()).unwrap_or_default();
-        let theme = Theme::from_setting(settings["theme"].as_str());
+        let theme = Theme::from_settings(&settings);
         theme.apply(ctx);
-        Self::apply_fonts(ctx, theme);
+        Self::apply_fonts(ctx, theme.font);
         Self {
             app,
             media: Media::default(),
             theme,
+            icon_style: icons::IconStyle::from_setting(settings["iconStyle"].as_str()),
             search: String::new(),
             gallery: vec![],
             gallery_index: 0,
@@ -89,7 +94,7 @@ impl Gui {
             logo: None,
         }
     }
-    fn apply_fonts(ctx: &egui::Context, theme: Theme) {
+    fn apply_fonts(ctx: &egui::Context, font: FontStyle) {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "emoji".into(),
@@ -107,7 +112,12 @@ impl Gui {
                 .or_default()
                 .push("emoji".into());
         }
-        if cfg!(target_os = "macos") && theme == Theme::MacOs {
+        if font == FontStyle::Terminal {
+            let monospace = fonts.families[&egui::FontFamily::Monospace].clone();
+            fonts
+                .families
+                .insert(egui::FontFamily::Proportional, monospace);
+        } else if cfg!(target_os = "macos") {
             for (name, path, family) in [
                 (
                     "sf",
@@ -136,7 +146,7 @@ impl Gui {
         ctx.set_fonts(fonts);
     }
     fn show_logo(&mut self, ui: &mut egui::Ui, size: f32, fallback: RichText) {
-        if self.theme == Theme::MacOs
+        if cfg!(target_os = "macos")
             && self.logo.is_none()
             && let Ok(icon) = image::load_from_memory(include_bytes!("../assets/macos/icon.png"))
         {
@@ -155,7 +165,7 @@ impl Gui {
                 egui::TextureOptions::LINEAR,
             ));
         }
-        if self.theme == Theme::MacOs
+        if cfg!(target_os = "macos")
             && let Some(logo) = &self.logo
         {
             ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(size)));
@@ -169,15 +179,19 @@ impl Gui {
             crossterm::event::KeyModifiers::NONE,
         ));
     }
-    fn save_theme(&mut self, ctx: &egui::Context) {
-        if cfg!(target_os = "macos") {
-            Self::apply_fonts(ctx, self.theme);
+    fn save_theme(&mut self, ctx: &egui::Context, previous: Theme) {
+        if previous.font != self.theme.font {
+            Self::apply_fonts(ctx, self.theme.font);
         }
         self.theme.apply(ctx);
         self.save_settings();
     }
     fn save_settings(&mut self) {
-        let value = json!({"theme": self.theme.setting(), "pins": self.app.pins});
+        let value = json!({
+            "appearance": self.theme,
+            "iconStyle": self.icon_style.setting(),
+            "pins": self.app.pins,
+        });
         let result = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut opts = std::fs::OpenOptions::new();
@@ -261,8 +275,15 @@ impl Gui {
                     (3, "WhatsApp", "W"),
                     (4, "Messages", "M"),
                 ] {
-                    let response =
-                        icons::button(ui, index, label, compact, self.app.source == index, p);
+                    let response = icons::button(
+                        ui,
+                        index,
+                        label,
+                        compact,
+                        self.app.source == index,
+                        p,
+                        self.icon_style,
+                    );
                     if response.clicked() {
                         if index == 2 {
                             self.app.open_servers();
@@ -366,31 +387,119 @@ impl Gui {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("⚙", |ui| {
-                    ui.label(RichText::new("Appearance").small().color(p.muted));
-                    let old = self.theme;
-                    for theme in Theme::OPTIONS {
-                        if ui
-                            .selectable_value(&mut self.theme, theme, theme.name())
-                            .clicked()
-                        {
-                            ui.close();
-                        }
-                    }
-                    if old != self.theme {
-                        self.save_theme(ui.ctx());
-                    }
-                    ui.separator();
-                    if ui.button("Manage accounts").clicked() {
-                        self.app.load_accounts();
-                        ui.close();
-                    }
-                })
-                .response
-                .on_hover_text("Settings");
+                egui::containers::menu::MenuButton::new("⚙")
+                    .config(
+                        egui::containers::menu::MenuConfig::new()
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .ui(ui, |ui| self.settings_menu(ui, p))
+                    .0
+                    .on_hover_text("Settings");
             });
         });
     }
+    fn settings_menu(&mut self, ui: &mut egui::Ui, p: Palette) {
+        ui.set_width(278.0);
+        ui.spacing_mut().item_spacing.y = 5.0;
+        ui.label(RichText::new("Settings").size(19.0).strong());
+        ui.separator();
+        ui.label(
+            RichText::new("Appearance")
+                .size(11.0)
+                .strong()
+                .color(p.muted),
+        );
+
+        let previous = self.theme;
+        let old_icons = self.icon_style;
+        let mode = self
+            .theme
+            .mode
+            .unwrap_or_else(|| DisplayMode::current(ui.ctx().theme()));
+        ui.label("Display mode");
+        if let Some(mode) = settings_choices(
+            ui,
+            p,
+            mode,
+            [(DisplayMode::Light, "Light"), (DisplayMode::Dark, "Dark")],
+        ) {
+            self.theme.mode = Some(mode);
+        }
+
+        ui.add_space(3.0);
+        let id = ui.make_persistent_id("appearance-color-scheme");
+        let mut schemes =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        let arrow = if schemes.is_open() { "▴" } else { "▾" };
+        let value = format!("{}  {arrow}", self.theme.scheme.label());
+        let scheme_button = egui::Button::new("Color scheme")
+            .right_text(RichText::new(value).color(p.muted))
+            .corner_radius(7.0);
+        if ui
+            .add_sized([ui.available_width(), 30.0], scheme_button)
+            .clicked()
+        {
+            schemes.toggle(ui);
+        }
+        schemes.show_body_unindented(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for scheme in ColorScheme::OPTIONS {
+                let selected = self.theme.scheme == scheme;
+                let option = egui::Button::selectable(selected, scheme.label())
+                    .right_text(if selected { "✓" } else { "" })
+                    .corner_radius(6.0);
+                if ui.add_sized([ui.available_width(), 24.0], option).clicked() {
+                    self.theme.scheme = scheme;
+                }
+            }
+        });
+
+        ui.add_space(3.0);
+        ui.label("Font style");
+        if let Some(font) = settings_choices(
+            ui,
+            p,
+            self.theme.font,
+            [
+                (FontStyle::Terminal, "Terminal"),
+                (FontStyle::MacOS, "macOS"),
+            ],
+        ) {
+            self.theme.font = font;
+        }
+
+        ui.add_space(3.0);
+        ui.label("Service icons");
+        if let Some(style) = settings_choices(
+            ui,
+            p,
+            self.icon_style,
+            icons::IconStyle::OPTIONS.map(|style| (style, style.label())),
+        ) {
+            self.icon_style = style;
+        }
+
+        if self.theme != previous {
+            self.save_theme(ui.ctx(), previous);
+        } else if self.icon_style != old_icons {
+            self.save_settings();
+        }
+
+        ui.separator();
+        if ui
+            .add_sized(
+                [ui.available_width(), 30.0],
+                egui::Button::new("Manage accounts")
+                    .right_text("›")
+                    .frame_when_inactive(false),
+            )
+            .clicked()
+        {
+            self.app.load_accounts();
+            ui.close();
+        }
+    }
+
     fn run_search(&mut self, ctx: &egui::Context) {
         self.search_page(ctx, false);
     }
@@ -806,7 +915,13 @@ impl Gui {
             .iter()
             .position(|(id, _, _)| *id == chat.source)
             .unwrap_or(0);
-        icons::service(ui.painter(), badge.shrink(2.5), source, p.text);
+        icons::service(
+            ui.painter(),
+            badge.shrink(2.5),
+            source,
+            p.text,
+            self.icon_style,
+        );
         let text_left = avatar_rect.right() + 16.;
         let right = rect.right() - 9.;
         let mut stamp = time_label(&chat.timestamp);
@@ -2822,21 +2937,27 @@ impl eframe::App for Gui {
             }
         }
         if let Some(mut smoke) = self.appearance_smoke.take() {
+            let expected = Theme {
+                mode: Some(DisplayMode::Light),
+                scheme: ColorScheme::Nord,
+                font: FontStyle::Terminal,
+            };
+            let palette_matches =
+                ctx.style().visuals.text_color() == self.theme.palette(ctx.theme()).text;
             if smoke.rendered {
-                let matches = self.theme == Theme::Light
-                    && ctx.style().visuals.text_color() == self.theme.palette(ctx.theme()).text;
-                smoke.complete.set(matches);
+                smoke
+                    .complete
+                    .set(self.theme == expected && palette_matches);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else {
                 if matches!(smoke.mode, AppearanceSmokeTest::Write) {
-                    if self.theme != Theme::MacOs
-                        || ctx.style().visuals.text_color() != self.theme.palette(ctx.theme()).text
-                    {
+                    if self.theme != Theme::default() || !palette_matches {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         return;
                     }
-                    self.theme = Theme::Light;
-                    self.save_theme(ctx);
+                    let previous = self.theme;
+                    self.theme = expected;
+                    self.save_theme(ctx, previous);
                 }
                 smoke.rendered = true;
                 self.appearance_smoke = Some(smoke);
@@ -2873,6 +2994,43 @@ fn reaction_count_label(count: usize, mine: bool) -> String {
     } else {
         count.to_string()
     }
+}
+
+fn settings_choices<T: Copy + Eq>(
+    ui: &mut egui::Ui,
+    p: Palette,
+    selected: T,
+    choices: [(T, &str); 2],
+) -> Option<T> {
+    egui::Frame::new()
+        .fill(p.bg)
+        .stroke(egui::Stroke::new(1.0_f32, p.line))
+        .corner_radius(8.0)
+        .inner_margin(3)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let width = (ui.available_width() - 4.0) / 2.0;
+                let mut choice = None;
+                for (value, label) in choices {
+                    let active = selected == value;
+                    let button = egui::Button::selectable(active, label).corner_radius(5.0);
+                    let button = if active {
+                        button
+                            .fill(p.select)
+                            .stroke(egui::Stroke::new(1.0_f32, p.accent))
+                    } else {
+                        button.frame_when_inactive(false)
+                    };
+                    if ui.add_sized([width, 26.0], button).clicked() {
+                        choice = Some(value);
+                    }
+                }
+                choice
+            })
+            .inner
+        })
+        .inner
 }
 
 fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui::Button<'static> {
@@ -3083,13 +3241,137 @@ pub fn run(app: App, smoke: Option<AppearanceSmokeTest>) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("Could not open Chord: {e}"))?;
     anyhow::ensure!(
         smoke.is_none() || result.get(),
-        "Default macOS appearance or saved theme did not render"
+        "Default macOS appearance or saved theme settings did not render"
     );
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_style_makes_proportional_text_monospace() {
+        let ctx = egui::Context::default();
+        let font = egui::FontId::proportional(16.0);
+        for (style, expect_equal) in [(FontStyle::Terminal, true), (FontStyle::MacOS, false)] {
+            Gui::apply_fonts(&ctx, style);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                ctx.fonts_mut(|fonts| {
+                    assert_eq!(
+                        fonts.glyph_width(&font, 'i') == fonts.glyph_width(&font, 'm'),
+                        expect_equal
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn color_scheme_expands_and_can_be_selected_in_the_settings_menu() {
+        let ctx = egui::Context::default();
+        let path = std::env::temp_dir().join(format!(
+            "chord-color-scheme-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut gui = Gui::with_settings_path(App::new(None, true), &ctx, path.clone());
+        let mut time = 0.0;
+        let mut frame = |gui: &mut Gui, events| {
+            time += 0.25;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900., 650.),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    gui.sidebar(ctx, gui.theme.palette(ctx.theme()));
+                },
+            )
+        };
+        let find_label = |frame: &egui::FullOutput, label| {
+            frame
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.job.text == label
+                    {
+                        return Some(text.pos + text.galley.rect.center().to_vec2());
+                    }
+                    None
+                })
+                .unwrap_or_else(|| panic!("missing menu label {label}"))
+        };
+        let click = |pos| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        let initial = frame(&mut gui, vec![]);
+        frame(&mut gui, click(find_label(&initial, "⚙")));
+        let settings = frame(&mut gui, vec![]);
+        for label in [
+            "Settings",
+            "Appearance",
+            "Display mode",
+            "Font style",
+            "Service icons",
+            "Manage accounts",
+        ] {
+            find_label(&settings, label);
+        }
+        frame(&mut gui, click(find_label(&settings, "Color scheme")));
+        let expanded = frame(&mut gui, vec![]);
+        frame(&mut gui, click(find_label(&expanded, "Nord")));
+        assert_eq!(gui.theme.scheme, ColorScheme::Nord);
+        let settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["appearance"]["scheme"], "nord");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn icon_style_saves_and_reloads_with_theme_and_pins() {
+        let ctx = egui::Context::default();
+        let path = std::env::temp_dir().join(format!(
+            "chord-icon-style-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut gui = Gui::with_settings_path(App::new(None, true), &ctx, path.clone());
+        assert_eq!(gui.icon_style, icons::IconStyle::Brand);
+        gui.icon_style = icons::IconStyle::Original;
+        gui.theme = Theme {
+            mode: Some(DisplayMode::Light),
+            scheme: ColorScheme::Solarized,
+            font: FontStyle::Terminal,
+        };
+        let id = gui.app.conversations[0].id.clone();
+        gui.app.move_pin(&id, Some(0));
+        gui.save_settings();
+
+        let restored = Gui::with_settings_path(App::new(None, true), &ctx, path.clone());
+        assert_eq!(restored.icon_style, icons::IconStyle::Original);
+        assert_eq!(restored.theme, gui.theme);
+        assert!(restored.app.is_pinned(&id));
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn reaction_list_names_everyone_and_puts_you_first() {
         let reactions = vec![

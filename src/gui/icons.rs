@@ -1,5 +1,37 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IconStyle {
+    #[default]
+    Brand,
+    Original,
+}
+
+impl IconStyle {
+    pub const OPTIONS: [Self; 2] = [Self::Brand, Self::Original];
+
+    pub fn from_setting(value: Option<&str>) -> Self {
+        Self::OPTIONS
+            .into_iter()
+            .find(|style| Some(style.setting()) == value)
+            .unwrap_or_default()
+    }
+
+    pub fn setting(self) -> &'static str {
+        match self {
+            Self::Brand => "brand",
+            Self::Original => "original",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Brand => "Brand logos",
+            Self::Original => "Original drawings",
+        }
+    }
+}
+
 /// Official marks for the chat services, filled with their brand colors.
 fn brand_svg(source: usize) -> Option<&'static str> {
     Some(match source {
@@ -52,8 +84,8 @@ fn brand_mark(p: &egui::Painter, rect: Rect, source: usize) -> bool {
 }
 
 // Brand marks for chat services; vector drawings for the rest, which need no assets.
-pub fn service(p: &egui::Painter, rect: Rect, source: usize, ink: Color32) {
-    if brand_mark(p, rect, source) {
+pub fn service(p: &egui::Painter, rect: Rect, source: usize, ink: Color32, style: IconStyle) {
+    if style == IconStyle::Brand && brand_mark(p, rect, source) {
         return;
     }
     let pt = |x: f32, y: f32| {
@@ -66,6 +98,62 @@ pub fn service(p: &egui::Painter, rect: Rect, source: usize, ink: Color32) {
         p.line_segment([pt(a.0, a.1), pt(b.0, b.1)], Stroke::new(width, color));
     };
     match source {
+        1 => {
+            for (a, b, c) in [
+                ((0.36, 0.12), (0.36, 0.65), Color32::from_rgb(54, 197, 240)),
+                ((0.12, 0.36), (0.65, 0.36), Color32::from_rgb(224, 30, 90)),
+                ((0.65, 0.36), (0.65, 0.89), Color32::from_rgb(236, 178, 46)),
+                ((0.36, 0.65), (0.89, 0.65), Color32::from_rgb(46, 182, 125)),
+            ] {
+                line(a, b, c, 4.);
+            }
+        }
+        2 => {
+            let c = Color32::from_rgb(128, 142, 255);
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    pt(0.2, 0.26),
+                    pt(0.8, 0.26),
+                    pt(0.94, 0.76),
+                    pt(0.72, 0.86),
+                    pt(0.65, 0.74),
+                    pt(0.35, 0.74),
+                    pt(0.28, 0.86),
+                    pt(0.06, 0.76),
+                ],
+                c,
+                Stroke::NONE,
+            ));
+            for x in [0.34, 0.66] {
+                p.circle_filled(pt(x, 0.53), 2.3, Color32::from_rgb(35, 38, 59));
+            }
+            line((0.32, 0.2), (0.68, 0.2), c, 2.);
+        }
+        3 => {
+            let c = Color32::from_rgb(37, 190, 100);
+            p.circle_stroke(pt(0.5, 0.46), rect.width() * 0.38, Stroke::new(2.0_f32, c));
+            line((0.21, 0.72), (0.12, 0.94), c, 2.);
+            line((0.12, 0.94), (0.39, 0.82), c, 2.);
+            p.add(egui::Shape::line(
+                vec![
+                    pt(0.34, 0.28),
+                    pt(0.32, 0.43),
+                    pt(0.5, 0.62),
+                    pt(0.67, 0.64),
+                ],
+                Stroke::new(3.0_f32, c),
+            ));
+        }
+        4 => {
+            p.rect_stroke(
+                Rect::from_two_pos(pt(0.25, 0.03), pt(0.75, 0.97)),
+                4.,
+                Stroke::new(2.0_f32, ink),
+                egui::StrokeKind::Inside,
+            );
+            line((0.42, 0.13), (0.58, 0.13), ink, 2.);
+            p.circle_filled(pt(0.5, 0.85), 1.2, ink);
+        }
         5 | 6 => {
             let c = if source == 6 {
                 Color32::from_rgb(224, 91, 85)
@@ -104,6 +192,7 @@ pub fn button(
     compact: bool,
     selected: bool,
     p: super::Palette,
+    style: IconStyle,
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.), egui::Sense::click());
@@ -132,6 +221,7 @@ pub fn button(
         } else {
             p.text
         },
+        style,
     );
     if !compact {
         ui.painter().text(

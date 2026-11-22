@@ -59,7 +59,7 @@ env = dict(os.environ, HOME=home)
 subprocess.run([binary, "--demo", "--appearance-smoke-test", "write"],
                env=env, check=True, timeout=30)
 settings = Path(home) / "Library/Application Support/Chord/ui.json"
-if json.loads(settings.read_text())["theme"] != "light":
+if json.loads(settings.read_text())["appearance"] != {"mode": "light", "scheme": "nord", "font": "terminal"}:
     raise RuntimeError("Chord did not save its appearance settings")
 subprocess.run([binary, "--demo", "--appearance-smoke-test", "check"],
                env=env, check=True, timeout=30)

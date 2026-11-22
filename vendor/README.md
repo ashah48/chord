@@ -12,6 +12,9 @@ submodules or applying patches. Package managers still download build dependenci
 - Chord changes preserve thread replies in message history, find encrypted media
   replacements, and use the included ai-bridge source through a Go module
   replacement. Regression tests are included in the native core package.
+- History edit lookups use four concurrent requests with duplicate lookups
+  removed. State events only write snapshots when they affect stored state.
+  See `PERFORMANCE.md` for measurements and verification commands.
 
 ## ai-bridge
 

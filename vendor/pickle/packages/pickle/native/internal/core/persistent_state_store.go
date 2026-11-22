@@ -47,8 +47,9 @@ func (store *persistentStateStore) save(ctx context.Context) error {
 }
 
 func (store *persistentStateStore) UpdateState(ctx context.Context, evt *event.Event) {
-	mautrix.UpdateStateStore(ctx, store.MemoryStateStore, evt)
-	_ = store.save(ctx)
+	// Hide UpdateState so mautrix dispatches through our persisting setters.
+	// Events it does not store must not serialize and write the entire snapshot.
+	mautrix.UpdateStateStore(ctx, struct{ mautrix.StateStore }{store}, evt)
 }
 
 func (store *persistentStateStore) MarkRegistered(ctx context.Context, userID id.UserID) error {

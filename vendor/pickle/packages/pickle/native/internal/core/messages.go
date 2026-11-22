@@ -8,10 +8,11 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
-	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
 	agui "github.com/beeper/ai-bridge/pkg/ag-ui"
+	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
 	"maunium.net/go/mautrix"
 	mautrixbeeperstream "maunium.net/go/mautrix/beeperstream"
 	"maunium.net/go/mautrix/event"
@@ -753,9 +754,10 @@ func (c *Core) handleFetchMessages(ctx context.Context, payload []byte) ([]byte,
 			evt.RoomID = id.RoomID(req.RoomID)
 		}
 		if converted := c.convertMaybeEncryptedMessageEvent(ctx, evt); converted != nil {
-			messages = upsertMessage(messages, c.applyLatestReplacement(ctx, cli, id.RoomID(req.RoomID), converted))
+			messages = append(messages, converted)
 		}
 	}
+	messages = c.resolveMessageReplacements(ctx, cli, id.RoomID(req.RoomID), messages)
 	sort.SliceStable(messages, func(i, j int) bool {
 		return int64Value(messages[i].OriginServerTS) < int64Value(messages[j].OriginServerTS)
 	})
@@ -790,7 +792,7 @@ func (c *Core) handleFetchThreadMessages(ctx context.Context, cli *mautrix.Clien
 				root.RoomID = id.RoomID(req.RoomID)
 			}
 			if converted := c.convertMaybeEncryptedMessageEvent(ctx, root); converted != nil {
-				messages = upsertMessage(messages, c.applyLatestReplacement(ctx, cli, id.RoomID(req.RoomID), converted))
+				messages = append(messages, converted)
 			}
 		} else if !errors.Is(err, mautrix.MNotFound) {
 			return nil, err
@@ -802,10 +804,11 @@ func (c *Core) handleFetchThreadMessages(ctx context.Context, cli *mautrix.Clien
 		}
 		if converted := c.convertMaybeEncryptedMessageEvent(ctx, evt); converted != nil {
 			if stringValue(converted.ThreadRootEventID) == req.ThreadRootEventID {
-				messages = upsertMessage(messages, c.applyLatestReplacement(ctx, cli, id.RoomID(req.RoomID), converted))
+				messages = append(messages, converted)
 			}
 		}
 	}
+	messages = c.resolveMessageReplacements(ctx, cli, id.RoomID(req.RoomID), messages)
 	sort.SliceStable(messages, func(i, j int) bool {
 		return int64Value(messages[i].OriginServerTS) < int64Value(messages[j].OriginServerTS)
 	})
@@ -828,18 +831,94 @@ func (c *Core) applyLatestReplacement(ctx context.Context, cli *mautrix.Client, 
 		cached.setThreadRoot(stringValue(msg.ThreadRootEventID))
 		return cached
 	}
+	return c.applyMessageReplacements(ctx, roomID, msg, fetchMessageReplacements(ctx, cli, roomID, id.EventID(eventID)))
+}
+
+// Only network I/O runs concurrently. Conversion, decryption and cache updates
+// remain on the caller's goroutine, since they mutate Core state.
+const replacementFetchConcurrency = 4
+
+func fetchMessageReplacements(ctx context.Context, cli *mautrix.Client, roomID id.RoomID, eventID id.EventID) []*event.Event {
 	resp, err := retryMatrix(ctx, func() (*mautrix.RespGetRelations, error) {
-		return cli.GetRelations(ctx, roomID, id.EventID(eventID), &mautrix.ReqGetRelations{
+		return cli.GetRelations(ctx, roomID, eventID, &mautrix.ReqGetRelations{
 			RelationType: event.RelReplace,
 			Dir:          mautrix.DirectionBackward,
 			Limit:        20,
 		})
 	})
-	if err != nil {
-		return msg
+	if err != nil || resp == nil {
+		return nil
 	}
+	return resp.Chunk
+}
+
+func (c *Core) resolveMessageReplacements(ctx context.Context, cli *mautrix.Client, roomID id.RoomID, messages []*MatrixMessageEvent) []*MatrixMessageEvent {
+	results := make(map[id.EventID][]*event.Event)
+	jobs := make([]id.EventID, 0, len(messages))
+	for _, msg := range messages {
+		if msg == nil || msg.EventID == "" || boolValue(msg.IsEdited) {
+			continue
+		}
+		eventID := id.EventID(msg.EventID)
+		if c.messageEdits[eventID] != nil {
+			continue
+		}
+		if _, ok := results[eventID]; ok {
+			continue
+		}
+		results[eventID] = nil
+		jobs = append(jobs, eventID)
+	}
+	// Workers write distinct slots; the map and Core are only read or written
+	// by the caller. Keep a fixed worker pool even for unusually large pages.
+	fetched := make([][]*event.Event, len(jobs))
+	var workers sync.WaitGroup
+	for worker := 0; worker < min(replacementFetchConcurrency, len(jobs)); worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			for i := worker; i < len(jobs); i += replacementFetchConcurrency {
+				if ctx.Err() != nil {
+					return
+				}
+				fetched[i] = fetchMessageReplacements(ctx, cli, roomID, jobs[i])
+			}
+		}(worker)
+	}
+	workers.Wait()
+	for i, eventID := range jobs {
+		results[eventID] = fetched[i]
+	}
+	merged := messages[:0]
+	positions := make(map[string]int, len(messages))
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if !boolValue(msg.IsEdited) {
+			if cached := c.messageEdits[id.EventID(msg.EventID)]; cached != nil {
+				cached.setThreadRoot(stringValue(msg.ThreadRootEventID))
+				msg = cached
+			} else {
+				msg = c.applyMessageReplacements(ctx, roomID, msg, results[id.EventID(msg.EventID)])
+			}
+		}
+		if pos, ok := positions[msg.EventID]; ok && msg.EventID != "" {
+			if boolValue(msg.IsEdited) || int64Value(msg.OriginServerTS) >= int64Value(merged[pos].OriginServerTS) {
+				merged[pos] = msg
+			}
+		} else {
+			positions[msg.EventID] = len(merged)
+			merged = append(merged, msg)
+		}
+	}
+	return merged
+}
+
+func (c *Core) applyMessageReplacements(ctx context.Context, roomID id.RoomID, msg *MatrixMessageEvent, events []*event.Event) *MatrixMessageEvent {
+	eventID := msg.EventID
 	var latest *MatrixMessageEvent
-	for _, evt := range resp.Chunk {
+	for _, evt := range events {
 		if evt != nil && evt.RoomID == "" {
 			evt.RoomID = roomID
 		}
@@ -860,27 +939,6 @@ func (c *Core) applyLatestReplacement(ctx context.Context, cli *mautrix.Client, 
 	}
 	latest.setThreadRoot(stringValue(msg.ThreadRootEventID))
 	return latest
-}
-
-func upsertMessage(messages []*MatrixMessageEvent, next *MatrixMessageEvent) []*MatrixMessageEvent {
-	if next == nil {
-		return messages
-	}
-	eventID := next.EventID
-	if eventID == "" {
-		return append(messages, next)
-	}
-	for i, existing := range messages {
-		if existing.EventID != eventID {
-			continue
-		}
-		nextTs := int64Value(next.OriginServerTS)
-		if boolValue(next.IsEdited) || nextTs >= int64Value(existing.OriginServerTS) {
-			messages[i] = next
-		}
-		return messages
-	}
-	return append(messages, next)
 }
 
 func (c *Core) rememberEdit(msg *MatrixMessageEvent) {

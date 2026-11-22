@@ -1976,6 +1976,34 @@ impl Gui {
                                             {
                                                 self.app.start_login(id.to_owned(), None);
                                             }
+                                            // iMessages reads the Messages app on this Mac; no sign-in.
+                                            let messages = &account["messages"];
+                                            if let Some(enabled) = messages["enabled"].as_bool() {
+                                                if ui
+                                                    .button(if enabled { "Turn off" } else { "Turn on" })
+                                                    .clicked()
+                                                {
+                                                    self.app.operation(
+                                                        "iMessages updated",
+                                                        "/api/messages".into(),
+                                                        json!({"enabled": !enabled}),
+                                                    );
+                                                }
+                                                if messages["needsAccess"] == true
+                                                    && ui
+                                                        .button("Open Full Disk Access…")
+                                                        .on_hover_text(format!(
+                                                            "Turn on {} in the list, then restart Chord's backend.",
+                                                            messages["accessApp"].as_str().unwrap_or("Chord")
+                                                        ))
+                                                        .clicked()
+                                                    && let Err(error) = std::process::Command::new("open")
+                                                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                                                        .spawn()
+                                                {
+                                                    self.app.notice = format!("Could not open System Settings: {error}");
+                                                }
+                                            }
                                         },
                                     );
                                 });

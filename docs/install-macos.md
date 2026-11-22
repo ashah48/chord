@@ -72,19 +72,22 @@ an older Chord backend or SSH tunnel before trying again.
 ### Enable iMessage
 
 Sign into the Messages app on this Mac with your own Apple Account and
-check that your conversations appear there. Grant Full Disk Access to the
-Terminal app you use to run the backend in **System Settings → Privacy &
-Security → Full Disk Access**, then quit and reopen Terminal. This
-permission gives Terminal broad access to protected files. Chord reads the
-Messages database only when you start the backend with `--messages`.
+check that your conversations appear there. Then open **Accounts** in
+Chord and choose **Turn on** next to iPhone. Chord remembers the choice
+across restarts; `sh scripts/start-macos.sh --messages` still works too.
+
+macOS protects the Messages and Contacts databases. If Chord says it can't
+read Messages, choose **Open Full Disk Access…**, turn on the app Chord
+names (the Terminal you started the backend from, or Chord when it started
+the backend itself), and restart the backend. This permission gives that
+app broad access to protected files.
 [Apple's Full Disk Access guide](https://support.apple.com/en-us/149699)
 
-Run the same start commands above, replacing the last line with
-`sh scripts/start-macos.sh --messages`. Open the **iPhone** inbox in Chord
-to view recent iMessage text. On the first reply to a one-to-one iMessage
-conversation, macOS may ask whether Terminal can control Messages.
-Group sending, attachments, and messages stored only in rich-text form
-are outside this preview. Keep using the Messages app for those.
+The **iPhone** inbox shows iMessage, SMS, and RCS conversations, including
+groups, with names from your Contacts. On the first reply to a one-to-one
+iMessage conversation, macOS may ask whether Chord's backend can control
+Messages. Replies to groups and SMS, and attachments, are outside this
+preview. Keep using the Messages app for those.
 
 ## Checks for an assistant
 

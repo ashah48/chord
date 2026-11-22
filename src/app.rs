@@ -1486,6 +1486,11 @@ impl App {
                             self.notice = "Last contact link undone".into();
                         }
 
+                        "iMessages updated" => {
+                            self.notice = label;
+                            self.load_connections();
+                            self.refresh_inbox(false, true);
+                        }
                         "Channel updated"
                         | "Channel muted"
                         | "Channel unmuted"

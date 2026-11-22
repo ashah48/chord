@@ -25,10 +25,11 @@ nix-shell shell.nix --run './scripts/bootstrap.sh'
 ./scripts/launch.sh
 ```
 
-Bootstrap initializes the pinned upstream submodules, applies Chord's Matrix
-history/media patch, installs project dependencies, and builds the release
-client. It can be run again. Conflicting vendor edits stop the bootstrap for
-review. Dependencies stay in the project and temporary Nix shells.
+Bootstrap installs project dependencies and builds the release client. Beeper's
+Pickle and ai-bridge source code is included under `vendor/`, with Chord's Matrix
+history/media fixes already applied. No submodule setup is needed. See
+`vendor/README.md` for upstream revisions and local changes. Dependencies stay
+in the project and temporary Nix shells.
 
 The launcher reuses an already running local engine and API. It starts
 project-owned processes when needed. The first engine build may take several

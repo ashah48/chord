@@ -16,6 +16,18 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use theme::{Palette, Theme};
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum AppearanceSmokeTest {
+    Write,
+    Check,
+}
+
+struct AppearanceSmoke {
+    mode: AppearanceSmokeTest,
+    rendered: bool,
+    complete: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
 pub struct Gui {
     pub app: App,
     media: Media,
@@ -27,6 +39,7 @@ pub struct Gui {
     profile_name: String,
     profile_id: String,
     settings_path: PathBuf,
+    appearance_smoke: Option<AppearanceSmoke>,
     scroll_to: Option<String>,
     unread_marker: Option<String>,
     search_focus: bool,
@@ -62,6 +75,7 @@ impl Gui {
             profile_name: String::new(),
             profile_id: String::new(),
             settings_path,
+            appearance_smoke: None,
             scroll_to: None,
             unread_marker: None,
             search_focus: false,
@@ -156,6 +170,9 @@ impl Gui {
         ));
     }
     fn save_theme(&mut self, ctx: &egui::Context) {
+        if cfg!(target_os = "macos") {
+            Self::apply_fonts(ctx, self.theme);
+        }
         self.theme.apply(ctx);
         self.save_settings();
     }
@@ -242,7 +259,7 @@ impl Gui {
                     (1, "Slack", "S"),
                     (2, "Discord", "D"),
                     (3, "WhatsApp", "W"),
-                    (4, "iPhone", "P"),
+                    (4, "Messages", "M"),
                 ] {
                     let response =
                         icons::button(ui, index, label, compact, self.app.source == index, p);
@@ -318,7 +335,7 @@ impl Gui {
             }
             .to_owned()
         } else {
-            format!("iPhone · {state}")
+            format!("Messages · {state}")
         };
         if ui
             .add(
@@ -361,11 +378,6 @@ impl Gui {
                         }
                     }
                     if old != self.theme {
-                        if cfg!(target_os = "macos")
-                            && (old == Theme::MacOs || self.theme == Theme::MacOs)
-                        {
-                            Self::apply_fonts(ui.ctx(), self.theme);
-                        }
                         self.save_theme(ui.ctx());
                     }
                     ui.separator();
@@ -502,7 +514,7 @@ impl Gui {
                 ui.add_space(6.);
                 ui.horizontal(|ui| {
                     let mut focus = self.app.focus_enabled();
-                    if ui.selectable_value(&mut focus, true, "Focus").clicked()
+                    if ui.selectable_value(&mut focus, true, "Important").clicked()
                         || ui.selectable_value(&mut focus, false, "All").clicked()
                     {
                         if self.app.discord_scope.is_some() {
@@ -517,7 +529,7 @@ impl Gui {
                     }
                 });
                 if let (Some(total), Some(important)) = (self.app.inbox_summary["total"].as_u64(), self.app.inbox_summary["important"].as_u64()) {
-                    ui.label(RichText::new(format!("{important} in Focus · {total} total")).small().color(p.muted));
+                    ui.label(RichText::new(format!("{important} important · {total} on page")).small().color(p.muted));
                 }
                 ui.add_space(10.);
                 ui.separator();
@@ -531,14 +543,16 @@ impl Gui {
                             ui.label(
                                 RichText::new(if self.app.loading {
                                     "Loading your conversations…"
+                                } else if self.app.focus_enabled() {
+                                    "Mark a conversation Important in All to see it here."
                                 } else {
-                                    "Nothing here yet. Try All, another account, or refresh."
+                                    "Nothing here yet. Try another account or refresh."
                                 })
                                 .color(p.muted),
                             );
                         }
                         if chats.is_empty() && !self.app.loading && self.app.focus_enabled() && self.app.inbox_summary["total"].as_u64().unwrap_or(0) > 0
-                            && ui.button(format!("Show all {} conversations", self.app.inbox_summary["total"].as_u64().unwrap_or(0))).clicked() {
+                            && ui.button("Switch to All").clicked() {
                             if self.app.discord_scope.is_some() { self.app.server_focus = false; } else { self.app.focus_view = false; }
                             self.app.refresh(false);
                         }
@@ -576,13 +590,8 @@ impl Gui {
                         if let Some((id, pos, dropped)) = drag {
                             self.drag_chat(ui, &chats, &rows, divider, pinned, &id, pos, dropped, p);
                         }
-                        if !self.app.inbox_cursors.is_null()
-                            && self
-                                .app
-                                .inbox_cursors
-                                .as_object()
-                                .is_some_and(|o| !o.is_empty())
-                            && ui.button("Load more conversations").clicked()
+                        if self.app.has_more_inbox()
+                            && ui.add_enabled(!self.app.loading, egui::Button::new("Load more conversations")).clicked()
                         {
                             self.app.refresh(true);
                         }
@@ -786,21 +795,24 @@ impl Gui {
             avatar_rect.right_bottom() - egui::vec2(2., 2.),
             Vec2::splat(20.),
         );
-        ui.painter()
-            .circle_filled(badge.center(), 11., theme::tint(p.panel, color, 0.22));
+        // A plain disk with a hairline edge, so the service's own colors stay true.
+        ui.painter().circle(
+            badge.center(),
+            11.,
+            p.panel,
+            egui::Stroke::new(1.0_f32, p.line),
+        );
         let source = crate::model::SOURCES
             .iter()
             .position(|(id, _, _)| *id == chat.source)
             .unwrap_or(0);
-        icons::service(ui.painter(), badge.shrink(3.), source, p.text);
+        icons::service(ui.painter(), badge.shrink(2.5), source, p.text);
         let text_left = avatar_rect.right() + 16.;
         let right = rect.right() - 9.;
         let mut stamp = time_label(&chat.timestamp);
         let now_ms = chrono::Utc::now().timestamp_millis();
         if chat.mute_until.is_some_and(|until| until > now_ms) {
             stamp = format!("Muted · {stamp}");
-        } else if chat.local_priority == "quiet" {
-            stamp = format!("Unimportant · {stamp}");
         }
         let stamp_font = egui::FontId::proportional(11.);
         let stamp_width = ui
@@ -839,11 +851,21 @@ impl Gui {
         } else {
             format!("{}: {}", chat.preview_sender_name, one_line(&chat.preview))
         };
+        // Pinned chats show a pin under the time, where the preview would otherwise end.
+        let pinned = self.app.is_pinned(&chat.id);
+        if pinned {
+            icons::pin(
+                ui.painter(),
+                egui::pos2(right - 6., rect.top() + 59.),
+                13.,
+                p.muted,
+            );
+        }
         row_text(
             ui,
             &preview,
             egui::pos2(text_left, rect.top() + 50.),
-            right - text_left - 8.,
+            right - text_left - if pinned { 26. } else { 8. },
             14.,
             p.muted,
         );
@@ -895,30 +917,25 @@ impl Gui {
             ui.close();
         }
         ui.separator();
-        let priority = if chat.local_priority.is_empty() {
-            "auto"
-        } else {
-            chat.local_priority.as_str()
-        };
-        for (label, value) in [
-            ("Important", "important"),
-            ("Unimportant", "quiet"),
-            ("Automatic", "auto"),
-        ] {
-            let text = if priority == value {
-                format!("✓ {label}")
+        // Important is a toggle; turning it off removes the chat from Important.
+        let important = chat.local_priority == "important";
+        if ui
+            .button(if important {
+                "✓ Important"
             } else {
-                label.to_owned()
-            };
-            if ui.button(text).clicked() {
-                self.app.apply_channel_rule(&id, Some(value), None);
-                self.app.operation(
-                    "Channel updated",
-                    "/api/preferences/conversation".into(),
-                    json!({"conversationID":id,"priority":value}),
-                );
-                ui.close();
-            }
+                "Important"
+            })
+            .on_hover_text("Important chats always show in Important mode.")
+            .clicked()
+        {
+            let value = if important { "auto" } else { "important" };
+            self.app.apply_channel_rule(&id, Some(value), None);
+            self.app.operation(
+                "Channel updated",
+                "/api/preferences/conversation".into(),
+                json!({"conversationID":id,"priority":value}),
+            );
+            ui.close();
         }
         ui.separator();
         for (label, minutes) in [
@@ -961,16 +978,21 @@ impl Gui {
         _p: Palette,
     ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
-        ui.painter()
-            .circle_filled(rect.center(), size / 2., theme::avatar_color(name));
         let initials = initials(name);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            initials,
-            egui::FontId::proportional(size * 0.34),
-            Color32::WHITE,
-        );
+        if initials.is_empty() {
+            // A phone number or blank name has no initials; show a contact silhouette.
+            icons::person(ui.painter(), rect.center(), size / 2.);
+        } else {
+            ui.painter()
+                .circle_filled(rect.center(), size / 2., theme::avatar_color(name));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initials,
+                egui::FontId::proportional(size * 0.34),
+                Color32::WHITE,
+            );
+        }
         if ui.is_rect_visible(rect)
             && let Some(id) = contact
         {
@@ -1002,7 +1024,7 @@ impl Gui {
                         self.show_logo(ui, 64., RichText::new("c·").size(58.).color(p.accent));
                         ui.heading("Your conversations");
                         ui.label(
-                            RichText::new("Slack, Discord, WhatsApp, iPhone, and email")
+                            RichText::new("Slack, Discord, WhatsApp, Messages, and email")
                                 .color(p.muted),
                         );
                         ui.add_space(15.);
@@ -1206,7 +1228,9 @@ impl Gui {
         index: usize,
         p: Palette,
     ) {
-        let has_thread = chat.source == "slack"
+        let synced = !m.is_local_outgoing();
+        let has_thread = synced
+            && chat.source == "slack"
             && chat.thread_root_id.is_none()
             && m.thread_root_id.is_none()
             && (m.reply_count > 0
@@ -1271,7 +1295,8 @@ impl Gui {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             ui.menu_button("•••", |ui| {
-                                                if chat.source == "slack"
+                                                if synced
+                                                    && chat.source == "slack"
                                                     && chat.kind == "chat"
                                                     && chat.thread_root_id.is_none()
                                                     && ui.button("View full thread").clicked()
@@ -1279,18 +1304,22 @@ impl Gui {
                                                     self.app.open_thread(m);
                                                     ui.close();
                                                 }
-                                                if chat.can_react {
+                                                if synced && chat.can_react {
                                                     self.reaction_menu(ui, chat, m, p);
                                                 }
                                                 if ui.button("Copy message").clicked() {
                                                     ui.ctx().copy_text(m.text.clone());
                                                     ui.close();
                                                 }
-                                                if chat.can_reply && ui.button("Reply").clicked() {
+                                                if synced
+                                                    && chat.can_reply
+                                                    && ui.button("Reply").clicked()
+                                                {
                                                     self.reply_to(index);
                                                     ui.close();
                                                 }
-                                                if m.is_sender
+                                                if synced
+                                                    && m.is_sender
                                                     && chat.kind == "chat"
                                                     && ui.button("Edit message").clicked()
                                                 {
@@ -1372,11 +1401,31 @@ impl Gui {
                                         });
                                 }
                                 if let Some(error) = &m.send_error {
-                                    ui.label(
-                                        RichText::new(format!("Not sent · {error}"))
-                                            .small()
-                                            .color(p.accent),
-                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("Not sent · {error}"))
+                                                .small()
+                                                .color(p.accent),
+                                        );
+                                        if ui.small_button("Retry").clicked() {
+                                            thread_clicked = true;
+                                            self.app.retry_outgoing(&m.id);
+                                        }
+                                        if ui.small_button("Dismiss").clicked() {
+                                            thread_clicked = true;
+                                            self.app.dismiss_outgoing(&m.id);
+                                        }
+                                    });
+                                } else if let Some(status) = &m.send_status {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(status).small().color(p.muted));
+                                        if status == "Sent · awaiting sync"
+                                            && ui.small_button("Dismiss").clicked()
+                                        {
+                                            thread_clicked = true;
+                                            self.app.dismiss_outgoing(&m.id);
+                                        }
+                                    });
                                 }
                                 if has_thread {
                                     let count = m.reply_count.max(
@@ -1416,7 +1465,9 @@ impl Gui {
                                         index: attachment_index,
                                         attachment: a.clone(),
                                     };
-                                    if crate::images::is_image(a) {
+                                    if !synced {
+                                        ui.label(a["fileName"].as_str().unwrap_or("Attachment"));
+                                    } else if crate::images::is_image(a) {
                                         if self
                                             .image(
                                                 ui,
@@ -1526,7 +1577,7 @@ impl Gui {
                 }
             }
         }
-        if chat.can_react {
+        if synced && chat.can_react {
             let activation_pos = ui.input(|input| {
                 input.pointer.interact_pos().filter(|pos| {
                     response.rect.contains(*pos)
@@ -2770,6 +2821,28 @@ impl eframe::App for Gui {
                 self.app.notice = format!("Could not open the link: {error}");
             }
         }
+        if let Some(mut smoke) = self.appearance_smoke.take() {
+            if smoke.rendered {
+                let matches = self.theme == Theme::Light
+                    && ctx.style().visuals.text_color() == self.theme.palette(ctx.theme()).text;
+                smoke.complete.set(matches);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                if matches!(smoke.mode, AppearanceSmokeTest::Write) {
+                    if self.theme != Theme::MacOs
+                        || ctx.style().visuals.text_color() != self.theme.palette(ctx.theme()).text
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    self.theme = Theme::Light;
+                    self.save_theme(ctx);
+                }
+                smoke.rendered = true;
+                self.appearance_smoke = Some(smoke);
+                ctx.request_repaint();
+            }
+        }
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
@@ -2809,7 +2882,10 @@ fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui
         } else {
             p.raised
         })
-        .stroke(egui::Stroke::new(if mine { 2. } else { 0. }, p.accent))
+        .stroke(egui::Stroke::new(
+            if mine { 2.0_f32 } else { 0.0 },
+            p.accent,
+        ))
         .corner_radius(10)
 }
 
@@ -2944,19 +3020,14 @@ fn message_order(messages: &[Message], group_threads: bool) -> Vec<usize> {
     order
 }
 
+/// Up to two initials from the first letters of the first two words. Empty when the name
+/// has no letters (a phone number), so the avatar shows a silhouette instead of a digit.
 fn initials(name: &str) -> String {
-    let result: String = name
-        .split_whitespace()
+    name.split_whitespace()
+        .filter_map(|w| w.chars().find(|c| c.is_alphabetic()))
         .take(2)
-        .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()))
         .flat_map(char::to_uppercase)
-        .take(2)
-        .collect();
-    if result.is_empty() {
-        "?".into()
-    } else {
-        result
-    }
+        .collect()
 }
 // Where UI preferences (the chosen theme) persist between launches. A release build's
 // CARGO_MANIFEST_DIR is the build machine's checkout, which does not exist on the user's
@@ -2970,7 +3041,7 @@ fn settings_path() -> PathBuf {
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("private/ui.json")
 }
-pub fn run(app: App) -> anyhow::Result<()> {
+pub fn run(app: App, smoke: Option<AppearanceSmokeTest>) -> anyhow::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Chord")
         .with_app_id("dev.chord.Chord")
@@ -2994,12 +3065,27 @@ pub fn run(app: App) -> anyhow::Result<()> {
         vsync: std::env::var_os("WAYLAND_DISPLAY").is_none(),
         ..Default::default()
     };
+    let complete = std::rc::Rc::new(std::cell::Cell::new(false));
+    let result = complete.clone();
     eframe::run_native(
         "Chord",
         options,
-        Box::new(move |cc| Ok(Box::new(Gui::new(app, &cc.egui_ctx)))),
+        Box::new(move |cc| {
+            let mut gui = Gui::new(app, &cc.egui_ctx);
+            gui.appearance_smoke = smoke.map(|mode| AppearanceSmoke {
+                mode,
+                rendered: false,
+                complete,
+            });
+            Ok(Box::new(gui))
+        }),
     )
-    .map_err(|e| anyhow::anyhow!("Could not open Chord: {e}"))
+    .map_err(|e| anyhow::anyhow!("Could not open Chord: {e}"))?;
+    anyhow::ensure!(
+        smoke.is_none() || result.get(),
+        "Default macOS appearance or saved theme did not render"
+    );
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -3137,7 +3223,10 @@ mod tests {
     fn initials_handle_unicode_and_empty_names() {
         assert_eq!(initials("Alex Chen"), "AC");
         assert_eq!(initials("Élodie"), "É");
-        assert_eq!(initials(""), "?");
+        assert_eq!(initials(""), "");
+        assert_eq!(initials("+1 (908) 902-3769"), "");
+        assert_eq!(initials("Mom ❤️"), "M");
+        assert_eq!(initials("Aiden, Ronav & 2 more"), "AR");
     }
     #[test]
     fn reaction_gestures_target_the_clicked_message_and_respect_capabilities() {
@@ -3346,8 +3435,6 @@ mod tests {
         let text = found.join("\n");
         for label in [
             "Important",
-            "Unimportant",
-            "Automatic",
             "Mute for 1 hour",
             "Mute for 4 hours",
             "Mute for 24 hours",
@@ -3357,14 +3444,16 @@ mod tests {
             assert!(text.contains(label), "missing {label} in {text}");
         }
         assert_eq!(text.matches("Mute for").count(), 5, "{text}");
+        assert!(!text.contains("Unimportant"), "{text}");
+        assert!(!text.contains("Automatic"), "{text}");
     }
     #[test]
-    fn unimportant_row_is_labeled_and_has_no_unread_dot() {
+    fn muted_row_is_labeled_and_has_no_unread_dot() {
         let ctx = egui::Context::default();
         let mut gui = Gui::new(App::new(None, true), &ctx);
         let mut chat = gui.app.conversations[0].clone();
         chat.unread = true;
-        chat.local_priority = "quiet".into();
+        chat.mute_until = Some(chrono::Utc::now().timestamp_millis() + 60_000);
         chat.title = "snipes".into();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -3387,7 +3476,7 @@ mod tests {
             texts(&shape.shape, &mut found);
         }
         let text = found.join("\n");
-        assert!(text.contains("Unimportant ·"), "{text}");
+        assert!(text.contains("Muted ·"), "{text}");
         gui.app.conversations[0] = chat.clone();
         gui.app.apply_channel_rule(&chat.id, None, Some(Some(60)));
         assert!(!gui.app.conversations[0].unread);

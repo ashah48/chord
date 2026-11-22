@@ -32,10 +32,21 @@ function decode(s){return Buffer.from(s||'','base64url').toString('utf8')}
 function content(payload){let plain=[],html=[];function visit(p){if(p.mimeType==='text/plain'&&p.body?.data)plain.push(decode(p.body.data));if(p.mimeType==='text/html'&&p.body?.data)html.push(decode(p.body.data));for(const child of p.parts||[])visit(child)}visit(payload);return plain.join('\n')||convert(html.join('\n'),{wordwrap:false,selectors:[{selector:'img',format:'skip'}]})}
 function attachments(payload){const result=[];function visit(p){if(p.filename&&p.body?.attachmentId)result.push({id:p.body.attachmentId,fileName:p.filename,mimeType:p.mimeType,fileSize:p.body.size});for(const child of p.parts||[])visit(child)}visit(payload);return result}
 function preview(m){return {id:m.id,threadId:m.threadId,subject:header(m,'subject')||'(No subject)',from:header(m,'from'),to:header(m,'to'),date:new Date(Number(m.internalDate)||Date.now()).toISOString(),snippet:m.snippet||'',unread:m.labelIds?.includes('UNREAD')||false,labels:m.labelIds||[],automated:!!header(m,'list-id')||!!header(m,'list-unsubscribe')||/bulk|list/i.test(header(m,'precedence'))||(!['','no'].includes(header(m,'auto-submitted').toLowerCase()))}}
-export async function listMail(id,{query='in:inbox',cursor,limit=30}={}){
+export async function listMail(id,{query='in:inbox',cursor,limit=30,includeThreads=[],onlyThreads=null}={}){
  await verify(id);const q=new URLSearchParams({q:query,maxResults:String(Math.min(100,limit))});if(cursor)q.set('pageToken',cursor);
- const list=await request(id,'/threads?'+q),threads=[];
- for(let i=0;i<(list.threads||[]).length;i+=6){const batch=await Promise.all((list.threads||[]).slice(i,i+6).map(t=>request(id,'/threads/'+t.id+'?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-ID&metadataHeaders=List-Unsubscribe&metadataHeaders=Auto-Submitted&metadataHeaders=Precedence')));for(const thread of batch){const latest=thread.messages?.at(-1);if(latest)threads.push({...preview(latest),id:thread.id,unread:thread.messages.some(m=>m.labelIds?.includes('UNREAD')),count:thread.messages.length,account:id})}}
+ const list=onlyThreads?{threads:[]}:await request(id,'/threads?'+q),threads=[];
+ const listed=new Set((list.threads||[]).map(t=>t.id));
+ const ids=[...new Set(onlyThreads??[...listed,...includeThreads])];
+ for(let i=0;i<ids.length;i+=6){
+  const batch=await Promise.all(ids.slice(i,i+6).map(async threadId=>{
+   try{return await request(id,'/threads/'+encodeURIComponent(threadId)+'?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-ID&metadataHeaders=List-Unsubscribe&metadataHeaders=Precedence')}
+   catch(e){if(!listed.has(threadId)&&e.status===404)return null;throw e}
+  }));
+  for(const thread of batch){
+   const latest=thread?.messages?.at(-1);
+   if(latest&&(listed.has(thread.id)||thread.messages.some(m=>m.labelIds?.includes('INBOX'))))threads.push({...preview(latest),id:thread.id,unread:thread.messages.some(m=>m.labelIds?.includes('UNREAD')),count:thread.messages.length,account:id});
+  }
+ }
  return {items:threads,hasMore:!!list.nextPageToken,oldestCursor:list.nextPageToken||null};
 }
 export async function readMail(id,threadId){await verify(id);const thread=await request(id,'/threads/'+encodeURIComponent(threadId)+'?format=full');return {items:(thread.messages||[]).map(m=>({...preview(m),text:content(m.payload),messageIdHeader:header(m,'message-id'),references:header(m,'references'),attachments:attachments(m.payload),isSender:header(m,'from').toLowerCase().includes(account(id).email.toLowerCase())})),hasMore:false,oldestCursor:null}}

@@ -1,7 +1,61 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
-// Vector service marks stay sharp at both sidebar sizes and need no remote assets.
+/// Official marks for the chat services, filled with their brand colors.
+fn brand_svg(source: usize) -> Option<&'static str> {
+    Some(match source {
+        1 => include_str!("../../assets/brands/slack.svg"),
+        2 => include_str!("../../assets/brands/discord.svg"),
+        3 => include_str!("../../assets/brands/whatsapp.svg"),
+        4 => include_str!("../../assets/brands/imessage.svg"),
+        _ => return None,
+    })
+}
+
+/// Rasterize a brand mark at the exact pixel size it is shown, once per size.
+fn brand_texture(ctx: &egui::Context, source: usize, px: u32) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new(("brand-mark", source, px));
+    if let Some(texture) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return Some(texture);
+    }
+    let tree = resvg::usvg::Tree::from_str(brand_svg(source)?, &Default::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px)?;
+    let scale = px as f32 / tree.size().width().max(tree.size().height());
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    let image = egui::ColorImage::from_rgba_premultiplied([px as usize; 2], pixmap.data());
+    let texture = ctx.load_texture(
+        format!("brand-mark-{source}-{px}"),
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| d.insert_temp(id, texture.clone()));
+    Some(texture)
+}
+
+/// Draw a service's real mark. Returns false for services without one.
+fn brand_mark(p: &egui::Painter, rect: Rect, source: usize) -> bool {
+    let px = (rect.width().max(rect.height()) * p.ctx().pixels_per_point()).round() as u32;
+    let Some(texture) = brand_texture(p.ctx(), source, px.clamp(8, 512)) else {
+        return false;
+    };
+    let side = rect.width().min(rect.height());
+    p.image(
+        texture.id(),
+        Rect::from_center_size(rect.center(), Vec2::splat(side)),
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)),
+        Color32::WHITE,
+    );
+    true
+}
+
+// Brand marks for chat services; vector drawings for the rest, which need no assets.
 pub fn service(p: &egui::Painter, rect: Rect, source: usize, ink: Color32) {
+    if brand_mark(p, rect, source) {
+        return;
+    }
     let pt = |x: f32, y: f32| {
         Pos2::new(
             rect.left() + x * rect.width(),
@@ -12,62 +66,6 @@ pub fn service(p: &egui::Painter, rect: Rect, source: usize, ink: Color32) {
         p.line_segment([pt(a.0, a.1), pt(b.0, b.1)], Stroke::new(width, color));
     };
     match source {
-        1 => {
-            for (a, b, c) in [
-                ((0.36, 0.12), (0.36, 0.65), Color32::from_rgb(54, 197, 240)),
-                ((0.12, 0.36), (0.65, 0.36), Color32::from_rgb(224, 30, 90)),
-                ((0.65, 0.36), (0.65, 0.89), Color32::from_rgb(236, 178, 46)),
-                ((0.36, 0.65), (0.89, 0.65), Color32::from_rgb(46, 182, 125)),
-            ] {
-                line(a, b, c, 4.);
-            }
-        }
-        2 => {
-            let c = Color32::from_rgb(128, 142, 255);
-            p.add(egui::Shape::convex_polygon(
-                vec![
-                    pt(0.2, 0.26),
-                    pt(0.8, 0.26),
-                    pt(0.94, 0.76),
-                    pt(0.72, 0.86),
-                    pt(0.65, 0.74),
-                    pt(0.35, 0.74),
-                    pt(0.28, 0.86),
-                    pt(0.06, 0.76),
-                ],
-                c,
-                Stroke::NONE,
-            ));
-            for x in [0.34, 0.66] {
-                p.circle_filled(pt(x, 0.53), 2.3, Color32::from_rgb(35, 38, 59));
-            }
-            line((0.32, 0.2), (0.68, 0.2), c, 2.);
-        }
-        3 => {
-            let c = Color32::from_rgb(37, 190, 100);
-            p.circle_stroke(pt(0.5, 0.46), rect.width() * 0.38, Stroke::new(2.0_f32, c));
-            line((0.21, 0.72), (0.12, 0.94), c, 2.);
-            line((0.12, 0.94), (0.39, 0.82), c, 2.);
-            p.add(egui::Shape::line(
-                vec![
-                    pt(0.34, 0.28),
-                    pt(0.32, 0.43),
-                    pt(0.5, 0.62),
-                    pt(0.67, 0.64),
-                ],
-                Stroke::new(3.0_f32, c),
-            ));
-        }
-        4 => {
-            p.rect_stroke(
-                Rect::from_two_pos(pt(0.25, 0.03), pt(0.75, 0.97)),
-                4.,
-                Stroke::new(2.0_f32, ink),
-                egui::StrokeKind::Inside,
-            );
-            line((0.42, 0.13), (0.58, 0.13), ink, 2.);
-            p.circle_filled(pt(0.5, 0.85), 1.2, ink);
-        }
         5 | 6 => {
             let c = if source == 6 {
                 Color32::from_rgb(224, 91, 85)
@@ -154,6 +152,56 @@ pub fn button(
     response.on_hover_text(label)
 }
 
+/// The generic contact silhouette, for people with no photo and no letters in their name.
+pub fn person(p: &egui::Painter, center: Pos2, radius: f32) {
+    p.circle_filled(center, radius, Color32::from_rgb(160, 168, 204));
+    let white = Color32::WHITE;
+    p.circle_filled(center - Vec2::new(0., radius * 0.2), radius * 0.36, white);
+    // Shoulders: a large circle below, cut off by the avatar's edge. Both shapes are
+    // convex, so their overlap is too: keep each outline's points that fall inside the other.
+    let shoulders = center + Vec2::new(0., radius * 0.98);
+    let shoulder_radius = radius * 0.74;
+    let ring = |c: Pos2, r: f32| {
+        (0..96).map(move |i| {
+            let a = i as f32 / 96. * std::f32::consts::TAU;
+            c + Vec2::new(a.cos(), a.sin()) * r
+        })
+    };
+    let mut points: Vec<Pos2> = ring(shoulders, shoulder_radius)
+        .filter(|q| q.distance(center) <= radius)
+        .chain(ring(center, radius).filter(|q| q.distance(shoulders) <= shoulder_radius))
+        .collect();
+    let middle = center + Vec2::new(0., radius * 0.6);
+    points.sort_by(|a, b| {
+        let angle = |q: &Pos2| (q.y - middle.y).atan2(q.x - middle.x);
+        angle(a).total_cmp(&angle(b))
+    });
+    if points.len() >= 3 {
+        p.add(egui::Shape::convex_polygon(points, white, Stroke::NONE));
+    }
+}
+
+/// A pushpin tilted 45°, head up and right, like the pin in macOS lists.
+pub fn pin(p: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    // Drawn upright in a unit box (needle down), then rotated about its middle.
+    let (sin, cos) = std::f32::consts::FRAC_PI_4.sin_cos();
+    let at = |x: f32, y: f32| {
+        let (x, y) = (x * size, (y - 0.5) * size);
+        center + Vec2::new(x * cos - y * sin, x * sin + y * cos)
+    };
+    let fill = |points: &[(f32, f32)]| {
+        p.add(egui::Shape::convex_polygon(
+            points.iter().map(|&(x, y)| at(x, y)).collect(),
+            color,
+            Stroke::NONE,
+        ));
+    };
+    fill(&[(-0.22, 0.0), (0.22, 0.0), (0.22, 0.13), (-0.22, 0.13)]);
+    fill(&[(-0.13, 0.13), (0.13, 0.13), (0.13, 0.42), (-0.13, 0.42)]);
+    fill(&[(-0.13, 0.42), (0.13, 0.42), (0.3, 0.6), (-0.3, 0.6)]);
+    p.line_segment([at(0., 0.6), at(0., 1.)], Stroke::new(1.3_f32, color));
+}
+
 /// Paint navigation arrows directly so they do not depend on font fallback.
 pub fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let response = ui.button(format!("    {label}"));
@@ -230,4 +278,17 @@ pub fn gallery_button(ui: &mut egui::Ui, icon: GalleryIcon, label: &str) -> egui
     response
         .on_hover_text(label)
         .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn brand_marks_render_in_color() {
+        let ctx = eframe::egui::Context::default();
+        for source in 1..=4 {
+            let texture = super::brand_texture(&ctx, source, 48).expect("brand mark renders");
+            assert_eq!(texture.size(), [48, 48]);
+        }
+        assert!(super::brand_texture(&ctx, 5, 48).is_none());
+    }
 }

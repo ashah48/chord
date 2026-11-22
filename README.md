@@ -164,7 +164,7 @@ API reads return `_cache` metadata when served from storage. `fresh=true` or the
 `X-Chord-Refresh: true` header requests revalidation while keeping cached content
 available to concurrent readers.
 
-## Search and focus
+## Search and Important mode
 
 Ctrl+K focuses search. Choose Conversations to search conversation names and
 Gmail, or Message text to search every locally retained message, including older
@@ -178,12 +178,11 @@ Local coverage expands as history syncs or is fetched. Gmail syntax remains avai
 in Conversations and the mail search API. `/api/search?remote=true&query=...` explicitly
 searches providers using the original unified search.
 
-All inbox views sort by newest activity first. Focus includes recent direct
-conversations, personal unread messages, mentions and
-replies, conversations you have participated in, favorite contacts, and important
-email. Rows explain their importance. All remains available. Search includes
-conversations hidden by Focus. Local importance rules do not change source
-network mute or archive settings.
+The All tab opens by default. Mark a conversation Important from its menu to
+include it in the Important tab. Drag a conversation to the top or choose Pin
+to place it above other conversations in the current list. A conversation can
+be both pinned and Important. Muting still controls unread badges. Existing
+Unimportant rules revert to the normal setting.
 
 Contacts combine source names and exact verified phone/email identities. Matching
 names alone never merge people. Profiles support local names, favorites, explicit
@@ -194,7 +193,7 @@ Discord attention rules can be configured locally under `discordAttention` in
 `private/config.json`. `visibleServerIDs` controls the preferred server list,
 `allMessagesChannelIDs` allows unread badges for every message in selected channels,
 and `mentionsOnlyServerIDs` allows unread badges only for unread highlighted mentions.
-The default inbox shows selected channels and unread mentions only. All servers
+Discord unread badges reflect those rules. All servers
 remain searchable in the picker; Show other servers reveals the full list.
 Other Discord channels stay accessible under All Discord channels and search, with
 unread badges suppressed. These rules do not alter network read receipts or mute settings.
@@ -221,7 +220,7 @@ operation documentation is available at `GET /api/openapi.json`.
 | Endpoint | Use |
 | --- | --- |
 | `GET /api/connections` | Live connection states, `refresh=true` bypasses the 30-second cache |
-| `GET /api/inbox?view=focus` | Ranked unified inbox with reasons and counts |
+| `GET /api/inbox?view=focus` | Conversations manually marked Important |
 | `GET /api/inbox?view=all&source=slack` | Per-source inbox, with pagination |
 | `GET /api/search?query=...` | Unified message and email search |
 | `GET /api/conversations/{id}/messages` | Conversation history with attachments and reactions |

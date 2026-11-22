@@ -70,6 +70,13 @@ pub struct Message {
     pub references: String,
     /// Set only for a message this client showed before the server accepted it.
     pub send_error: Option<String>,
+    pub send_status: Option<String>,
+}
+
+impl Message {
+    pub fn is_local_outgoing(&self) -> bool {
+        self.send_status.is_some() || self.send_error.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -86,7 +93,7 @@ pub const SOURCES: &[(&str, &str, &str)] = &[
     ("slack", "Slack", "2"),
     ("discord", "Discord", "3"),
     ("whatsapp", "WhatsApp", "4"),
-    ("iphone", "iPhone", "5"),
+    ("iphone", "Messages", "5"),
     ("mail:home", "Personal mail", "6"),
     ("mail:cmu", "CMU mail", "7"),
 ];
@@ -103,13 +110,13 @@ pub fn one_line(text: &str) -> String {
 
 pub fn source_label(source: &str) -> &str {
     match source {
-        "slack" => "slack",
-        "discord" => "discord",
-        "whatsapp" => "whatsapp",
-        "iphone" => "iphone",
-        "mail:home" => "personal",
-        "mail:cmu" => "cmu",
-        _ => "matrix",
+        "slack" => "Slack",
+        "discord" => "Discord",
+        "whatsapp" => "WhatsApp",
+        "iphone" => "Messages",
+        "mail:home" => "Personal mail",
+        "mail:cmu" => "CMU mail",
+        _ => "Matrix",
     }
 }
 

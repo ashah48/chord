@@ -139,7 +139,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Span::styled(app.source_title(), Style::new().fg(t.text)),
         Span::styled(
             format!(
-                "   {} quieter · v {}",
+                "   {} hidden · v {}",
                 app.inbox_summary["hidden"].as_u64().unwrap_or(0),
                 if app.focus_enabled() {
                     "show all"
@@ -176,6 +176,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_inbox(frame, app, list, t);
     render_thread(frame, app, content, t);
     let hint = match app.mode {
+        Mode::Browse if app.has_more_inbox() => "L load more conversations · ? help",
         Mode::Compose => "esc back    ctrl+s send    enter newline",
         Mode::Search => "enter search    esc clear",
         Mode::Accounts => "j/k select    enter connect    esc back",
@@ -194,7 +195,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::ContactName => "enter save name    esc cancel",
         Mode::ConfirmContactLink => "enter link these accounts    esc cancel",
         _ => {
-            "j/k move   i write   r reply   e react   v focus/all   c contacts   * pin   z quiet   ? help"
+            "j/k move   i write   r reply   e react   v important/all   c contacts   * important   ? help"
         }
     };
     let status = Layout::horizontal([Constraint::Min(15), Constraint::Length(19)]).split(outer[3]);
@@ -315,7 +316,7 @@ fn render_inbox(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
             if app.unread {
                 "Unread"
             } else if app.focus_enabled() {
-                "Focus"
+                "Important"
             } else if app.discord_scope.is_some() {
                 "Channels"
             } else {
@@ -336,7 +337,7 @@ fn render_inbox(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
         let text = if app.loading {
             "\n  Loading your conversations…"
         } else if app.focus_enabled() {
-            "\n  Nothing needs your attention here.\n\n  v shows all conversations.\n  * pins a chat in Focus.\n  c opens your contacts."
+            "\n  Nothing needs your attention here.\n\n  v shows all conversations.\n  * marks a chat important.\n  c opens your contacts."
         } else {
             "\n  Nothing here yet.\n\n  Press a to connect your accounts.\n  Email and iPhone appear as\n  soon as they are available."
         };
@@ -589,6 +590,18 @@ fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
             lines.push(
                 Line::from(Span::styled(format!("   {l}"), Style::new().fg(t.text))).style(style),
             );
+        }
+        if let Some(error) = &m.send_error {
+            lines.push(
+                Line::from(format!("   Not sent · {error} · y retry · D dismiss")).style(style),
+            );
+        } else if let Some(status) = &m.send_status {
+            let hint = if status == "Sent · awaiting sync" {
+                " · D dismiss"
+            } else {
+                ""
+            };
+            lines.push(Line::from(format!("   {status}{hint}")).style(style));
         }
         for a in &m.attachments {
             lines.push(
@@ -1255,11 +1268,8 @@ fn render_help(frame: &mut Frame, t: Theme) {
     let rows = [
         ("1…7", "switch account; 3 opens Discord servers"),
         ("s", "browse Discord servers and direct messages"),
-        ("v", "switch between Focus and every conversation"),
-        (
-            "* / z / =",
-            "pin in Focus / quiet / restore automatic importance",
-        ),
+        ("v", "switch between Important and every conversation"),
+        ("* / =", "mark important / restore automatic importance"),
         ("c", "contacts: search, rename, favorite, and link accounts"),
         ("j / k", "move through conversations or messages"),
         ("tab / h / l", "change pane; enter opens a conversation"),
@@ -1357,7 +1367,7 @@ fn render_accounts(frame: &mut Frame, app: &App, t: Theme) {
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            "iPhone     direct BlueFerry over Bluetooth",
+            "Messages  direct BlueFerry over Bluetooth",
             Style::new().fg(t.aqua),
         )),
     ]);

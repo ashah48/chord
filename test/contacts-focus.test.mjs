@@ -81,36 +81,28 @@ test('message senders use contact names and local renames across linked accounts
  assert.equal(m.senderName,'Alex from lab');assert.equal(m.senderContactID,person.id);
 });
 
-test('Focus keeps personal conversations and explicit signals, hiding unengaged channels',()=>{
- const now=Date.parse('2026-10-29T12:00:00Z');const timestamp=new Date(now-3600000).toISOString();
- const base={timestamp,source:'discord',kind:'chat'};
- assert.equal(importance({...base,direct:true,unread:true},{now}).important,true);
- assert.equal(importance({...base,direct:false,unread:true},{now}).important,false);
- assert.equal(importance({...base,signals:{mention:true}},{now}).important,true);
- assert.equal(importance({...base,signals:{replyToYou:true}},{now}).important,true);
- assert.equal(importance({...base,activity:{lastSentAt:now-86400000}},{now}).important,true);
- assert.equal(importance({...base,isBot:true},{now}).important,false);
- assert.equal(importance({...base,direct:true,isMuted:true},{now}).important,false);
- assert.equal(importance({...base,kind:'email',unread:true,labels:['CATEGORY_PROMOTIONS']},{now}).important,false);
- assert.equal(importance({...base,kind:'email',unread:true,signals:{automated:true}},{now}).important,false);
+test('only a manual mark makes a conversation Important',()=>{
+ const chat={direct:true,unread:true,signals:{mention:true},attention:{important:true}};
+ assert.equal(importance(chat).important,false);
+ assert.equal(importance(chat,{preference:{priority:'important',muted:true}}).important,true);
 });
 
-test('quiet and pin overrides persist, All still contains every conversation',async()=>{
+test('important overrides persist, the retired quiet rule reads as automatic, All contains every conversation',async()=>{
  const book=memoryBook();const now=Date.now(),timestamp=new Date(now).toISOString();
- const conversations=[{id:'chat:one',timestamp,direct:true},{id:'chat:two',timestamp,direct:false}];
- await book.setPreference('chat:one',{priority:'quiet'});
+ const conversations=[{id:'chat:one',timestamp,direct:false},{id:'chat:two',timestamp,direct:false}];
+ await assert.rejects(()=>book.setPreference('chat:one',{priority:'quiet'}),/auto or important/);
+ book.data.conversations['chat:one']={priority:'quiet'};
+ assert.equal(book.preference('chat:one').priority,'auto');
  await book.setPreference('chat:two',{priority:'important'});
  const focus=rankInbox(conversations,book,{view:'focus',now});
  assert.deepEqual(focus.items.map(c=>c.id),['chat:two']);assert.equal(focus.summary.hidden,1);
+ assert.equal(focus.items[0].importance.reasons[0],'Marked important by you');
  assert.equal(rankInbox(conversations,book,{view:'all',now}).items.length,2);
- const ruled=applyLocalRules([{id:'chat:one',timestamp,unread:true,unreadCount:4,highlightCount:2,attention:{important:true,reason:'All messages in a selected channel'}}],book,now);
- assert.equal(ruled[0].unread,false);
- assert.equal(ruled[0].unreadCount,0);
- assert.equal(ruled[0].highlightCount,0);
- assert.equal(ruled[0].sourceUnread,true);
- assert.equal(rankInbox(ruled,book,{view:'focus',now}).items.length,0);
- await book.setPreference('chat:one',{priority:'auto'});
- assert.equal(rankInbox(conversations,book,{view:'focus',now}).items.length,2);
+ const ruled=applyLocalRules([{id:'chat:one',timestamp,unread:true,unreadCount:4}],book,now);
+ assert.equal(ruled[0].unread,true);
+ assert.equal(ruled[0].unreadCount,4);
+ await book.setPreference('chat:two',{priority:'auto'});
+ assert.equal(rankInbox(conversations,book,{view:'focus',now}).items.length,0);
 });
 test('a mute lasts for one of five durations, hides unread, and keeps the priority underneath',async()=>{
  const book=memoryBook();
@@ -127,7 +119,7 @@ test('a mute lasts for one of five durations, hides unread, and keeps the priori
  assert.equal(hidden[0].unread,false);
  assert.equal(hidden[0].sourceUnread,true);
  assert.equal(hidden[0].localPriority,'important');
- assert.equal(rankInbox(hidden,book,{view:'focus',now}).items.length,0);
+ assert.equal(rankInbox(hidden,book,{view:'focus',now}).items[0].unread,false);
  const later=now+10080*60000+1;
  assert.equal(book.preference('chat:one',later).muted,false);
  const back=applyLocalRules([{...chat,unread:true}],book,later);
@@ -155,7 +147,8 @@ test('direct conversations choose the other person for photos, excluding bridge 
  assert.equal(conversation.contactIDs.includes(bot.id),false);assert.equal(conversation.contactIDs.includes(me.id),false);assert.equal(conversation.contactIDs.includes(other.id),true);
 });
 test('every inbox view sorts by recency, even when an older item has a higher importance score',()=>{
- const book=memoryBook();book.data.conversations.old={priority:'important'};
+ const book=memoryBook();
+ for(const id of ['new','old','invalid'])book.data.conversations[id]={priority:'important'};
  const items=[{id:'old',timestamp:'2026-10-01T00:00:00Z'},{id:'new',timestamp:'2026-11-09T00:00:00Z',attention:{important:true,reason:'Selected channel'}},{id:'invalid',timestamp:'invalid',attention:{important:true,reason:'Selected channel'}}];
  for(const view of ['all','focus'])assert.deepEqual(rankInbox(items,book,{view}).items.map(c=>c.id),['new','old','invalid']);
 });
@@ -179,12 +172,17 @@ test('group photos use at most three distinct humans and exclude phone conversat
  assert.deepEqual(phone.avatarContacts,[]);
 });
 
-test('pins surface quiet conversations in Focus without enabling their badges',async()=>{
+test('pins do not affect Important membership and Important does not affect badges',async()=>{
  const book=memoryBook();
- const chat={id:'matrix:!quiet',timestamp:new Date().toISOString(),unread:true,unreadCount:3};
- await book.setPreference(chat.id,{priority:'quiet'});
- const {items}=rankInbox([chat],book,{view:'focus',pins:[chat.id]});
- assert.equal(items.length,1);
- assert.equal(items[0].importance.rule,'quiet');
- assert.equal(items[0].unread,false);
+ const keys=['pinned','important','both','neither'];
+ const chats=keys.map(id=>({id,unread:true,unreadCount:3}));
+ for(const id of ['important','both'])await book.setPreference(id,{priority:'important'});
+ await book.setPreference('both',{muteMinutes:60});
+ const view=rankInbox(chats,book,{view:'focus',pins:['pinned','both']});
+ assert.deepEqual(view.items.map(chat=>chat.id),['important','both']);
+ assert.equal(view.items[0].unreadCount,3);
+ assert.equal(view.items[1].unread,false);
+ assert.equal(rankInbox(chats,book).items.length,4);
+ const quiet={id:'important',unread:false,sourceUnread:true};
+ assert.equal(rankInbox([quiet],book,{view:'focus'}).items[0].unread,false);
 });

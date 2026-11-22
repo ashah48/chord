@@ -7,9 +7,10 @@ import {readHistory,writeHistory} from './history-file.mjs';
 
 const enc=encodeURIComponent;
 // Room state (names, bridge info, membership) re-sent by a bridge is not conversation activity.
+const ACTIVITY_VERSION=4;
 const MESSAGE_TYPES=['m.room.message','m.room.encrypted','m.sticker'];
 const isMessageEvent=e=>!!e&&e.state_key===undefined&&(!e.type||MESSAGE_TYPES.includes(e.type));
-const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'iPhone':'Matrix';
+const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'Messages':'Matrix';
 const page=(items,limit=200,offset=0)=>({items:items.slice(offset,offset+limit),hasMore:items.length>offset+limit,oldestCursor:String(offset+limit),newestCursor:null});
 const threadEvent=event=>event?.content?.['m.relates_to']?.rel_type==='m.thread';
 const isChannelEvent=e=>isMessageEvent(e)&&!threadEvent(e)&&e.content?.['m.relates_to']?.rel_type!=='m.replace';
@@ -70,31 +71,41 @@ export class MatrixProvider{
   this.activityRepair=this.repairActivity().catch(e=>{this.error=e.message}).finally(()=>{this.activityRepair=null});
  }
  async repairActivity(){
-  const pending=[...this.chats.keys()].filter(id=>this.chats.get(id).activityVersion!==3);
+  const pending=[...this.chats.keys()].filter(id=>this.chats.get(id).activityVersion!==ACTIVITY_VERSION);
   for(let i=0;i<pending.length&&!this.closing;i+=4){
    await Promise.all(pending.slice(i,i+4).map(async id=>{
     const room=this.chats.get(id),previous=room.lastActivity;
     const timeline=Date.parse(this.timelines.get(id)?.findLast(m=>!threadMessage(m))?.timestamp)||0;
     let latest=Math.max(timeline,this.observedActivity?.get(id)||0,this.archive?.latestMessageAt?.('matrix:'+id)||0);
-    if(!latest){try{latest=await this.latestMessageOnServer(id)}catch{return}}
+    let cursor;
+    if(!latest){
+     try{({latest,cursor}=await this.latestMessageOnServer(id,room.activityRepairCursor))}
+     catch(e){
+      if(room.activityRepairCursor&&e.status===400&&this.chats.get(id)?.activityRepairCursor===room.activityRepairCursor){
+       delete this.chats.get(id).activityRepairCursor;this.scheduleSave();
+      }
+      return;
+     }
+    }
     const current=this.chats.get(id);
     if(this.closing||!current||current.lastActivity!==previous)return;
-    this.chats.set(id,{...current,activityVersion:3,...(latest?{lastActivity:new Date(latest).toISOString()}:{})});
+    if(cursor){current.activityRepairCursor=cursor;this.scheduleSave();return}
+    delete current.activityRepairCursor;
+    this.chats.set(id,{...current,activityVersion:ACTIVITY_VERSION,...(latest?{lastActivity:new Date(latest).toISOString()}:{})});
     this.observedActivity?.delete(id);
     this.scheduleSave();
    }));
   }
  }
- async latestMessageOnServer(roomId){
-  let from;
+ async latestMessageOnServer(roomId,from){
   for(let i=0;i<3;i++){
    const page=await this.raw('GET',`/_matrix/client/v3/rooms/${enc(roomId)}/messages`,undefined,{dir:'b',limit:'20',filter:JSON.stringify({types:MESSAGE_TYPES}),...(from?{from}:{})});
    const latest=page.chunk?.find(isChannelEvent)?.origin_server_ts;
-   if(latest)return latest;
-   if(!page.end||page.end===from)return 0;
+   if(latest)return {latest};
+   if(!page.end||page.end===from)return {latest:0};
    from=page.end;
   }
-  return 0;
+  return {latest:0,cursor:from};
  }
  async refreshRooms(){
   if(this.roomRefresh)return this.roomRefresh;
@@ -148,7 +159,7 @@ export class MatrixProvider{
     participants={items,total,hasMore:total>items.length};
    }
    const threadOnly=events.some(threadEvent)&&!channelEvent;
-   if(old.activityVersion!==3&&channelEvent?.origin_server_ts){
+   if(old.activityVersion!==ACTIVITY_VERSION&&channelEvent?.origin_server_ts){
     const observed=this.observedActivity??=new Map();
     observed.set(roomId,Math.max(observed.get(roomId)||0,channelEvent.origin_server_ts));
    }
@@ -270,8 +281,27 @@ export class MatrixProvider{
    if(Date.now()-(this.lastRoomRefresh||0)>5000)await this.refreshRooms();
    let rooms=[...this.chats.values()].filter(c=>!q.has('accountIDs')||q.getAll('accountIDs').includes(c.accountID));
    if(q.get('query'))rooms=rooms.filter(c=>c.title.toLowerCase().includes(q.get('query').toLowerCase()));if(q.get('type')&&q.get('type')!=='any')rooms=rooms.filter(c=>c.type===q.get('type'));if(q.get('unreadOnly')==='true')rooms=rooms.filter(c=>c.unreadCount||c.isMarkedUnread);if(q.get('inbox'))rooms=rooms.filter(c=>q.get('inbox')==='archive'?c.isArchived:!c.isArchived);
+   const only=new Set(q.getAll('onlyRoom'));if(only.size)rooms=rooms.filter(room=>only.has(room.id));
    rooms=rooms.map(c=>roomListing(c,this.timelines.get(c.id)));
-   rooms.sort((a,b)=>new Date(b.lastActivity)-new Date(a.lastActivity));return page(rooms,Math.min(200,Number(q.get('limit'))||200),Number(q.get('cursor'))||0);
+   const compare=(a,b)=>((Date.parse(b.lastActivity)||0)-(Date.parse(a.lastActivity)||0))||a.id.localeCompare(b.id);
+   rooms.sort(compare);
+   const cursor=q.get('cursor'),limit=Math.max(1,Math.min(200,Math.trunc(Number(q.get('limit')))||200));
+   let offset=0;
+   if(cursor?.startsWith('[')){
+    let anchor;try{anchor=JSON.parse(cursor)}catch{}
+    if(!Array.isArray(anchor)||anchor.length!==2||anchor.some(x=>typeof x!=='string'))throw Object.assign(new Error('Invalid Matrix inbox cursor'),{status:400});
+    const [lastActivity,id]=anchor;
+    const index=rooms.findIndex(room=>compare(room,{lastActivity,id})>0);
+    offset=index<0?rooms.length:index;
+   }else if(cursor)offset=Math.max(0,Math.trunc(Number(cursor))||0);
+   const result=page(rooms,limit,offset);
+   const last=result.items.at(-1);
+   result.oldestCursor=result.hasMore&&last?JSON.stringify([last.lastActivity||'',last.id]):null;
+   if(!cursor){
+    const pins=new Set(q.getAll('includeRoom')),visible=new Set(result.items.map(room=>room.id));
+    result.items.push(...rooms.filter(room=>pins.has(room.id)&&!visible.has(room.id)));
+   }
+   return result;
   }
   if(p==='/v1/messages/search'){
    const text=(q.get('query')||'').toLowerCase(),items=[...this.timelines.values()].flat().filter(m=>m.text?.toLowerCase().includes(text)&&(!q.has('accountIDs')||q.getAll('accountIDs').includes(m.accountID))).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));return {...page(items.map(m=>({...m,conversation:this.chats.get(m.chatID)})),Math.min(20,Number(q.get('limit'))||20),Number(q.get('cursor'))||0),scope:'Messages synced or fetched by Chord. Encrypted history search expands as history is loaded.'};

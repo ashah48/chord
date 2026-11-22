@@ -10,7 +10,7 @@ import path from 'node:path';
 async function stop(child){if(child.exitCode!==null)return;const exited=once(child,'exit');child.kill('SIGTERM');await exited}
 test('HTTP cache survives restart, serves reads during a stalled refresh, and invalidates after a send', {timeout:30000},async t=>{
  const dir=await mkdtemp(path.join(os.tmpdir(),'chord-api-cache-'));
- const config={apiKey:'synthetic-test-key',matrixAccount:{userId:'@test:chord.local',deviceId:'TEST',homeserver:'http://127.0.0.1:1'},mailAccounts:[]};
+ const config={apiKey:'synthetic-test-key',matrixAccount:{userId:'@test:chord.local',deviceId:'TEST',homeserver:'http://127.0.0.1:1'},mailAccounts:[],discordAttention:{visibleServerIDs:[],allMessagesChannelIDs:[],mentionsOnlyServerIDs:[]}};
  await writeFile(path.join(dir,'config.json'),JSON.stringify(config));
  let text='First version',blocked=false,offline=false,waiting,release;
  const transport=http.createServer(async(req,res)=>{
@@ -19,7 +19,8 @@ test('HTTP cache survives restart, serves reads during a stalled refresh, and in
   const url=new URL(req.url,'http://localhost');
   if(url.pathname==='/v1/chats'){
    const excluded=new Set(url.searchParams.getAll('excludeRoom'));
-   const items=[{id:'!test',accountID:'slack',title:'Quiet channel',unreadCount:3},{id:'!other',accountID:'slack',title:'Other channel'}];
+   let items=[{id:'!test',accountID:'slack',title:'Quiet channel',unreadCount:3},{id:'!other',accountID:'slack',title:'Other channel'},{id:'!videos',accountID:'discord',title:'#videos-photos'}];
+   if(url.searchParams.has('accountIDs'))items=items.filter(chat=>url.searchParams.getAll('accountIDs').includes(chat.accountID));
    res.setHeader('Content-Type','application/json');res.end(JSON.stringify({items:items.filter(chat=>!excluded.has(chat.id)),hasMore:false}));return;
   }
   if(blocked){waiting?.();await new Promise(r=>release=r)}
@@ -56,6 +57,14 @@ test('HTTP cache survives restart, serves reads during a stalled refresh, and in
  assert.equal((await api('/api/archive/status')).retention,'indefinite');
  await stop(child);await start();assert.equal((await api('/api/search?query=First%20version')).items.length,1);
  offline=false;
+ const allInbox='/api/inbox?source=all&view=inbox&fresh=true';
+ for(const pins of ['', '&pin='+encodeURIComponent('matrix:!videos')]){
+  assert.equal((await api(allInbox+pins)).items.some(chat=>chat.id==='matrix:!videos'),true);
+ }
+ const videoPreference={conversationID:'matrix:!videos',priority:'unimportant'};
+ await api('/api/preferences/conversation',videoPreference);
+ assert.equal((await api(allInbox)).items.some(chat=>chat.id==='matrix:!videos'),false);
+ assert.equal((await api(allInbox.replace('view=inbox','view=all'))).items.some(chat=>chat.id==='matrix:!videos'),true);
  const inbox='/api/inbox?source=slack&fresh=true';
  const unimportant='matrix:!test';
  const preference='/api/preferences/conversation';

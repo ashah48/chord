@@ -4,17 +4,17 @@ import {applyAttention} from '../attention.mjs';
 import {importance} from '../importance.mjs';
 const rules={visibleServerIDs:['buggy','wrct'],allMessagesChannelIDs:['heads','pushers','info','announcements'],mentionsOnlyServerIDs:['wrct']};
 const c=(serverID,channelID,extra={})=>({source:'discord',serverID,channelID,unread:true,...extra});
-test('only selected Buggy channels and unread WRCT pings count, quiet channels remain accessible',()=>{
+test('Discord rules control unread badges without hiding conversations',()=>{
  const items=[...['heads','pushers','info','announcements','social'].map(id=>c('buggy',id)),c('wrct','general'),c('wrct','music',{highlightCount:1}),c('wrct','old',{highlightCount:1,unread:false}),c('other','general'),c(null,'dm'),{source:'slack',unread:true}];
  const result=applyAttention(items,rules);
- assert.equal(result.length,6);assert.equal(result.filter(c=>c.unread).length,6);
- assert.equal(result.some(c=>c.channelID==='social'),false);
- assert.equal(result.some(c=>c.channelID==='general'),false);
- assert.equal(result.some(c=>c.channelID==='old'),false);
- const social=applyAttention(items,rules,{server:'buggy'}).find(c=>c.channelID==='social');
+ assert.equal(result.length,items.length);
+ assert.equal(result.filter(c=>c.unread).length,6);
+ assert.equal(result.find(c=>c.channelID==='social').unread,false);
+ assert.equal(result.find(c=>c.channelID==='social').sourceUnread,true);
+ assert.equal(result.find(c=>c.channelID==='old').unread,false);
+ assert.equal(result.find(c=>c.serverID==='other').unread,false);
+ const social=result.find(c=>c.channelID==='social');
  assert.equal(importance(social).important,false);
  assert.equal(importance(social,{preference:{priority:'important'}}).important,true);
- const all=applyAttention(items,rules,{server:'all'});assert.equal(all.length,items.length);assert.equal(all.find(c=>c.serverID==='other').unread,false);
- assert.equal(applyAttention(items,rules,{query:'something'}).length,items.length);
 });
 test('no configured rules leaves the inbox unchanged',()=>{const items=[c('any','x')];assert.equal(applyAttention(items,null),items)});

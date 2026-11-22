@@ -194,8 +194,8 @@ Discord attention rules can be configured locally under `discordAttention` in
 and `mentionsOnlyServerIDs` allows unread badges only for unread highlighted mentions.
 Discord unread badges reflect those rules. All servers
 remain searchable in the picker; Show other servers reveals the full list.
-Other Discord channels stay accessible under All Discord channels and search, with
-unread badges suppressed. These rules do not alter network read receipts or mute settings.
+All Discord channels appear in Inbox unless marked unimportant. Channels outside
+the unread rules keep their unread badges suppressed. These rules do not alter network read receipts or mute settings.
 
 Double-click or right-click a message to open the reaction picker on supported chat
 connections, including Slack, Discord, WhatsApp, and Matrix. Selecting your existing

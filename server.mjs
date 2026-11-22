@@ -55,7 +55,7 @@ async function seedInbox(url){
  let matrixCount=0;
  let items=candidates.filter(c=>!c.id.startsWith('matrix:')||matrixCount++<200||pinned.has(c.id)).map(c=>directory.enrichConversation(c));
  if(!items.length)return undefined;
- items=applyLocalRules(applyAttention(items,config.discordAttention,{server,query}),directory.book);
+ items=applyLocalRules(applyAttention(items,config.discordAttention),directory.book);
  if(unread)items=items.filter(c=>c.unread);if(server)items=items.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));
  return {...rankInbox(items,directory.book,{view}),errors:[],cursors:{},hasMore:false};
 }
@@ -156,7 +156,7 @@ async function inbox(url){
  }
  await Promise.all(jobs);
  const candidates=items.filter(c=>!c.isArchived&&!isStatusConversation(c,config.matrixAccount?.userId)).map(c=>directory.enrichConversation(c));
- let enriched=applyLocalRules(applyAttention(candidates,config.discordAttention,{server,query}),directory.book);
+ let enriched=applyLocalRules(applyAttention(candidates,config.discordAttention),directory.book);
  if(unread)enriched=enriched.filter(c=>c.unread);
  if(server)enriched=enriched.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));
  const ranked=rankInbox(enriched,directory.book,{view});
@@ -187,7 +187,7 @@ export const server=http.createServer(async(req,res)=>{try{
   return json(res,archive.store.search(url.searchParams.get('query')||'',{limit:url.searchParams.get('limit')||60,offset:url.searchParams.get('offset')||0}));
  }
  if(p==='/api/connections'&&req.method==='GET')return json(res,await connections(url.searchParams.get('refresh')==='true'));
- if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:visibility-v1:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
+ if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:visibility-v2:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
  if(p==='/api/discord/servers'&&req.method==='GET'){await directory.refresh();const rooms=[...directory.catalog.rooms.values()].filter(r=>r.network==='discord');return json(res,{items:directory.catalog.servers.map(g=>({...g,preferred:!config.discordAttention||(config.discordAttention.visibleServerIDs||[]).includes(g.id),channelCount:rooms.filter(r=>r.serverID===g.id).length})).sort((a,b)=>a.name.localeCompare(b.name)),directMessageCount:rooms.filter(r=>!r.serverID).length})}
  if(p==='/api/contacts'&&req.method==='GET'){directory.refresh().catch(()=>{});return json(res,{items:directory.book.list(url.searchParams.get('query')||''),errors:directory.catalog.errors})}
  if(p==='/api/slack/cache-profiles'&&req.method==='POST'){const b=await input(req);return json(res,await cacheSlackProfiles(b.workspace,{dataDir,directory,cache:readCache,photos:b.photos!==false}))}

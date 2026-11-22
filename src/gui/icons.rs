@@ -152,6 +152,35 @@ pub fn button(
     response.on_hover_text(label)
 }
 
+/// The generic contact silhouette, for people with no photo and no letters in their name.
+pub fn person(p: &egui::Painter, center: Pos2, radius: f32) {
+    p.circle_filled(center, radius, Color32::from_rgb(160, 168, 204));
+    let white = Color32::WHITE;
+    p.circle_filled(center - Vec2::new(0., radius * 0.2), radius * 0.36, white);
+    // Shoulders: a large circle below, cut off by the avatar's edge. Both shapes are
+    // convex, so their overlap is too: keep each outline's points that fall inside the other.
+    let shoulders = center + Vec2::new(0., radius * 0.98);
+    let shoulder_radius = radius * 0.74;
+    let ring = |c: Pos2, r: f32| {
+        (0..96).map(move |i| {
+            let a = i as f32 / 96. * std::f32::consts::TAU;
+            c + Vec2::new(a.cos(), a.sin()) * r
+        })
+    };
+    let mut points: Vec<Pos2> = ring(shoulders, shoulder_radius)
+        .filter(|q| q.distance(center) <= radius)
+        .chain(ring(center, radius).filter(|q| q.distance(shoulders) <= shoulder_radius))
+        .collect();
+    let middle = center + Vec2::new(0., radius * 0.6);
+    points.sort_by(|a, b| {
+        let angle = |q: &Pos2| (q.y - middle.y).atan2(q.x - middle.x);
+        angle(a).total_cmp(&angle(b))
+    });
+    if points.len() >= 3 {
+        p.add(egui::Shape::convex_polygon(points, white, Stroke::NONE));
+    }
+}
+
 /// Paint navigation arrows directly so they do not depend on font fallback.
 pub fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let response = ui.button(format!("    {label}"));

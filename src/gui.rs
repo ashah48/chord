@@ -973,16 +973,21 @@ impl Gui {
         _p: Palette,
     ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
-        ui.painter()
-            .circle_filled(rect.center(), size / 2., theme::avatar_color(name));
         let initials = initials(name);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            initials,
-            egui::FontId::proportional(size * 0.34),
-            Color32::WHITE,
-        );
+        if initials.is_empty() {
+            // A phone number or blank name has no initials; show a contact silhouette.
+            icons::person(ui.painter(), rect.center(), size / 2.);
+        } else {
+            ui.painter()
+                .circle_filled(rect.center(), size / 2., theme::avatar_color(name));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initials,
+                egui::FontId::proportional(size * 0.34),
+                Color32::WHITE,
+            );
+        }
         if ui.is_rect_visible(rect)
             && let Some(id) = contact
         {
@@ -3010,19 +3015,14 @@ fn message_order(messages: &[Message], group_threads: bool) -> Vec<usize> {
     order
 }
 
+/// Up to two initials from the first letters of the first two words. Empty when the name
+/// has no letters (a phone number), so the avatar shows a silhouette instead of a digit.
 fn initials(name: &str) -> String {
-    let result: String = name
-        .split_whitespace()
+    name.split_whitespace()
+        .filter_map(|w| w.chars().find(|c| c.is_alphabetic()))
         .take(2)
-        .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()))
         .flat_map(char::to_uppercase)
-        .take(2)
-        .collect();
-    if result.is_empty() {
-        "?".into()
-    } else {
-        result
-    }
+        .collect()
 }
 // Where UI preferences (the chosen theme) persist between launches. A release build's
 // CARGO_MANIFEST_DIR is the build machine's checkout, which does not exist on the user's
@@ -3218,7 +3218,10 @@ mod tests {
     fn initials_handle_unicode_and_empty_names() {
         assert_eq!(initials("Alex Chen"), "AC");
         assert_eq!(initials("Élodie"), "É");
-        assert_eq!(initials(""), "?");
+        assert_eq!(initials(""), "");
+        assert_eq!(initials("+1 (908) 902-3769"), "");
+        assert_eq!(initials("Mom ❤️"), "M");
+        assert_eq!(initials("Aiden, Ronav & 2 more"), "AR");
     }
     #[test]
     fn reaction_gestures_target_the_clicked_message_and_respect_capabilities() {

@@ -9,7 +9,7 @@ const enc=encodeURIComponent;
 // Room state (names, bridge info, membership) re-sent by a bridge is not conversation activity.
 const MESSAGE_TYPES=['m.room.message','m.room.encrypted','m.sticker'];
 const isMessageEvent=e=>!!e&&e.state_key===undefined&&(!e.type||MESSAGE_TYPES.includes(e.type));
-const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'iPhone':'Matrix';
+const networkFor=id=>/discord/i.test(id)?'Discord':/slack/i.test(id)?'Slack':/whatsapp/i.test(id)?'WhatsApp':/blueferry/i.test(id)?'iMessages':'Matrix';
 const page=(items,limit=200,offset=0)=>({items:items.slice(offset,offset+limit),hasMore:items.length>offset+limit,oldestCursor:String(offset+limit),newestCursor:null});
 const threadEvent=event=>event?.content?.['m.relates_to']?.rel_type==='m.thread';
 const isChannelEvent=e=>isMessageEvent(e)&&!threadEvent(e)&&e.content?.['m.relates_to']?.rel_type!=='m.replace';

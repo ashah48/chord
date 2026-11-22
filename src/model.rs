@@ -86,7 +86,7 @@ pub const SOURCES: &[(&str, &str, &str)] = &[
     ("slack", "Slack", "2"),
     ("discord", "Discord", "3"),
     ("whatsapp", "WhatsApp", "4"),
-    ("iphone", "iPhone", "5"),
+    ("iphone", "iMessages", "5"),
     ("mail:home", "Personal mail", "6"),
     ("mail:cmu", "CMU mail", "7"),
 ];

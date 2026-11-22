@@ -242,7 +242,7 @@ impl Gui {
                     (1, "Slack", "S"),
                     (2, "Discord", "D"),
                     (3, "WhatsApp", "W"),
-                    (4, "iPhone", "P"),
+                    (4, "iMessages", "M"),
                 ] {
                     let response =
                         icons::button(ui, index, label, compact, self.app.source == index, p);
@@ -318,7 +318,7 @@ impl Gui {
             }
             .to_owned()
         } else {
-            format!("iPhone · {state}")
+            format!("iMessages · {state}")
         };
         if ui
             .add(
@@ -786,13 +786,18 @@ impl Gui {
             avatar_rect.right_bottom() - egui::vec2(2., 2.),
             Vec2::splat(20.),
         );
-        ui.painter()
-            .circle_filled(badge.center(), 11., theme::tint(p.panel, color, 0.22));
+        // A plain disk with a hairline edge, so the service's own colors stay true.
+        ui.painter().circle(
+            badge.center(),
+            11.,
+            p.panel,
+            egui::Stroke::new(1.0_f32, p.line),
+        );
         let source = crate::model::SOURCES
             .iter()
             .position(|(id, _, _)| *id == chat.source)
             .unwrap_or(0);
-        icons::service(ui.painter(), badge.shrink(3.), source, p.text);
+        icons::service(ui.painter(), badge.shrink(2.5), source, p.text);
         let text_left = avatar_rect.right() + 16.;
         let right = rect.right() - 9.;
         let mut stamp = time_label(&chat.timestamp);
@@ -1002,7 +1007,7 @@ impl Gui {
                         self.show_logo(ui, 64., RichText::new("c·").size(58.).color(p.accent));
                         ui.heading("Your conversations");
                         ui.label(
-                            RichText::new("Slack, Discord, WhatsApp, iPhone, and email")
+                            RichText::new("Slack, Discord, WhatsApp, iMessages, and email")
                                 .color(p.muted),
                         );
                         ui.add_space(15.);

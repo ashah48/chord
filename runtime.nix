@@ -6,7 +6,7 @@ let
   });
   discord = pkgs.mautrix-discord.overrideAttrs (old: {
     buildInputs = []; tags = [ "nocrypto" ];
-    patches = (old.patches or []) ++ [ ./patches/discord-empty-history.patch ];
+    patches = (old.patches or []) ++ [ ./patches/discord-empty-history.patch ./patches/discord-room-emoji.patch ./patches/discord-composer-emoji.patch ];
   });
   python = pkgs.python3.withPackages (ps: [ ps.pip ps.pyyaml ]);
 in pkgs.mkShell {

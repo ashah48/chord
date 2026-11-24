@@ -80,6 +80,7 @@ impl Api {
         unread: bool,
         cursor: Option<&str>,
         server: Option<&str>,
+        hidden_servers: &[String],
         pins: &[String],
     ) -> Result<Value> {
         let mut route = format!(
@@ -94,6 +95,9 @@ impl Api {
         }
         if let Some(server) = server {
             route.push_str(&format!("&server={}", urlencoding::encode(server)));
+        }
+        for id in hidden_servers {
+            route.push_str(&format!("&hideDiscordServer={}", urlencoding::encode(id)));
         }
         for id in pins {
             route.push_str(&format!("&pin={}", urlencoding::encode(id)));

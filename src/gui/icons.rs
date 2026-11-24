@@ -185,63 +185,6 @@ pub fn service(p: &egui::Painter, rect: Rect, source: usize, ink: Color32, style
     }
 }
 
-pub fn button(
-    ui: &mut egui::Ui,
-    source: usize,
-    label: &str,
-    compact: bool,
-    selected: bool,
-    p: super::Palette,
-    style: IconStyle,
-) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.), egui::Sense::click());
-    if selected || response.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            9.,
-            if selected {
-                super::theme::tint(p.panel, super::theme::service_color(source), 0.18)
-            } else {
-                p.panel
-            },
-        );
-    }
-    let origin = if compact {
-        rect.center() - Vec2::splat(12.)
-    } else {
-        egui::pos2(rect.left() + 10., rect.center().y - 12.)
-    };
-    service(
-        ui.painter(),
-        Rect::from_min_size(origin, Vec2::splat(24.)),
-        source,
-        if selected {
-            super::theme::service_color(source)
-        } else {
-            p.text
-        },
-        style,
-    );
-    if !compact {
-        ui.painter().text(
-            egui::pos2(rect.left() + 44., rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(14.),
-            if selected {
-                super::theme::service_color(source)
-            } else {
-                p.text
-            },
-        );
-    }
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
-    });
-    response.on_hover_text(label)
-}
-
 /// The generic contact silhouette, for people with no photo and no letters in their name.
 pub fn person(p: &egui::Painter, center: Pos2, radius: f32) {
     p.circle_filled(center, radius, Color32::from_rgb(160, 168, 204));

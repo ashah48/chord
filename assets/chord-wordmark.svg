@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="360" viewBox="0 0 840 360">
+  <rect width="840" height="360" fill="#1d2021"/>
+  <g transform="translate(48 40) scale(1.09375)">
+    <rect x="8" y="8" width="240" height="240" rx="56" fill="#282828"/>
+    <path d="M68 56h116a26 26 0 0 1 26 26v78a26 26 0 0 1-26 26h-58l-44 32v-32H68a26 26 0 0 1-26-26V82a26 26 0 0 1 26-26Z" fill="#3c3836" stroke="#b8bb26" stroke-width="8" stroke-linejoin="round"/>
+    <line x1="146" y1="62" x2="146" y2="158" stroke="#ebdbb2" stroke-width="8" stroke-linecap="round"/>
+    <g fill="#ebdbb2">
+      <ellipse cx="126" cy="90" rx="22" ry="12" transform="rotate(-22 126 90)"/>
+      <ellipse cx="126" cy="124" rx="22" ry="12" transform="rotate(-22 126 124)"/>
+      <ellipse cx="126" cy="158" rx="22" ry="12" transform="rotate(-22 126 158)"/>
+    </g>
+  </g>
+  <text x="368" y="242" font-family="Liberation Sans" font-size="168" font-weight="400" fill="#ebdbb2" letter-spacing="0.5">chord</text>
+</svg>

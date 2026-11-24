@@ -1,0 +1,221 @@
+--- a/provisioning.go
++++ b/provisioning.go
+@@ -8,13 +8,16 @@
+ 	"net"
+ 	"net/http"
+ 	_ "net/http/pprof"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
++	"github.com/bwmarrin/discordgo"
+ 	"github.com/gorilla/mux"
+ 	"github.com/gorilla/websocket"
+ 	log "maunium.net/go/maulogger/v2"
+ 
++	"go.mau.fi/util/variationselector"
+ 	"maunium.net/go/mautrix"
+ 	"maunium.net/go/mautrix/bridge/bridgeconfig"
+ 	"maunium.net/go/mautrix/id"
+@@ -68,6 +71,9 @@
+ 	r.HandleFunc("/v1/logout", p.logout).Methods(http.MethodPost)
+ 	r.HandleFunc("/v1/reconnect", p.reconnect).Methods(http.MethodPost)
+ 
++	r.HandleFunc("/v1/room-nicknames", p.roomNicknames).Methods(http.MethodGet)
++	r.HandleFunc("/v1/room-reactions", p.roomReactions).Methods(http.MethodPost)
++	r.HandleFunc("/v1/room-emoji", p.roomEmoji).Methods(http.MethodGet)
+ 	r.HandleFunc("/v1/guilds", p.guildsList).Methods(http.MethodGet)
+ 	r.HandleFunc("/v1/guilds/{guildID}", p.guildsBridge).Methods(http.MethodPost)
+ 	r.HandleFunc("/v1/guilds/{guildID}", p.guildsUnbridge).Methods(http.MethodDelete)
+@@ -435,6 +441,191 @@
+ 	}
+ }
+ 
++func (p *ProvisioningAPI) roomNicknames(w http.ResponseWriter, r *http.Request) {
++	user := r.Context().Value("user").(*User)
++	user.Lock()
++	session := user.Session
++	user.Unlock()
++	nicknames := map[string]string{}
++	portal := p.bridge.GetPortalByMXID(id.RoomID(r.URL.Query().Get("room_id")))
++	if session != nil && portal != nil && portal.GuildID != "" {
++		state := session.State
++		if guild, err := state.Guild(portal.GuildID); err == nil {
++			state.RLock()
++			for _, member := range guild.Members {
++				if member != nil && member.User != nil && member.Nick != "" {
++					nicknames[p.bridge.FormatPuppetMXID(member.User.ID).String()] = member.Nick
++				}
++			}
++			state.RUnlock()
++		}
++	}
++	jsonResponse(w, http.StatusOK, nicknames)
++}
++
++type chordReactionCount struct {
++	Key       string `json:"key"`
++	Shortcode string `json:"shortcode,omitempty"`
++	Count     int    `json:"count"`
++	Mine      bool   `json:"mine"`
++}
++
++func (p *ProvisioningAPI) roomReactions(w http.ResponseWriter, r *http.Request) {
++	user := r.Context().Value("user").(*User)
++	user.Lock()
++	session := user.Session
++	user.Unlock()
++	if session == nil {
++		jsonResponse(w, http.StatusServiceUnavailable, Error{Error: "Discord is disconnected", ErrCode: ErrCodeNotConnected})
++		return
++	}
++	portal := p.bridge.GetPortalByMXID(id.RoomID(r.URL.Query().Get("room_id")))
++	if portal == nil {
++		jsonResponse(w, http.StatusNotFound, Error{Error: "Discord room not found", ErrCode: mautrix.MNotFound.ErrCode})
++		return
++	}
++	var input struct {
++		Messages []id.EventID `json:"messages"`
++	}
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(&input); err != nil || len(input.Messages) > 100 {
++		jsonResponse(w, http.StatusBadRequest, Error{Error: "Invalid message list", ErrCode: mautrix.MBadJSON.ErrCode})
++		return
++	}
++
++	type channelPage struct {
++		newest uint64
++		mapping map[string][]id.EventID
++	}
++	channels := map[string]*channelPage{}
++	for _, eventID := range input.Messages {
++		msg := p.bridge.DB.Message.GetByMXID(portal.Key, eventID)
++		if msg == nil {
++			continue
++		}
++		snowflake, err := strconv.ParseUint(msg.DiscordID, 10, 64)
++		if err != nil || snowflake == ^uint64(0) {
++			continue
++		}
++		channelID := msg.DiscordProtoChannelID()
++		page := channels[channelID]
++		if page == nil {
++			page = &channelPage{mapping: map[string][]id.EventID{}}
++			channels[channelID] = page
++		}
++		page.newest = max(page.newest, snowflake)
++		page.mapping[msg.DiscordID] = append(page.mapping[msg.DiscordID], eventID)
++	}
++	output := map[id.EventID][]chordReactionCount{}
++	customKeys := map[string]string{}
++	for channelID, page := range channels {
++		messages, err := session.ChannelMessages(channelID, 100, strconv.FormatUint(page.newest+1, 10), "", "", portal.RefererOptIfUser(session, channelID)...)
++		if err != nil {
++			jsonResponse(w, http.StatusBadGateway, Error{Error: "Could not read Discord reactions", ErrCode: "M_UNKNOWN"})
++			return
++		}
++		for _, msg := range messages {
++			eventIDs := page.mapping[msg.ID]
++			if len(eventIDs) == 0 {
++				continue
++			}
++			counts := make([]chordReactionCount, 0, len(msg.Reactions))
++			for _, reaction := range msg.Reactions {
++				if reaction == nil || reaction.Emoji == nil || reaction.Count <= 0 {
++					continue
++				}
++				emoji := reaction.Emoji
++				item := chordReactionCount{Count: reaction.Count, Mine: reaction.Me}
++				if emoji.ID == "" {
++					item.Key = variationselector.Add(emoji.Name)
++				} else {
++					item.Shortcode = ":" + emoji.Name + ":"
++					if _, ok := customKeys[emoji.ID]; !ok {
++						mxc := portal.getEmojiMXCByDiscordID(emoji.ID, emoji.Name, emoji.Animated)
++						if !mxc.IsEmpty() {
++							customKeys[emoji.ID] = mxc.String()
++						}
++					}
++					item.Key = customKeys[emoji.ID]
++				}
++				if item.Key != "" {
++					counts = append(counts, item)
++				}
++			}
++			if len(counts) == len(msg.Reactions) {
++				for _, eventID := range eventIDs {
++					output[eventID] = counts
++				}
++			}
++		}
++	}
++	jsonResponse(w, http.StatusOK, output)
++}
++
++type roomEmojiEntry struct {
++	ID   string `json:"id"`
++	Name string `json:"name"`
++	MXC  string `json:"mxc,omitempty"`
++}
++
++func (p *ProvisioningAPI) roomEmoji(w http.ResponseWriter, r *http.Request) {
++	user := r.Context().Value("user").(*User)
++	session := user.Session
++	if session == nil {
++		jsonResponse(w, http.StatusServiceUnavailable, Error{Error: "Discord is disconnected", ErrCode: ErrCodeNotConnected})
++		return
++	}
++	query := r.URL.Query()
++	portal := p.bridge.GetPortalByMXID(id.RoomID(query.Get("room_id")))
++	if portal == nil || portal.GuildID == "" {
++		jsonResponse(w, http.StatusNotFound, Error{Error: "Discord server room not found", ErrCode: mautrix.MNotFound.ErrCode})
++		return
++	}
++	state := session.State
++	guild, err := state.Guild(portal.GuildID)
++	if err != nil {
++		jsonResponse(w, http.StatusNotFound, Error{Error: "Discord server is unavailable", ErrCode: mautrix.MNotFound.ErrCode})
++		return
++	}
++
++	state.RLock()
++	emojis := append([]*discordgo.Emoji(nil), guild.Emojis...)
++	state.RUnlock()
++	wanted := query.Get("emoji_id")
++	items := make([]roomEmojiEntry, 0, len(emojis))
++	for _, emoji := range emojis {
++		if emoji.ID == "" || emoji.Name == "" || (wanted != "" && emoji.ID != wanted) {
++			continue
++		}
++		if wanted != "" {
++			mxc := portal.getEmojiMXCByDiscordID(emoji.ID, emoji.Name, emoji.Animated)
++			if mxc.IsEmpty() {
++				jsonResponse(w, http.StatusBadGateway, Error{Error: "Could not load the Discord emoji", ErrCode: "M_UNKNOWN"})
++				return
++			}
++			jsonResponse(w, http.StatusOK, roomEmojiEntry{ID: emoji.ID, Name: emoji.Name, MXC: mxc.String()})
++			return
++		}
++		entry := roomEmojiEntry{ID: emoji.ID, Name: emoji.Name}
++		if mxc := p.bridge.DMA.EmojiMXC(emoji.ID, emoji.Name, emoji.Animated); !mxc.IsEmpty() {
++			entry.MXC = mxc.String()
++		} else {
++			emojiURL := discordgo.EndpointEmoji(emoji.ID)
++			if emoji.Animated {
++				emojiURL = discordgo.EndpointEmojiAnimated(emoji.ID)
++			}
++			if file := p.bridge.DB.File.Get(emojiURL, false); file != nil {
++				entry.MXC = file.MXC.String()
++			}
++		}
++		items = append(items, entry)
++	}
++	if wanted != "" {
++		jsonResponse(w, http.StatusNotFound, Error{Error: "Discord emoji not found", ErrCode: mautrix.MNotFound.ErrCode})
++		return
++	}
++	jsonResponse(w, http.StatusOK, map[string]interface{}{"items": items})
++}
++
+ type guildEntry struct {
+ 	ID           string        `json:"id"`
+ 	Name         string        `json:"name"`

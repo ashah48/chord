@@ -8,8 +8,8 @@ test('history returns while reaction recovery is stalled and duplicate page requ
  p.raw=()=>new Promise(r=>finishRelations=r);
  const first=p.listMessages('!room'),second=p.listMessages('!room');
  assert.equal(calls,1);finishHistory({messages:[{roomId:'!room',eventId:'$one',text:'Fast text',sender:{userId:'@other:chord.local'},timestamp:1}],nextCursor:'older'});
- const [a,b]=await Promise.all([first,second]);assert.equal(a.items[0].text,'Fast text');assert.deepEqual(a,b);assert.ok(p.relationRefresh.has('!room'));
- finishRelations({chunk:[]});await p.relationRefresh.get('!room');
+ const [a,b]=await Promise.all([first,second]);assert.equal(a.items[0].text,'Fast text');assert.deepEqual(a,b);assert.ok(p.relationRefresh.has('!room|$one'));
+ finishRelations({chunk:[]});await p.relationRefresh.get('!room|$one');
 });
 test('confirmed reactions update immediately and a stale recovery cannot undo them',async()=>{
  let release;

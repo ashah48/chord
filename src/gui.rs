@@ -6,14 +6,18 @@ mod theme;
 
 use crate::{
     api::Api,
-    app::{App, Mode, REACTIONS, keeps_failure, reaction_is_users, user_has_reaction},
+    app::{App, Mode, keeps_failure, reaction_is_users, user_has_reaction},
     images::Target,
     model::{Conversation, Message, day_label, one_line, source_label, time_label},
 };
 use eframe::egui::{self, Color32, RichText, Vec2};
-use media::{Entry, Event, Media, Request};
+use media::{DiscordEmoji, Entry, Event, Media, MentionMember, Request, RoomEmoji};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    time::Duration,
+};
 use theme::{ColorScheme, DisplayMode, FontStyle, Palette, Theme};
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -45,7 +49,13 @@ pub struct Gui {
     unread_marker: Option<String>,
     search_focus: bool,
     message_search: bool,
-    reaction_target: Option<(Conversation, Message)>,
+    reaction_target: Option<ReactionPicker>,
+    discord_emoji: BTreeMap<String, Option<Result<Vec<DiscordEmoji>, String>>>,
+    discord_emoji_requested: BTreeMap<String, std::time::Instant>,
+    room_custom_emoji: BTreeMap<String, Vec<RoomEmoji>>,
+    emoji_usage: BTreeMap<String, BTreeSet<String>>,
+    composer_completion_open: bool,
+    mention_members: BTreeMap<String, (std::time::Instant, Vec<MentionMember>)>,
     reaction_detail: Option<ReactionDetail>,
     expanded_thread: Option<(String, String)>,
     search_busy: bool,
@@ -65,6 +75,14 @@ impl Gui {
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or(Value::Null);
         app.pins = serde_json::from_value(settings["pins"].clone()).unwrap_or_default();
+        app.hidden_accounts =
+            serde_json::from_value(settings["hiddenAccounts"].clone()).unwrap_or_default();
+        app.unimportant_discord_servers =
+            serde_json::from_value(settings["unimportantDiscordServers"].clone())
+                .unwrap_or_default();
+        if !app.unimportant_discord_servers.is_empty() {
+            app.refresh(false);
+        }
         let theme = Theme::from_settings(&settings);
         theme.apply(ctx);
         Self::apply_fonts(ctx, theme.font);
@@ -86,6 +104,13 @@ impl Gui {
             search_focus: false,
             message_search: false,
             reaction_target: None,
+            discord_emoji: BTreeMap::new(),
+            discord_emoji_requested: BTreeMap::new(),
+            room_custom_emoji: BTreeMap::new(),
+            emoji_usage: serde_json::from_value(settings["reactionUsage"].clone())
+                .unwrap_or_default(),
+            composer_completion_open: false,
+            mention_members: BTreeMap::new(),
             reaction_detail: None,
             expanded_thread: None,
             search_busy: false,
@@ -189,8 +214,11 @@ impl Gui {
     fn save_settings(&mut self) {
         let value = json!({
             "appearance": self.theme,
+            "reactionUsage": self.emoji_usage,
             "iconStyle": self.icon_style.setting(),
             "pins": self.app.pins,
+            "hiddenAccounts": self.app.hidden_accounts,
+            "unimportantDiscordServers": self.app.unimportant_discord_servers,
         });
         let result = (|| -> std::io::Result<()> {
             use std::io::Write;
@@ -241,163 +269,143 @@ impl Gui {
         self.unread_marker = None;
     }
     fn sidebar(&mut self, ctx: &egui::Context, p: Palette) {
-        let compact = ctx.content_rect().width() < 1000.;
         egui::SidePanel::left("navigation")
-            .exact_width(if compact { 76. } else { 188. })
+            .exact_width(54.)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(p.panel)
-                    .inner_margin(egui::Margin::symmetric(14, 20)),
+                    .inner_margin(egui::Margin::symmetric(6, 12)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.vertical_centered(|ui| {
                     self.show_logo(
                         ui,
                         30.,
                         RichText::new("c·").size(30.).color(p.accent).strong(),
                     );
-                    if !compact {
-                        ui.label(RichText::new("chord").size(23.).strong());
-                    }
-                });
-                ui.add_space(25.);
-                ui.label(
-                    RichText::new(if compact { "INBOX" } else { "YOUR INBOX" })
-                        .size(10.)
-                        .color(p.muted),
-                );
-                ui.add_space(8.);
-                for (index, label, _short) in [
-                    (0, "All accounts", "All"),
-                    (1, "Slack", "S"),
-                    (2, "Discord", "D"),
-                    (3, "WhatsApp", "W"),
-                    (4, "Messages", "M"),
-                ] {
-                    let response = icons::button(
-                        ui,
-                        index,
-                        label,
-                        compact,
-                        self.app.source == index,
-                        p,
-                        self.icon_style,
-                    );
-                    if response.clicked() {
-                        if index == 2 {
-                            self.app.open_servers();
-                        } else {
-                            self.switch_source(index);
-                        }
-                    }
-                }
-                if self.app.source == 2 && !compact {
-                    ui.add_space(5.);
-                    if ui.small_button("Browse servers…").clicked() {
-                        self.app.open_servers();
-                    }
-                    if self.app.discord_scope.is_some() {
-                        ui.label(RichText::new(&self.app.server_label).small().color(p.muted));
-                    }
-                }
-                ui.add_space(22.);
-                ui.separator();
-                ui.add_space(10.);
-                if ui
-                    .add(
-                        egui::Button::new(if compact {
-                            "People"
-                        } else {
-                            "Contacts & profiles"
-                        })
-                        .frame(false),
-                    )
-                    .clicked()
-                {
-                    self.app.open_contacts();
-                }
-                if ui.add(egui::Button::new("Accounts").frame(false)).clicked() {
-                    self.app.load_accounts();
-                }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), if compact { 78. } else { 70. }),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| self.sidebar_footer(ui, p, compact),
-                    );
+                    ui.add_space(10.);
+                    egui::containers::menu::MenuButton::new("⚙")
+                        .config(
+                            egui::containers::menu::MenuConfig::new()
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                        )
+                        .ui(ui, |ui| self.settings_menu(ui, p))
+                        .0
+                        .on_hover_text("Settings");
                 });
             });
     }
-    fn sidebar_footer(&mut self, ui: &mut egui::Ui, p: Palette, compact: bool) {
-        ui.separator();
-        ui.add_space(8.);
-        let accounts = self.app.connections["items"].as_array();
-        let online = accounts
-            .map(|items| items.iter().filter(|a| a["connected"] == true).count())
-            .unwrap_or(0);
-        let total = accounts.map(Vec::len).unwrap_or(0);
-        let phone = accounts.and_then(|items| items.iter().find(|a| a["id"] == "iphone"));
-        let connected = phone.map(|a| a["connected"] == true);
-        let state = match connected {
-            Some(true) => "Connected",
-            Some(false) => "Offline",
-            None => "Checking",
-        };
-        let detail = phone
-            .and_then(|a| a["detail"].as_str())
-            .unwrap_or("Checking the iPhone Bluetooth connection")
-            .to_owned();
-        let label = if compact {
-            match connected {
-                Some(true) => "BT on",
-                Some(false) => "BT off",
-                None => "BT…",
-            }
-            .to_owned()
+
+    fn toggle_account(&mut self, key: &str, visible: bool) {
+        if visible {
+            self.app.hidden_accounts.remove(key);
         } else {
-            format!("Messages · {state}")
-        };
-        if ui
-            .add(
-                egui::Button::new(RichText::new(label).size(12.).color(
-                    if connected == Some(true) {
-                        p.accent
-                    } else {
-                        p.muted
-                    },
-                ))
-                .frame(false),
-            )
-            .on_hover_text(format!("BlueFerry: {detail}"))
-            .clicked()
-        {
-            self.app.load_accounts();
+            self.app.hidden_accounts.insert(key.to_owned());
         }
-        ui.horizontal(|ui| {
-            if !compact {
-                ui.label(
-                    RichText::new(if self.app.demo {
-                        "Preview".into()
-                    } else {
-                        format!("{online}/{total} accounts online")
-                    })
-                    .size(10.)
-                    .color(p.muted),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                egui::containers::menu::MenuButton::new("⚙")
-                    .config(
-                        egui::containers::menu::MenuConfig::new()
-                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-                    )
-                    .ui(ui, |ui| self.settings_menu(ui, p))
-                    .0
-                    .on_hover_text("Settings");
-            });
-        });
+        self.app.selection = 0;
+        self.save_settings();
     }
+
+    fn account_filter(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let label = if compact { "≡" } else { "Accounts" };
+        let id = ui.make_persistent_id("account-filter");
+        let button = ui.small_button(label).on_hover_text("Filter accounts");
+        if button.clicked() && !egui::Popup::is_id_open(ui.ctx(), id) {
+            self.app.refresh_discord_servers();
+        }
+        egui::Popup::menu(&button)
+            .id(id)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.label("Show accounts");
+                let configured = self.app.connections["items"].as_array();
+                let accounts: Vec<_> = crate::model::SOURCES
+                    .iter()
+                    .skip(1)
+                    .filter(|(key, _, _)| {
+                        configured.is_none_or(|items| items.iter().any(|row| row["id"] == *key))
+                            || self
+                                .app
+                                .conversations
+                                .iter()
+                                .any(|chat| chat.source == *key)
+                    })
+                    .collect();
+                let workspaces: BTreeMap<_, _> = self
+                    .app
+                    .conversations
+                    .iter()
+                    .filter(|chat| chat.source == "slack" && chat.account_key.starts_with("slack:"))
+                    .filter_map(|chat| {
+                        chat.account_name
+                            .as_ref()
+                            .map(|name| (chat.account_key.clone(), name.clone()))
+                    })
+                    .collect();
+                for &(key, label, _) in accounts {
+                    let mut visible = !self.app.hidden_accounts.contains(key);
+                    if ui.checkbox(&mut visible, label).changed() {
+                        self.toggle_account(key, visible);
+                    }
+                    if key == "slack" && workspaces.len() > 1 {
+                        ui.indent("slack-workspaces", |ui| {
+                            ui.add_enabled_ui(visible, |ui| {
+                                for (key, name) in &workspaces {
+                                    let mut visible = !self.app.hidden_accounts.contains(key);
+                                    if ui.checkbox(&mut visible, name).changed() {
+                                        self.toggle_account(key, visible);
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
+                ui.separator();
+                if self.app.source != 0 && ui.button("All conversations").clicked() {
+                    self.switch_source(0);
+                    ui.close();
+                }
+                if ui.button("Browse Discord servers…").clicked() {
+                    self.app.open_servers();
+                    ui.close();
+                }
+                ui.menu_button("Discord server importance", |ui| {
+                    ui.label("Mark servers as unimportant");
+                    if self.app.servers.is_empty() {
+                        ui.weak("No Discord servers loaded");
+                    }
+                    let mut changed = false;
+                    egui::ScrollArea::vertical()
+                        .max_height(300.)
+                        .show(ui, |ui| {
+                            for server in &self.app.servers {
+                                let (Some(id), Some(name)) =
+                                    (server["id"].as_str(), server["name"].as_str())
+                                else {
+                                    continue;
+                                };
+                                let mut unimportant =
+                                    self.app.unimportant_discord_servers.contains(id);
+                                if ui.checkbox(&mut unimportant, name).changed() {
+                                    if unimportant {
+                                        self.app.unimportant_discord_servers.insert(id.into());
+                                    } else {
+                                        self.app.unimportant_discord_servers.remove(id);
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        });
+                    if changed {
+                        self.app.selection = 0;
+                        self.save_settings();
+                        self.app.refresh(false);
+                    }
+                });
+            });
+    }
+
     fn settings_menu(&mut self, ui: &mut egui::Ui, p: Palette) {
         ui.set_width(278.0);
         ui.spacing_mut().item_spacing.y = 5.0;
@@ -488,6 +496,18 @@ impl Gui {
         ui.separator();
         if ui
             .add_sized(
+                [ui.available_width(), 30.],
+                egui::Button::new("Contacts & profiles")
+                    .right_text("›")
+                    .frame_when_inactive(false),
+            )
+            .clicked()
+        {
+            self.app.open_contacts();
+            ui.close();
+        }
+        if ui
+            .add_sized(
                 [ui.available_width(), 30.0],
                 egui::Button::new("Manage accounts")
                     .right_text("›")
@@ -559,39 +579,43 @@ impl Gui {
             }
         });
         ui.add_space(3.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            ui.spacing_mut().icon_width = 12.0;
-            ui.spacing_mut().icon_width_inner = 8.0;
-            let size = if ui.available_width() < 260.0 {
-                11.0
-            } else {
-                12.0
-            };
-            if !self.message_search {
-                let show = ui
-                    .add(egui::Checkbox::new(
-                        &mut self.app.show_unimportant,
-                        RichText::new("Show unimportant").size(size),
-                    ))
-                    .changed();
-                let unread = ui
-                    .add(egui::Checkbox::new(
-                        &mut self.app.unread,
-                        RichText::new("Unread only").size(size),
-                    ))
-                    .changed();
-                if show || unread {
-                    self.app.selection = 0;
-                    self.app.refresh(false);
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let width = ui.available_width();
+        let compact = width < 320.;
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, ui.spacing().interact_size.y),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = if compact { 3. } else { 5. };
+                ui.spacing_mut().button_padding.x = 4.;
                 if ui.small_button("↻").on_hover_text("Refresh").clicked() {
                     self.app.refresh_now();
                 }
-            });
-        });
+                self.account_filter(ui, compact);
+                if !self.message_search {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().icon_width = if compact { 10. } else { 12. };
+                        ui.spacing_mut().icon_width_inner = if compact { 7. } else { 8. };
+                        let size = if width < 260. { 10. } else { 12. };
+                        let show = ui
+                            .add(egui::Checkbox::new(
+                                &mut self.app.show_unimportant,
+                                RichText::new("Show unimportant").size(size),
+                            ))
+                            .changed();
+                        let unread = ui
+                            .add(egui::Checkbox::new(
+                                &mut self.app.unread,
+                                RichText::new("Unread only").size(size),
+                            ))
+                            .changed();
+                        if show || unread {
+                            self.app.selection = 0;
+                            self.app.refresh(false);
+                        }
+                    });
+                }
+            },
+        );
     }
 
     fn inbox(&mut self, ctx: &egui::Context, p: Palette) {
@@ -607,8 +631,10 @@ impl Gui {
                 self.inbox_header(ui);
                 ui.add_space(10.);
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!self.message_search, "Conversations").clicked() { self.message_search = false; }
-                    if ui.selectable_label(self.message_search, "Message text").clicked() { self.message_search = true; self.run_search(ctx); }
+                    let compact = ui.available_width() < 295.;
+                    let size = if compact { 12. } else { 14. };
+                    if ui.selectable_label(!self.message_search, RichText::new("Conversations").size(size)).clicked() { self.message_search = false; }
+                    if ui.selectable_label(self.message_search, RichText::new("Message text").size(size)).clicked() { self.message_search = true; self.run_search(ctx); }
                 });
                 let search = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
@@ -635,11 +661,14 @@ impl Gui {
                 if self.message_search {
                     if self.search_busy { ui.spinner(); }
                     ui.add(egui::Label::new(RichText::new("Search all saved messages and filenames, including compressed archives. Works offline.").small().color(p.muted)).wrap());
-                    let hits = self.search_results["items"].as_array().cloned().unwrap_or_default();
+                    let hits: Vec<_> = self.search_results["items"].as_array().into_iter().flatten()
+                        .filter_map(|hit| {
+                            let chat = serde_json::from_value::<Conversation>(hit["conversation"].clone()).ok()?;
+                            self.app.account_visible(&chat).then_some((hit.clone(), chat))
+                        }).collect();
                     egui::ScrollArea::vertical().id_salt("search-results").show(ui, |ui| {
                         if hits.is_empty() && !self.search_busy { ui.label("No results. Enter text and press Search."); }
-                        for hit in hits {
-                            let Ok(chat) = serde_json::from_value::<Conversation>(hit["conversation"].clone()) else { continue; };
+                        for (hit, chat) in hits {
                             let text = hit["message"]["text"].as_str().unwrap_or("");
                             let saved = if hit["archived"] == true { " · archive" } else { " · saved locally" };
                             let label = format!("{} · {}{}\n{}", chat.title, source_label(&chat.source), saved, one_line(text).chars().take(130).collect::<String>());
@@ -1094,6 +1123,21 @@ impl Gui {
         size: f32,
         _p: Palette,
     ) -> egui::Response {
+        self.avatar_image(
+            ui,
+            contact.map(|id| Request::Avatar(id.to_owned())),
+            name,
+            size,
+        )
+    }
+
+    fn avatar_image(
+        &mut self,
+        ui: &mut egui::Ui,
+        request: Option<Request>,
+        name: &str,
+        size: f32,
+    ) -> egui::Response {
         let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
         let initials = initials(name);
         if initials.is_empty() {
@@ -1111,14 +1155,10 @@ impl Gui {
             );
         }
         if ui.is_rect_visible(rect)
-            && let Some(id) = contact
+            && let Some(request) = request
         {
-            let key = format!("avatar:{id}");
-            self.media.request(
-                Request::Avatar(id.to_owned()),
-                self.app.api.clone(),
-                ui.ctx(),
-            );
+            let key = request.key();
+            self.media.request(request, self.app.api.clone(), ui.ctx());
             if let Some(texture) = self.media.texture(&key) {
                 egui::Image::new(&texture)
                     .corner_radius((size / 2.) as u8)
@@ -1356,36 +1396,79 @@ impl Gui {
                     .messages
                     .iter()
                     .any(|reply| reply.thread_root_id.as_ref() == Some(&m.id)));
+        let actions_id = ui.id().with(("message-actions", &m.id));
+        let more_id = actions_id.with("more");
+        let can_react = synced && chat.can_react;
+        let can_reply = synced && chat.can_reply;
+        let can_edit = synced && m.is_sender && chat.kind == "chat";
+        let show_quick_reactions = can_react && ui.available_width() >= 350.;
+        let buttons = 1
+            + usize::from(can_react)
+            + usize::from(can_reply)
+            + usize::from(can_edit)
+            + 3 * usize::from(show_quick_reactions);
+        let toolbar_width = 2. * (ACTION_PADDING + 1.)
+            + buttons as f32 * ACTION_SIZE
+            + (buttons - 1) as f32 * ACTION_GAP
+            + if show_quick_reactions {
+                ACTION_GAP + 1.
+            } else {
+                0.
+            };
+        let background = ui.painter().add(egui::Shape::Noop);
         let mut thread_clicked = false;
-        let reaction_hovered = std::cell::Cell::new(false);
         let reaction_clicked = std::cell::Cell::new(false);
         let response = ui
             .scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
                 egui::Frame::new()
-                    .fill(if m.is_sender { p.own } else { p.bg })
                     .corner_radius(12)
                     .inner_margin(12)
                     .show(ui, |ui| {
                         ui.horizontal_top(|ui| {
-                            if self
-                                .avatar(ui, m.sender_contact_id.as_deref(), &m.sender_name, 34., p)
-                                .clicked()
+                            let image = if m.is_sender
+                                && matches!(chat.source.as_str(), "discord" | "slack" | "whatsapp")
+                            {
+                                Some(Request::SelfAvatar(chat.id.clone()))
+                            } else {
+                                m.sender_contact_id
+                                    .as_ref()
+                                    .map(|id| Request::Avatar(id.clone()))
+                            };
+                            if self.avatar_image(ui, image, &m.sender_name, 34.).clicked()
                                 && let Some(id) = &m.sender_contact_id
                             {
                                 self.app.open_contact(json!({"id":id}));
                             }
                             ui.vertical(|ui| {
                                 ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    let (name_rect, name_response) = ui.allocate_exact_size(
-                                        egui::vec2((ui.available_width() - 112.).max(24.), 22.),
-                                        egui::Sense::click(),
-                                    );
-                                    row_text(
+                                let mut metadata = time_label(&m.timestamp);
+                                if m.historical_version {
+                                    if !metadata.is_empty() {
+                                        metadata.push_str(" · ");
+                                    }
+                                    metadata.push_str("Saved version");
+                                }
+                                let metadata = ui.painter().layout_no_wrap(
+                                    metadata,
+                                    egui::FontId::proportional(11.),
+                                    p.muted,
+                                );
+                                let header_width = ui.available_width() - toolbar_width;
+                                let stack_timestamp =
+                                    !metadata.is_empty() && header_width < metadata.size().x + 72.;
+                                let header = |ui: &mut egui::Ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(8., 0.);
+                                    let name_width = if stack_timestamp || metadata.is_empty() {
+                                        header_width
+                                    } else {
+                                        header_width
+                                            - metadata.size().x
+                                            - ui.spacing().item_spacing.x
+                                    };
+                                    let name = row_text_galley(
                                         ui,
                                         &m.sender_name,
-                                        name_rect.min + egui::vec2(0., 2.),
-                                        name_rect.width(),
+                                        name_width,
                                         14.,
                                         if m.is_sender {
                                             p.accent
@@ -1393,69 +1476,30 @@ impl Gui {
                                             theme::avatar_color(&m.sender_name)
                                         },
                                     );
+                                    let (name_rect, name_response) = ui.allocate_exact_size(
+                                        egui::vec2(name.size().x, 22.),
+                                        egui::Sense::click(),
+                                    );
+                                    let name_pos = egui::pos2(
+                                        name_rect.left(),
+                                        name_rect.center().y - name.size().y / 2.,
+                                    );
+                                    ui.painter().galley(name_pos, name.clone(), p.text);
+                                    emoji::paint(ui, &name, name_pos);
                                     if name_response.clicked()
                                         && let Some(id) = &m.sender_contact_id
                                     {
                                         self.app.open_contact(json!({"id":id}));
                                     }
-                                    ui.label(
-                                        RichText::new(time_label(&m.timestamp))
-                                            .size(11.)
-                                            .color(p.muted),
-                                    );
-                                    if m.historical_version {
-                                        ui.label(
-                                            RichText::new("Saved version").small().color(p.muted),
-                                        );
+                                    if !metadata.is_empty() {
+                                        ui.add(egui::Label::new(metadata).truncate());
                                     }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.menu_button("•••", |ui| {
-                                                if synced
-                                                    && chat.source == "slack"
-                                                    && chat.kind == "chat"
-                                                    && chat.thread_root_id.is_none()
-                                                    && ui.button("View full thread").clicked()
-                                                {
-                                                    self.app.open_thread(m);
-                                                    ui.close();
-                                                }
-                                                if synced && chat.can_react {
-                                                    self.reaction_menu(ui, chat, m, p);
-                                                }
-                                                if ui.button("Copy message").clicked() {
-                                                    ui.ctx().copy_text(m.text.clone());
-                                                    ui.close();
-                                                }
-                                                if synced
-                                                    && chat.can_reply
-                                                    && ui.button("Reply").clicked()
-                                                {
-                                                    self.reply_to(index);
-                                                    ui.close();
-                                                }
-                                                if synced
-                                                    && m.is_sender
-                                                    && chat.kind == "chat"
-                                                    && ui.button("Edit message").clicked()
-                                                {
-                                                    self.app.message_selection = index;
-                                                    self.app.editor.set(m.text.clone());
-                                                    self.app.edit_message = Some(m.id.clone());
-                                                    self.app.mode = Mode::Compose;
-                                                    ui.close();
-                                                }
-                                                if let Some(id) = &m.sender_contact_id
-                                                    && ui.button("View profile").clicked()
-                                                {
-                                                    self.app.open_contact(json!({"id":id}));
-                                                    ui.close();
-                                                }
-                                            });
-                                        },
-                                    );
-                                });
+                                };
+                                if stack_timestamp {
+                                    ui.vertical(header);
+                                } else {
+                                    ui.horizontal(header);
+                                }
                                 if let Some(reply_id) = &m.linked_message_id
                                     && m.thread_root_id.as_ref() != Some(reply_id)
                                 {
@@ -1632,8 +1676,8 @@ impl Gui {
                                         }
                                     }
                                 }
-                                let reactions = reaction_groups(
-                                    &m.reactions,
+                                let reactions = message_reaction_groups(
+                                    m,
                                     self.app.status["userID"].as_str().unwrap_or(""),
                                 );
                                 if !reactions.is_empty() {
@@ -1653,9 +1697,6 @@ impl Gui {
                                                 summary.mine,
                                                 p,
                                             ));
-                                            if response.hovered() {
-                                                reaction_hovered.set(true);
-                                            }
                                             if response.clicked() {
                                                 reaction_clicked.set(true);
                                                 self.reaction_target = None;
@@ -1667,6 +1708,19 @@ impl Gui {
                                                 });
                                             }
                                         }
+                                        if can_react {
+                                            let add = message_action(ui, MessageAction::React, p);
+                                            if add.clicked() {
+                                                reaction_clicked.set(true);
+                                                self.open_reaction_picker(
+                                                    chat,
+                                                    m,
+                                                    (&add).into(),
+                                                    add.layer_id,
+                                                    ui.ctx(),
+                                                );
+                                            }
+                                        }
                                     });
                                 }
                             });
@@ -1675,12 +1729,148 @@ impl Gui {
                     .response
             })
             .response;
-        if has_thread {
-            if !reaction_hovered.get() {
-                response
-                    .clone()
-                    .on_hover_text("Click to expand or collapse replies");
+        let hovered = ui.rect_contains_pointer(response.rect);
+        let show_actions = hovered
+            || egui::Popup::is_id_open(ui.ctx(), more_id)
+            || self
+                .reaction_target
+                .as_ref()
+                .is_some_and(|picker| picker.message.id == m.id);
+        let shortcut = if hovered
+            && matches!(self.app.mode, Mode::Browse | Mode::Compose)
+            && self.gallery.is_empty()
+            && self.reaction_target.is_none()
+            && self.reaction_detail.is_none()
+            && !egui::Popup::is_any_open(ui.ctx())
+            && !ui
+                .memory(|memory| memory.focused())
+                .is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some())
+        {
+            message_shortcut(ui, can_reply, can_edit)
+        } else {
+            None
+        };
+        let can_focus_composer = chat.can_send && !self.file_busy;
+        let focus_composer = |ui: &egui::Ui| {
+            if can_focus_composer {
+                ui.memory_mut(|memory| memory.request_focus(composer_id(chat)));
             }
+        };
+        let fill = if m.is_sender { p.own } else { p.bg };
+        ui.painter().set(
+            background,
+            egui::Shape::rect_filled(
+                response.rect,
+                12.,
+                if show_actions {
+                    fill.lerp_to_gamma(p.raised, 0.55)
+                } else {
+                    fill
+                },
+            ),
+        );
+        let right = response.rect.right().min(ui.clip_rect().right()) - 10.;
+        let toolbar_rect = egui::Rect::from_min_size(
+            egui::pos2(right - toolbar_width, response.rect.top() + 6.),
+            egui::vec2(toolbar_width, ACTION_SIZE + 2. * (ACTION_PADDING + 1.)),
+        );
+        let mut toolbar = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(actions_id)
+                .max_rect(toolbar_rect),
+        );
+        if show_actions {
+            egui::Frame::new()
+                .fill(p.bg)
+                .stroke(egui::Stroke::new(1., p.line))
+                .corner_radius(8)
+                .inner_margin(ACTION_PADDING)
+                .show(&mut toolbar, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = ACTION_GAP;
+                        if show_quick_reactions {
+                            let self_id =
+                                self.app.status["userID"].as_str().unwrap_or("").to_owned();
+                            for (key, label) in
+                                [("👍", "Thumbs up"), ("❤️", "Heart"), ("🔥", "Fire")]
+                            {
+                                let mine = user_has_reaction(&m.reactions, key, &self_id);
+                                let response = icon_button(ui, ACTION_SIZE, label, mine, p);
+                                let icon_rect = egui::Rect::from_center_size(
+                                    response.rect.center(),
+                                    Vec2::splat(18.),
+                                );
+                                if let Some(image) = emoji::icon(ui, key, 18.) {
+                                    image.paint_at(ui, icon_rect);
+                                }
+                                if response.clicked() {
+                                    self.react(chat, m, key, mine);
+                                }
+                            }
+                            let (divider, _) =
+                                ui.allocate_exact_size(egui::vec2(1., 15.), egui::Sense::hover());
+                            ui.painter().line_segment(
+                                [divider.center_top(), divider.center_bottom()],
+                                egui::Stroke::new(1., p.line),
+                            );
+                        }
+                        if can_react {
+                            let add = message_action(ui, MessageAction::React, p);
+                            if add.clicked() {
+                                self.open_reaction_picker(
+                                    chat,
+                                    m,
+                                    (&add).into(),
+                                    add.layer_id,
+                                    ui.ctx(),
+                                );
+                            }
+                        }
+                        if can_reply
+                            && (message_action(ui, MessageAction::Reply, p).clicked()
+                                || shortcut == Some(egui::Key::R))
+                        {
+                            self.reply_to(index);
+                            if self.app.reply.is_some() {
+                                focus_composer(ui);
+                            }
+                        }
+                        if can_edit
+                            && (message_action(ui, MessageAction::Edit, p).clicked()
+                                || shortcut == Some(egui::Key::E))
+                        {
+                            self.app.message_selection = index;
+                            self.app.editor.set(m.text.clone());
+                            self.app.edit_message = Some(m.id.clone());
+                            self.app.mode = Mode::Compose;
+                            focus_composer(ui);
+                        }
+                        let more = message_action(ui, MessageAction::More, p);
+                        egui::Popup::menu(&more).id(more_id).show(|ui| {
+                            if synced
+                                && chat.source == "slack"
+                                && chat.kind == "chat"
+                                && chat.thread_root_id.is_none()
+                                && ui.button("View full thread").clicked()
+                            {
+                                self.app.open_thread(m);
+                                ui.close();
+                            }
+                            if ui.button("Copy message").clicked() {
+                                ui.ctx().copy_text(m.text.clone());
+                                ui.close();
+                            }
+                            if let Some(id) = &m.sender_contact_id
+                                && ui.button("View profile").clicked()
+                            {
+                                self.app.open_contact(json!({"id":id}));
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+        }
+        if has_thread {
             if !reaction_clicked.get()
                 && (response.clicked() || thread_clicked)
                 && !response.double_clicked()
@@ -1698,16 +1888,17 @@ impl Gui {
             let activation_pos = ui.input(|input| {
                 input.pointer.interact_pos().filter(|pos| {
                     response.rect.contains(*pos)
+                        && (!show_actions || !toolbar_rect.contains(*pos))
                         && (input
                             .pointer
                             .button_double_clicked(egui::PointerButton::Primary)
                             || input.pointer.button_clicked(egui::PointerButton::Secondary))
                 })
             });
-            let activated =
-                activation_pos.is_some_and(|pos| ui.ctx().layer_id_at(pos) == Some(ui.layer_id()));
-            if activated {
-                self.reaction_target = Some((chat.clone(), m.clone()));
+            if let Some(pos) =
+                activation_pos.filter(|pos| ui.ctx().layer_id_at(*pos) == Some(ui.layer_id()))
+            {
+                self.open_reaction_picker(chat, m, pos.into(), ui.layer_id(), ui.ctx());
             }
         }
         if self.scroll_to.as_ref() == Some(&m.id) {
@@ -1764,7 +1955,7 @@ impl Gui {
             .show(ctx, |ui| {
                 ui.set_min_width(280.);
                 ui.label(RichText::new("Quick").small().color(p.muted));
-                let groups = reaction_groups(&message.reactions, &self_id);
+                let groups = message_reaction_groups(&message, &self_id);
                 let mut keys = Vec::new();
                 for group in groups.iter().take(12) {
                     keys.push((
@@ -1902,70 +2093,453 @@ impl Gui {
         }
         emoji::button(ui, key, label)
     }
-    fn reaction_picker(&mut self, ctx: &egui::Context) {
-        let Some((chat, message)) = self.reaction_target.clone() else {
-            return;
-        };
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            self.reaction_target = None;
-            return;
+    fn open_reaction_picker(
+        &mut self,
+        chat: &Conversation,
+        message: &Message,
+        anchor: egui::PopupAnchor,
+        layer_id: egui::LayerId,
+        ctx: &egui::Context,
+    ) {
+        self.reaction_detail = None;
+        self.load_discord_emoji(chat, ctx);
+        if matches!(chat.source.as_str(), "slack" | "discord") {
+            self.load_composer_room(chat, ctx);
         }
-        let mut open = true;
-        let mut picked = false;
-        egui::Window::new("React to message")
-            .id(egui::Id::new("reaction_picker"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(300.)
-            .show(ctx, |ui| {
-                ui.label(RichText::new(&chat.title).strong());
-                ui.label(&message.sender_name);
-                ui.add(egui::Label::new(one_line(&message.text)).truncate());
-                ui.label("Yours are marked you. Select one again to remove it.");
-                let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
-                ui.horizontal_wrapped(|ui| {
-                    for key in REACTIONS {
-                        let mine = message
-                            .reactions
-                            .iter()
-                            .any(|reaction| reaction_is_users(reaction, key, &self_id));
-                        let button = paint_reaction(
-                            emoji::button(ui, key, if mine { "you" } else { "" }),
-                            mine,
-                            self.theme.palette(ctx.theme()),
-                        );
-                        if ui.add(button).clicked() {
-                            self.react(&chat, &message, key, mine);
-                            picked = true;
-                        }
-                    }
-                });
-            });
-        if !open || picked {
-            self.reaction_target = None;
-        }
-    }
-    fn reaction_menu(&mut self, ui: &mut egui::Ui, chat: &Conversation, m: &Message, p: Palette) {
-        ui.menu_button(RichText::new("☺").color(p.muted), |ui| {
-            ui.set_max_width(260.);
-            let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
-            ui.horizontal_wrapped(|ui| {
-                for key in REACTIONS {
-                    let mine = user_has_reaction(&m.reactions, key, &self_id);
-                    let button = paint_reaction(
-                        emoji::button(ui, key, if mine { "you" } else { "" }),
-                        mine,
-                        p,
-                    );
-                    if ui.add(button).clicked() {
-                        self.react(chat, m, key, mine);
-                        ui.close();
-                    }
-                }
-            });
+        self.reaction_target = Some(ReactionPicker {
+            chat: chat.clone(),
+            message: message.clone(),
+            anchor,
+            layer_id,
+            search: String::new(),
+            focus_search: true,
         });
     }
+
+    fn load_discord_emoji(&mut self, chat: &Conversation, ctx: &egui::Context) {
+        let (Some(guild_id), Some(api)) = (chat.server_id.as_ref(), self.app.api.clone()) else {
+            return;
+        };
+        if chat.source != "discord"
+            || chat.remote_id.is_empty()
+            || self.discord_emoji.get(guild_id).is_some_and(|result| {
+                result.is_none()
+                    || self
+                        .discord_emoji_requested
+                        .get(guild_id)
+                        .is_some_and(|requested| {
+                            let max_age = if matches!(result, Some(Ok(_))) {
+                                300
+                            } else {
+                                10
+                            };
+                            requested.elapsed() < Duration::from_secs(max_age)
+                        })
+            })
+        {
+            return;
+        }
+        self.discord_emoji.entry(guild_id.clone()).or_insert(None);
+        self.discord_emoji_requested
+            .insert(guild_id.clone(), std::time::Instant::now());
+        let chat_id = guild_id.clone();
+        let path = discord_emoji_path(&chat.remote_id);
+        let tx = self.media.tx.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let page = api.get(&path).await?;
+                anyhow::Ok(serde_json::from_value(page["items"].clone())?)
+            }
+            .await
+            .map_err(|err| err.to_string());
+            let _ = tx.send(Event::DiscordEmojis(chat_id, result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn observe_reaction_usage(&mut self) {
+        if self.app.demo {
+            return;
+        }
+        let self_id = self.app.status["userID"].as_str().unwrap_or("");
+        let mut changed = false;
+        for message in &self.app.messages {
+            for reaction in &message.reactions {
+                let Some(key) = reaction["reactionKey"].as_str() else {
+                    continue;
+                };
+                if !message.id.is_empty()
+                    && reaction["local"] != true
+                    && reaction_is_users(reaction, key, self_id)
+                {
+                    changed |= self
+                        .emoji_usage
+                        .entry(key.to_owned())
+                        .or_default()
+                        .insert(message.id.clone());
+                }
+            }
+        }
+        if changed {
+            self.save_settings();
+        }
+    }
+
+    fn reaction_picker(&mut self, ctx: &egui::Context) {
+        let Some(mut picker) = self.reaction_target.take() else {
+            return;
+        };
+        if self.app.active.as_ref().map(|chat| &chat.id) != Some(&picker.chat.id)
+            || ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            return;
+        }
+        let message = self
+            .app
+            .messages
+            .iter()
+            .find(|message| message.id == picker.message.id)
+            .unwrap_or(&picker.message)
+            .clone();
+        let self_id = self.app.status["userID"].as_str().unwrap_or("").to_owned();
+        let p = self.theme.palette(ctx.theme());
+        let mut open = true;
+        let mut picked = None;
+        let mut resolve_discord = None;
+        let id = egui::Id::new("reaction-picker");
+        let server_emoji = picker
+            .chat
+            .server_id
+            .as_ref()
+            .and_then(|id| self.discord_emoji.get(id))
+            .cloned();
+        let mut custom = BTreeMap::new();
+        if let Some(items) = self.room_custom_emoji.get(mention_room_key(&picker.chat)) {
+            for emoji in items {
+                if let Some(mxc) = &emoji.mxc {
+                    custom.insert(mxc.clone(), (emoji.name.clone(), mxc.clone()));
+                }
+            }
+        }
+        for reaction in self
+            .app
+            .messages
+            .iter()
+            .flat_map(|message| &message.reactions)
+        {
+            let (Some(key), Some(name)) = (
+                reaction["reactionKey"].as_str(),
+                reaction["shortcode"].as_str(),
+            ) else {
+                continue;
+            };
+            let image = reaction["image"].as_str().unwrap_or(key);
+            if image.starts_with("mxc://") {
+                custom
+                    .entry(key.to_owned())
+                    .or_insert_with(|| (emoji_name(name).to_owned(), image.to_owned()));
+            }
+        }
+        let mut most_used = self
+            .emoji_usage
+            .iter()
+            .filter_map(|(key, uses)| {
+                let custom_emoji = custom.get(key);
+                let server = server_emoji
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(|items| items.iter().find(|emoji| emoji.mxc.as_ref() == Some(key)));
+                let (name, image) = if let Some((name, mxc)) = custom_emoji {
+                    (name.as_str(), Some(mxc.as_str()))
+                } else if let Some(emoji) = server {
+                    (emoji.name.as_str(), Some(key.as_str()))
+                } else if !key.starts_with("mxc://") {
+                    (emoji::reaction_name(key).unwrap_or(key), None)
+                } else {
+                    return None;
+                };
+                Some((
+                    key.clone(),
+                    name.to_owned(),
+                    image.map(str::to_owned),
+                    uses.len(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        most_used.sort_by_key(|entry| std::cmp::Reverse(entry.3));
+        egui::Popup::new(id, ctx.clone(), picker.anchor, picker.layer_id)
+            .open_bool(&mut open)
+            .align(egui::RectAlign::TOP_END)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .gap(6.)
+            .width(324.)
+            .frame(
+                egui::Frame::popup(&ctx.style())
+                    .fill(p.panel)
+                    .stroke(egui::Stroke::new(1., p.line))
+                    .inner_margin(10.)
+                    .corner_radius(10),
+            )
+            .show(|ui| {
+                ui.set_width(304.);
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut picker.search)
+                        .hint_text("Search emoji")
+                        .desired_width(ui.available_width()),
+                );
+                if std::mem::take(&mut picker.focus_search) {
+                    search.request_focus();
+                }
+                let query = picker.search.trim().trim_matches(':').to_lowercase();
+                ui.separator();
+                let mut hovered_name = None;
+                let mut found = false;
+                egui::ScrollArea::vertical()
+                    .max_height(230.)
+                    .min_scrolled_height(230.)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(3., 3.);
+                        if query.is_empty() && !most_used.is_empty() {
+                            found = true;
+                            ui.label(RichText::new("Most used").small().strong().color(p.muted));
+                            ui.horizontal_wrapped(|ui| {
+                                for (key, name, image, _) in most_used.iter().take(12) {
+                                    let mine = user_has_reaction(&message.reactions, key, &self_id);
+                                    let cell = icon_button(ui, 32., name, mine, p);
+                                    if let Some(image) = image {
+                                        self.picker_custom_icon(
+                                            ui,
+                                            &cell,
+                                            Request::Emoji(image.clone()),
+                                            p,
+                                        );
+                                    } else if let Some(image) = emoji::icon(ui, key, 23.) {
+                                        paint_picker_icon(ui, &cell, image);
+                                    } else {
+                                        ui.painter().text(
+                                            cell.rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            key,
+                                            egui::FontId::proportional(19.),
+                                            p.text,
+                                        );
+                                    }
+                                    if cell.hovered() {
+                                        hovered_name = Some(name.as_str());
+                                    }
+                                    if cell.clicked() {
+                                        picked = Some((key.clone(), mine));
+                                    }
+                                }
+                            });
+                            ui.add_space(5.);
+                        }
+                        if let Some(server_emoji) = &server_emoji {
+                            match server_emoji {
+                                Some(Ok(items)) => {
+                                    let mut matches = items
+                                        .iter()
+                                        .filter(|emoji| {
+                                            emoji::matches_search(&emoji.id, &emoji.name, &query)
+                                        })
+                                        .peekable();
+                                    if matches.peek().is_some() {
+                                        found = true;
+                                        ui.label(
+                                            RichText::new(
+                                                picker
+                                                    .chat
+                                                    .server_name
+                                                    .as_deref()
+                                                    .unwrap_or("Discord server emoji"),
+                                            )
+                                            .small()
+                                            .strong()
+                                            .color(p.muted),
+                                        );
+                                        ui.horizontal_wrapped(|ui| {
+                                            for emoji in matches {
+                                                let mine =
+                                                    emoji.mxc.as_deref().is_some_and(|key| {
+                                                        user_has_reaction(
+                                                            &message.reactions,
+                                                            key,
+                                                            &self_id,
+                                                        )
+                                                    });
+                                                let cell =
+                                                    icon_button(ui, 32., &emoji.name, mine, p);
+                                                if ui.is_rect_visible(cell.rect) {
+                                                    self.picker_custom_icon(
+                                                        ui,
+                                                        &cell,
+                                                        Request::DiscordEmoji(emoji.id.clone()),
+                                                        p,
+                                                    );
+                                                }
+                                                if cell.hovered() {
+                                                    hovered_name = Some(emoji.name.as_str());
+                                                }
+                                                if cell.clicked() {
+                                                    if let Some(key) = &emoji.mxc {
+                                                        picked = Some((key.clone(), mine));
+                                                    } else {
+                                                        resolve_discord = Some(emoji.id.clone());
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        ui.add_space(5.);
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    ui.label(
+                                        RichText::new("Discord server emoji unavailable")
+                                            .small()
+                                            .color(p.muted),
+                                    )
+                                    .on_hover_text(error);
+                                }
+                                None => {
+                                    ui.label(
+                                        RichText::new("Loading Discord server emoji…")
+                                            .small()
+                                            .color(p.muted),
+                                    );
+                                }
+                            }
+                        }
+                        let mut matches = custom
+                            .iter()
+                            .filter(|(key, (name, _))| emoji::matches_search(key, name, &query))
+                            .peekable();
+                        if matches.peek().is_some() {
+                            found = true;
+                            ui.label(
+                                RichText::new("Conversation emoji")
+                                    .small()
+                                    .strong()
+                                    .color(p.muted),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                for (key, (name, mxc)) in matches {
+                                    let mine = user_has_reaction(&message.reactions, key, &self_id);
+                                    let cell = icon_button(ui, 32., name, mine, p);
+                                    if ui.is_rect_visible(cell.rect) {
+                                        self.picker_custom_icon(
+                                            ui,
+                                            &cell,
+                                            Request::Emoji(mxc.clone()),
+                                            p,
+                                        );
+                                    }
+                                    if cell.hovered() {
+                                        hovered_name = Some(name);
+                                    }
+                                    if cell.clicked() {
+                                        picked = Some((key.clone(), mine));
+                                    }
+                                }
+                            });
+                        }
+                        for (title, entries) in emoji::catalog() {
+                            let matches: Vec<_> = entries
+                                .iter()
+                                .filter(|entry| entry.matches(&query))
+                                .collect();
+                            if matches.is_empty() {
+                                continue;
+                            }
+                            found = true;
+                            ui.label(RichText::new(*title).small().strong().color(p.muted));
+                            emoji_grid(ui, &matches, |ui, entry| {
+                                let mine =
+                                    user_has_reaction(&message.reactions, entry.glyph, &self_id);
+                                let cell = icon_button(ui, 32., entry.name, mine, p);
+                                if let Some(image) = emoji::icon(ui, entry.glyph, 23.) {
+                                    paint_picker_icon(ui, &cell, image);
+                                }
+                                if cell.hovered() {
+                                    hovered_name = Some(entry.name);
+                                }
+                                if cell.clicked() {
+                                    picked = Some((entry.glyph.to_owned(), mine));
+                                }
+                            });
+                            ui.add_space(5.);
+                        }
+                        if !found {
+                            ui.label(RichText::new("No matching emoji").color(p.muted));
+                        }
+                    });
+                ui.separator();
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(hovered_name.unwrap_or("Choose an emoji"))
+                            .small()
+                            .color(p.muted),
+                    )
+                    .truncate(),
+                );
+            });
+        if let Some((key, mine)) = picked {
+            self.react(&picker.chat, &message, &key, mine);
+        } else if let Some(emoji_id) = resolve_discord {
+            if let Some(api) = self.app.api.clone() {
+                let path = format!(
+                    "{}&emojiID={}",
+                    discord_emoji_path(&picker.chat.remote_id),
+                    urlencoding::encode(&emoji_id)
+                );
+                let chat_id = picker.chat.id;
+                let message_id = message.id;
+                let tx = self.media.tx.clone();
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let emoji = api.get(&path).await?;
+                        emoji["mxc"]
+                            .as_str()
+                            .filter(|key| key.starts_with("mxc://"))
+                            .map(str::to_owned)
+                            .ok_or_else(|| anyhow::anyhow!("Missing Discord emoji media"))
+                    }
+                    .await
+                    .map_err(|err| err.to_string());
+                    let _ = tx.send(Event::DiscordReaction(chat_id, message_id, result));
+                    ctx.request_repaint();
+                });
+            }
+        } else if open {
+            self.reaction_target = Some(picker);
+        }
+    }
+
+    fn picker_custom_icon(
+        &mut self,
+        ui: &egui::Ui,
+        cell: &egui::Response,
+        request: Request,
+        p: Palette,
+    ) {
+        let key = request.key();
+        self.media.request(request, self.app.api.clone(), ui.ctx());
+        if let Some(texture) = self.media.texture(&key) {
+            paint_picker_icon(ui, cell, egui::Image::new((texture.id(), Vec2::splat(23.))));
+        } else {
+            ui.painter().text(
+                cell.rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "…",
+                egui::FontId::proportional(15.),
+                p.muted,
+            );
+        }
+    }
+
     fn image(
         &mut self,
         ui: &mut egui::Ui,
@@ -2014,22 +2588,459 @@ impl Gui {
         }
         response.on_hover_text(target.name())
     }
-    fn composer(&mut self, ui: &mut egui::Ui, chat: &Conversation, p: Palette) {
-        if let Some(reply) = self.app.reply.clone() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("Reply to {}", reply.sender_name))
-                        .small()
-                        .color(p.blue),
-                );
-                ui.add(
-                    egui::Label::new(RichText::new(one_line(&reply.text)).small().color(p.muted))
-                        .truncate(),
-                );
-                if ui.small_button("×").clicked() {
-                    self.app.reply = None;
+    fn load_composer_room(&mut self, chat: &Conversation, ctx: &egui::Context) {
+        let Some(api) = self.app.api.clone() else {
+            return;
+        };
+        let key = mention_room_key(chat).to_owned();
+        if self
+            .mention_members
+            .get(&key)
+            .is_some_and(|(requested, _)| requested.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.mention_members
+            .entry(key.clone())
+            .and_modify(|(requested, _)| *requested = std::time::Instant::now())
+            .or_insert_with(|| (std::time::Instant::now(), Vec::new()));
+        let path = Api::conversation(&chat.id, "details");
+        let tx = self.media.tx.clone();
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Ok(response) = api.get(&path).await
+                && let Ok(members) =
+                    serde_json::from_value(response["participants"]["items"].clone())
+            {
+                let emoji =
+                    serde_json::from_value(response["customEmoji"].clone()).unwrap_or_default();
+                let _ = tx.send(Event::ComposerRoom(key, members, emoji));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn mention_suggestions(&self, chat: &Conversation, query: &str) -> Vec<ComposerSuggestion> {
+        let mut names = BTreeMap::new();
+        let self_id = self.app.status["userID"].as_str();
+        if let Some((_, members)) = self.mention_members.get(mention_room_key(chat)) {
+            for member in members {
+                if !member.is_self
+                    && Some(member.id.as_str()) != self_id
+                    && valid_mention_id(&member.id)
+                    && member.full_name != member.id
+                {
+                    names.insert(
+                        member.id.as_str(),
+                        (
+                            member.full_name.as_str(),
+                            member
+                                .aliases
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                        ),
+                    );
+                }
+            }
+        }
+        for message in &self.app.messages {
+            if !message.is_sender
+                && let Some(id) = message.sender_id.as_deref()
+                && Some(id) != self_id
+                && valid_mention_id(id)
+            {
+                let entry = names
+                    .entry(id)
+                    .or_insert((&message.sender_name, Vec::new()));
+                if entry.0 != message.sender_name
+                    && !entry.1.contains(&message.sender_name.as_str())
+                {
+                    entry.1.push(&message.sender_name);
+                }
+            }
+        }
+        let mut name_counts = BTreeMap::new();
+        for (name, _) in names.values() {
+            *name_counts
+                .entry(one_line(name).to_lowercase())
+                .or_insert(0usize) += 1;
+        }
+        let mut suggestions = Vec::new();
+        for (&id, (name, aliases)) in &names {
+            let name = one_line(name);
+            let normalized = name.to_lowercase();
+            let id_lower = id.to_ascii_lowercase();
+            let matching_alias = aliases
+                .iter()
+                .map(|alias| alias.to_lowercase())
+                .find(|alias| alias.contains(query));
+            if name.trim().is_empty()
+                || (!normalized.contains(query)
+                    && !id_lower.contains(query)
+                    && matching_alias.is_none())
+            {
+                continue;
+            }
+            let display = if name_counts[&normalized] > 1 {
+                let handle = id.trim_start_matches('@').split(':').next().unwrap_or(id);
+                format!("{name} ({handle})")
+            } else {
+                name
+            };
+            suggestions.push(ComposerSuggestion {
+                name: display.clone(),
+                insert: format!("@{display}"),
+                image: None,
+                user_id: Some(id.to_owned()),
+                uses: 0,
+                keywords: if normalized.starts_with(query) {
+                    normalized
+                } else {
+                    matching_alias
+                        .filter(|alias| alias.starts_with(query))
+                        .unwrap_or(normalized)
+                },
+            });
+        }
+        suggestions.sort_by(|a, b| {
+            (!a.keywords.starts_with(query), &a.keywords, &a.name).cmp(&(
+                !b.keywords.starts_with(query),
+                &b.keywords,
+                &b.name,
+            ))
+        });
+        suggestions
+    }
+
+    fn complete_composer(
+        &mut self,
+        ui: &egui::Ui,
+        chat: &Conversation,
+        edit: &mut egui::text_edit::TextEditOutput,
+        mut menu: ComposerCompletionMenu,
+        action: Option<egui::Key>,
+        p: Palette,
+    ) {
+        let popup_id = edit.response.id.with("composer-completion");
+        let store = |menu: ComposerCompletionMenu| {
+            ui.ctx().data_mut(|data| data.insert_temp(popup_id, menu));
+        };
+        let over_popup = ui.ctx().pointer_hover_pos().is_some_and(|pos| {
+            ui.ctx().layer_id_at(pos) == Some(egui::LayerId::new(egui::Order::Foreground, popup_id))
+        });
+        let Some(cursor) = edit.cursor_range.filter(|range| range.is_empty()) else {
+            store(ComposerCompletionMenu::default());
+            return;
+        };
+        let text = &self.app.editor.text;
+        let mention = (chat.kind == "chat")
+            .then(|| emoji::completion_token_for(text, cursor.primary.index, '@'))
+            .flatten();
+        let is_mention = mention.is_some();
+        let Some((range, query)) =
+            mention.or_else(|| emoji::completion_token(text, cursor.primary.index))
+        else {
+            store(ComposerCompletionMenu::default());
+            return;
+        };
+        let query = query.to_lowercase();
+        if !edit.response.has_focus() && !(menu.visible && over_popup) {
+            store(ComposerCompletionMenu::default());
+            return;
+        }
+        let query_changed = menu.start != range.start || menu.query != query;
+        if query_changed {
+            menu = ComposerCompletionMenu {
+                start: range.start,
+                query: query.clone(),
+                ..Default::default()
+            };
+        }
+        if action == Some(egui::Key::Escape) {
+            menu.dismissed = true;
+        }
+        if menu.dismissed {
+            menu.visible = false;
+            store(menu);
+            return;
+        }
+
+        let suggestions = if is_mention {
+            self.load_composer_room(chat, ui.ctx());
+            self.mention_suggestions(chat, &query)
+        } else {
+            self.load_discord_emoji(chat, ui.ctx());
+            if matches!(chat.source.as_str(), "slack" | "discord") {
+                self.load_composer_room(chat, ui.ctx());
+            }
+            let discord = chat
+                .server_id
+                .as_ref()
+                .and_then(|id| self.discord_emoji.get(id))
+                .and_then(Option::as_ref)
+                .and_then(|result| result.as_ref().ok());
+            let mut suggestions = Vec::new();
+            if let Some(discord) = discord {
+                for emoji in discord {
+                    suggestions.push(ComposerSuggestion {
+                        name: emoji.name.clone(),
+                        insert: format!(":{}:", emoji.name),
+                        image: Some(Request::DiscordEmoji(emoji.id.clone())),
+                        user_id: None,
+                        uses: emoji
+                            .mxc
+                            .as_ref()
+                            .and_then(|key| self.emoji_usage.get(key))
+                            .map_or(0, BTreeSet::len),
+                        keywords: emoji.name.clone(),
+                    });
+                }
+            }
+            if matches!(chat.source.as_str(), "discord" | "slack") {
+                let mut known = BTreeMap::new();
+                if let Some(items) = self.room_custom_emoji.get(mention_room_key(chat)) {
+                    for item in items {
+                        known.insert(item.name.as_str(), (item.mxc.as_deref(), item.thumbnail));
+                    }
+                }
+                for message in &self.app.messages {
+                    for emote in &message.emotes {
+                        known
+                            .entry(&emote.name)
+                            .or_insert((Some(&emote.mxc), false));
+                    }
+                    for reaction in &message.reactions {
+                        let name = reaction["shortcode"].as_str().map(emoji_name);
+                        let image = reaction["image"]
+                            .as_str()
+                            .or_else(|| reaction["reactionKey"].as_str());
+                        if let (Some(name), Some(image)) = (name, image)
+                            && image.starts_with("mxc://")
+                        {
+                            known.entry(name).or_insert((Some(image), false));
+                        }
+                    }
+                }
+                let catalog_names = suggestions
+                    .iter()
+                    .map(|item| item.name.to_lowercase())
+                    .collect::<BTreeSet<_>>();
+                suggestions.extend(known.into_iter().filter_map(|(name, (mxc, thumbnail))| {
+                    if name.is_empty() || catalog_names.contains(&name.to_lowercase()) {
+                        return None;
+                    }
+                    let image = mxc.map(|mxc| Request::Emoji(mxc.to_owned())).or_else(|| {
+                        (thumbnail && !chat.remote_id.is_empty()).then(|| Request::SlackEmoji {
+                            room: chat.remote_id.clone(),
+                            name: name.to_owned(),
+                        })
+                    });
+                    Some(ComposerSuggestion {
+                        name: name.to_owned(),
+                        insert: format!(":{name}:"),
+                        image,
+                        user_id: None,
+                        uses: mxc
+                            .and_then(|key| self.emoji_usage.get(key))
+                            .map_or(0, BTreeSet::len),
+                        keywords: name.to_owned(),
+                    })
+                }));
+            }
+            suggestions.retain(|item| {
+                item.name.starts_with(&query)
+                    || emoji::matches_search(&item.insert, &item.keywords, &query)
+                    || item.name.contains(&query)
+            });
+            for (_, entries) in emoji::catalog() {
+                suggestions.extend(entries.iter().filter(|entry| entry.matches(&query)).map(
+                    |entry| ComposerSuggestion {
+                        name: entry.shortcode.clone(),
+                        insert: entry.glyph.to_owned(),
+                        image: None,
+                        user_id: None,
+                        uses: self.emoji_usage.get(entry.glyph).map_or(0, BTreeSet::len),
+                        keywords: String::new(),
+                    },
+                ));
+            }
+            suggestions.sort_by_key(|item| {
+                (
+                    !item.name.starts_with(&query),
+                    item.name != query,
+                    query.is_empty() && !item.insert.starts_with(':'),
+                    std::cmp::Reverse(item.uses),
+                )
+            });
+            suggestions
+        };
+        if suggestions.is_empty() {
+            menu.visible = false;
+            store(menu);
+            return;
+        }
+        let count = suggestions.len();
+        menu.selected = menu.selected.min(count - 1);
+        match action {
+            Some(egui::Key::ArrowUp) => menu.selected = (menu.selected + count - 1) % count,
+            Some(egui::Key::ArrowDown) => menu.selected = (menu.selected + 1) % count,
+            _ => {}
+        }
+        let mut picked =
+            matches!(action, Some(egui::Key::Tab | egui::Key::Enter)).then_some(menu.selected);
+        let width = edit.response.rect.width().min(350.);
+        egui::Popup::new(
+            popup_id,
+            ui.ctx().clone(),
+            egui::PopupAnchor::from(&edit.response),
+            ui.layer_id(),
+        )
+        .align(egui::RectAlign::TOP_START)
+        .gap(5.)
+        .width(width)
+        .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+        .frame(
+            egui::Frame::popup(ui.style())
+                .fill(p.panel)
+                .stroke(egui::Stroke::new(1., p.line))
+                .inner_margin(6)
+                .corner_radius(8),
+        )
+        .show(|ui| {
+            ui.set_width((width - 14.).max(80.));
+            ui.spacing_mut().item_spacing.y = 1.;
+            let mut scroll = egui::ScrollArea::vertical().max_height(223.);
+            if query_changed || !menu.visible {
+                scroll = scroll.vertical_scroll_offset(0.);
+            } else if matches!(action, Some(egui::Key::ArrowUp | egui::Key::ArrowDown)) {
+                scroll =
+                    scroll.vertical_scroll_offset(menu.selected.saturating_sub(4) as f32 * 28.);
+            }
+            scroll.show_rows(ui, 27., count, |ui, rows| {
+                for index in rows {
+                    let item = &suggestions[index];
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 27.),
+                        egui::Sense::click(),
+                    );
+                    if index == menu.selected || response.hovered() {
+                        ui.painter().rect_filled(rect, 5., p.raised);
+                    }
+                    let icon = egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + 17., rect.center().y),
+                        Vec2::splat(19.),
+                    );
+                    if let Some(request) = &item.image {
+                        let key = request.key();
+                        self.media
+                            .request(request.clone(), self.app.api.clone(), ui.ctx());
+                        if let Some(texture) = self.media.texture(&key) {
+                            egui::Image::new((texture.id(), Vec2::splat(19.))).paint_at(ui, icon);
+                        }
+                    } else if let Some(image) = emoji::icon(ui, &item.insert, 19.) {
+                        image.paint_at(ui, icon);
+                    }
+                    let label = if item.user_id.is_some() {
+                        ui.painter().text(
+                            icon.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "@",
+                            egui::FontId::proportional(14.),
+                            p.blue,
+                        );
+                        format!("@{}", item.name)
+                    } else {
+                        format!(":{}:", item.name)
+                    };
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 33., rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &label,
+                        egui::FontId::proportional(13.),
+                        p.text,
+                    );
+                    response.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Button,
+                            true,
+                            index == menu.selected,
+                            &label,
+                        )
+                    });
+                    if response.clicked() {
+                        picked = Some(index);
+                    }
                 }
             });
+        });
+        if let Some(index) = picked {
+            let mut insert = suggestions[index].insert.clone();
+            if range.end == self.app.editor.text.len() {
+                insert.push(' ');
+            }
+            let cursor =
+                self.app.editor.text[..range.start].chars().count() + insert.chars().count();
+            self.app
+                .editor
+                .replace_completion(range, &insert, suggestions[index].user_id.clone());
+            edit.state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(cursor),
+                )));
+            edit.state.clone().store(ui.ctx(), edit.response.id);
+            edit.response.request_focus();
+            self.app.mode = Mode::Compose;
+            store(ComposerCompletionMenu::default());
+        } else {
+            menu.visible = true;
+            self.composer_completion_open = true;
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    edit.response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
+            store(menu);
+        }
+    }
+
+    fn composer(&mut self, ui: &mut egui::Ui, chat: &Conversation, p: Palette) {
+        if let Some(reply) = self.app.reply.clone() {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .small_button("×")
+                        .on_hover_text("Cancel reply (Esc)")
+                        .clicked()
+                    {
+                        self.app.reply = None;
+                    }
+                    let mut preview = egui::text::LayoutJob::default();
+                    let font_id = egui::TextStyle::Small.resolve(ui.style());
+                    preview.append(
+                        &format!("Reply to {}  ", one_line(&reply.sender_name)),
+                        0.,
+                        egui::TextFormat::simple(font_id.clone(), p.blue),
+                    );
+                    preview.append(
+                        &one_line(&reply.text),
+                        0.,
+                        egui::TextFormat::simple(font_id, p.muted),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(preview).truncate());
+                    });
+                },
+            );
         }
         if self.app.edit_message.is_some() {
             ui.horizontal(|ui| {
@@ -2077,9 +3088,39 @@ impl Gui {
                     );
                     ui.fonts_mut(|fonts| fonts.layout_job(job))
                 };
-                let edit = ui
+                let id = composer_id(chat);
+                let menu = ui
+                    .ctx()
+                    .data(|data| {
+                        data.get_temp::<ComposerCompletionMenu>(id.with("composer-completion"))
+                    })
+                    .unwrap_or_default();
+                let action = if enabled && menu.visible && ui.memory(|memory| memory.has_focus(id))
+                {
+                    ui.input_mut(|input| {
+                        [
+                            egui::Key::Escape,
+                            egui::Key::Tab,
+                            egui::Key::Enter,
+                            egui::Key::ArrowDown,
+                            egui::Key::ArrowUp,
+                        ]
+                        .into_iter()
+                        .find(|key| {
+                            input.modifiers.is_none()
+                                && input.consume_key(egui::Modifiers::NONE, *key)
+                        })
+                    })
+                } else {
+                    None
+                };
+                if action == Some(egui::Key::Escape) {
+                    self.app.reply = None;
+                }
+                let mut edit = ui
                     .add_enabled_ui(enabled, |ui| {
                         egui::TextEdit::multiline(&mut self.app.editor.text)
+                            .id(composer_id(chat))
                             .hint_text(if enabled {
                                 "Write a message…"
                             } else if chat.kind == "archive" {
@@ -2099,12 +3140,17 @@ impl Gui {
                     })
                     .inner;
                 emoji::paint_clipped(ui, &edit.galley, edit.galley_pos, edit.text_clip_rect);
+                self.app.editor.reconcile_mentions(&before);
+                if enabled && matches!(chat.kind.as_str(), "chat" | "phone" | "email") {
+                    self.complete_composer(ui, chat, &mut edit, menu, action, p);
+                }
                 let response = edit.response;
                 self.app.editor.cursor = self.app.editor.text.len();
                 if response.changed() && self.app.mode == Mode::Browse {
                     self.app.mode = Mode::Compose;
                 }
                 let send_key = response.has_focus()
+                    && !self.composer_completion_open
                     && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
                 ui.horizontal(|ui| {
                     if chat.kind == "chat"
@@ -2826,24 +3872,34 @@ impl Gui {
             self.gallery.clear();
         }
     }
+    fn handle_escape(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.composer_completion_open)
+            && self.gallery.is_empty()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.app.mode = if self.app.mode == Mode::Confirm {
+                self.app.confirm_body = None;
+                Mode::Compose
+            } else {
+                if matches!(self.app.mode, Mode::Browse | Mode::Compose) {
+                    self.app.reply = None;
+                }
+                if self.app.editor.text.is_empty() {
+                    Mode::Browse
+                } else {
+                    Mode::Compose
+                }
+            };
+        }
+    }
 }
 impl eframe::App for Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.reaction_picker(ctx);
         self.show_reaction_detail(ctx);
         self.app.poll();
-        if self.gallery.is_empty()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-        {
-            self.app.mode = if self.app.mode == Mode::Confirm {
-                self.app.confirm_body = None;
-                Mode::Compose
-            } else if self.app.editor.text.is_empty() {
-                Mode::Browse
-            } else {
-                Mode::Compose
-            };
-        }
+        self.observe_reaction_usage();
+        self.handle_escape(ctx);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
             self.search_focus = true;
         }
@@ -2862,6 +3918,21 @@ impl eframe::App for Gui {
                         Err(e) => self.app.notice = e,
                     }
                 }
+                Event::ComposerRoom(room, members, emoji) => {
+                    self.room_custom_emoji.insert(room.clone(), emoji);
+                    if let Some((_, current)) = self.mention_members.get_mut(&room) {
+                        *current = members;
+                    }
+                }
+                Event::DiscordEmojis(guild_id, result) => {
+                    self.discord_emoji.insert(guild_id, Some(result));
+                }
+                Event::DiscordReaction(chat_id, message_id, result) => match result {
+                    Ok(key) => self.app.queue_reaction(&chat_id, &message_id, &key, true),
+                    Err(error) => {
+                        self.app.notice = format!("Could not load Discord emoji: {error}")
+                    }
+                },
                 Event::File(file) => {
                     self.file_busy = false;
                     self.app.notice = "Uploading attachment…".into();
@@ -2984,10 +4055,219 @@ struct ReactionGroup {
     names: Vec<String>,
     unnamed: usize,
 }
+#[derive(Clone, Default)]
+struct ComposerCompletionMenu {
+    start: usize,
+    query: String,
+    selected: usize,
+    visible: bool,
+    dismissed: bool,
+}
+
+struct ComposerSuggestion {
+    name: String,
+    insert: String,
+    image: Option<Request>,
+    user_id: Option<String>,
+    uses: usize,
+    keywords: String,
+}
+
+struct ReactionPicker {
+    chat: Conversation,
+    message: Message,
+    anchor: egui::PopupAnchor,
+    layer_id: egui::LayerId,
+    search: String,
+    focus_search: bool,
+}
+
+fn discord_emoji_path(room_id: &str) -> String {
+    format!(
+        "/api/discord/room-emoji?roomID={}",
+        urlencoding::encode(room_id)
+    )
+}
+
+fn emoji_grid(
+    ui: &mut egui::Ui,
+    entries: &[&emoji::CatalogEmoji],
+    mut draw: impl FnMut(&mut egui::Ui, &emoji::CatalogEmoji),
+) {
+    let size = 32.;
+    let spacing = ui.spacing().item_spacing;
+    let columns =
+        (((ui.available_width() + spacing.x) / (size + spacing.x)).floor() as usize).max(1);
+    let row_count = entries.len().div_ceil(columns);
+    let pitch = size + spacing.y;
+    let top = ui.next_widget_position().y;
+    let clip = ui.clip_rect();
+    let first = (((clip.top() - top) / pitch).floor() as usize).min(row_count);
+    let end = (((clip.bottom() - top) / pitch).ceil() as usize).clamp(first, row_count);
+    let skip = |ui: &mut egui::Ui, rows| {
+        if rows > 0 {
+            ui.allocate_space(egui::vec2(1., rows as f32 * pitch - spacing.y));
+        }
+    };
+    skip(ui, first);
+    for row in first..end {
+        ui.push_id(row, |ui| {
+            ui.horizontal(|ui| {
+                for entry in &entries[row * columns..((row + 1) * columns).min(entries.len())] {
+                    draw(ui, entry);
+                }
+            });
+        });
+    }
+    skip(ui, row_count - end);
+}
+
+fn paint_picker_icon(ui: &egui::Ui, response: &egui::Response, image: egui::Image<'_>) {
+    image.paint_at(
+        ui,
+        egui::Rect::from_center_size(response.rect.center(), Vec2::splat(23.)),
+    );
+}
+
 const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "🎉"];
 
 fn emoji_name(shortcode: &str) -> &str {
     shortcode.trim().trim_matches(':')
+}
+
+const ACTION_SIZE: f32 = 26.;
+const ACTION_PADDING: f32 = 3.;
+const ACTION_GAP: f32 = 2.;
+
+enum MessageAction {
+    React,
+    Reply,
+    Edit,
+    More,
+}
+
+fn mention_room_key(chat: &Conversation) -> &str {
+    chat.parent_conversation_id.as_deref().unwrap_or(&chat.id)
+}
+
+fn valid_mention_id(id: &str) -> bool {
+    id.starts_with('@')
+        && id.contains(':')
+        && !matches!(
+            id.split(':').next(),
+            Some("@discordbot" | "@slackbot" | "@whatsappbot")
+        )
+}
+
+fn composer_id(chat: &Conversation) -> egui::Id {
+    egui::Id::new(("message-composer", &chat.id))
+}
+
+fn message_shortcut(ui: &egui::Ui, can_reply: bool, can_edit: bool) -> Option<egui::Key> {
+    ui.input_mut(|input| {
+        let (key, letter) = input.events.iter().find_map(|event| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } if modifiers.is_none() => match key {
+                egui::Key::R if can_reply => Some((*key, "r")),
+                egui::Key::E if can_edit => Some((*key, "e")),
+                _ => None,
+            },
+            _ => None,
+        })?;
+        input.consume_key(egui::Modifiers::NONE, key);
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::Text(text) if text == letter));
+        Some(key)
+    })
+}
+
+fn icon_button(
+    ui: &mut egui::Ui,
+    size: f32,
+    label: &str,
+    selected: bool,
+    p: Palette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    if selected || response.hovered() || response.has_focus() {
+        let fill = if selected {
+            theme::tint(p.raised, p.accent, 0.30)
+        } else {
+            p.raised
+        };
+        ui.painter().rect_filled(rect, 5., fill);
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
+    });
+    response
+        .on_hover_text(label)
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn message_action(ui: &mut egui::Ui, action: MessageAction, p: Palette) -> egui::Response {
+    let label = match action {
+        MessageAction::React => "Add reaction",
+        MessageAction::Reply => "Reply (R)",
+        MessageAction::Edit => "Edit message (E)",
+        MessageAction::More => "More actions",
+    };
+    let response = icon_button(ui, ACTION_SIZE, label, false, p);
+    let center = response.rect.center();
+    let at = |x, y| center + egui::vec2(x, y);
+    let ink = if response.hovered() { p.text } else { p.muted };
+    let stroke = egui::Stroke::new(1.5, ink);
+    let painter = ui.painter();
+    match action {
+        MessageAction::React => {
+            painter.circle_stroke(center, 6.5, stroke);
+            painter.circle_filled(at(-2.3, -1.7), 0.9, ink);
+            painter.circle_filled(at(2.3, -1.7), 0.9, ink);
+            painter.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
+                [at(-2.8, 1.6), at(0., 4.8), at(2.8, 1.6)],
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+        }
+        MessageAction::Reply => {
+            painter.add(egui::Shape::line(
+                vec![at(-1.5, -6.), at(-6., -1.5), at(-1.5, 3.)],
+                stroke,
+            ));
+            painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                [at(-6., -1.5), at(-1., -1.5), at(6., -3.), at(6., 5.5)],
+                false,
+                Color32::TRANSPARENT,
+                stroke,
+            ));
+        }
+        MessageAction::Edit => {
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    at(-6., 6.),
+                    at(-5., 1.5),
+                    at(2.5, -6.),
+                    at(6., -2.5),
+                    at(-1.5, 5.),
+                ],
+                stroke,
+            ));
+            painter.line_segment([at(0.5, -4.), at(4., -0.5)], stroke);
+        }
+        MessageAction::More => {
+            for x in [-5., 0., 5.] {
+                painter.circle_filled(at(x, 0.), 1.35, ink);
+            }
+        }
+    }
+    response
 }
 
 fn reaction_count_label(count: usize, mine: bool) -> String {
@@ -3047,6 +4327,48 @@ fn paint_reaction(button: egui::Button<'static>, mine: bool, p: Palette) -> egui
             p.accent,
         ))
         .corner_radius(10)
+}
+
+fn message_reaction_groups(message: &Message, self_id: &str) -> Vec<ReactionGroup> {
+    let mut groups = reaction_groups(&message.reactions, self_id);
+    let Some(counts) = &message.reaction_counts else {
+        return groups;
+    };
+    counts
+        .iter()
+        .filter(|summary| summary.count > 0)
+        .map(|summary| {
+            let known = groups.iter().position(|group| group.key == summary.key);
+            let mut group = known
+                .map(|index| groups.swap_remove(index))
+                .unwrap_or_else(|| ReactionGroup {
+                    key: summary.key.clone(),
+                    image: summary
+                        .key
+                        .starts_with("mxc://")
+                        .then(|| summary.key.clone()),
+                    shortcode: summary.shortcode.clone(),
+                    count: 0,
+                    mine: false,
+                    names: Vec::new(),
+                    unnamed: 0,
+                });
+            group.count = summary.count;
+            group.mine = summary.mine;
+            if group.shortcode.is_none() {
+                group.shortcode = summary.shortcode.clone();
+            }
+            group.names.retain(|name| name != "You");
+            if group.names.len() > summary.count - usize::from(summary.mine) {
+                group.names.clear();
+            }
+            if summary.mine {
+                group.names.insert(0, "You".into());
+            }
+            group.unnamed = group.count - group.names.len();
+            group
+        })
+        .collect()
 }
 
 fn reaction_groups(reactions: &[Value], self_id: &str) -> Vec<ReactionGroup> {
@@ -3127,12 +4449,22 @@ fn reaction_groups(reactions: &[Value], self_id: &str) -> Vec<ReactionGroup> {
     groups
 }
 
-// Keep loaded Slack replies beside their parent while retaining their original
-// indices for reply, reaction, and edit actions. Orphan replies remain visible.
 fn row_text(ui: &egui::Ui, text: &str, pos: egui::Pos2, width: f32, size: f32, color: Color32) {
-    let mut colored = egui::text::LayoutJob::default();
+    let galley = row_text_galley(ui, text, width, size, color);
+    ui.painter().galley(pos, galley.clone(), color);
+    emoji::paint(ui, &galley, pos);
+}
+
+fn row_text_galley(
+    ui: &egui::Ui,
+    text: &str,
+    width: f32,
+    size: f32,
+    color: Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
     emoji::append(
-        &mut colored,
+        &mut job,
         text,
         egui::TextFormat {
             font_id: egui::FontId::proportional(size),
@@ -3140,15 +4472,14 @@ fn row_text(ui: &egui::Ui, text: &str, pos: egui::Pos2, width: f32, size: f32, c
             ..Default::default()
         },
     );
-    let mut job = colored;
     job.wrap.max_width = width.max(1.);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    ui.painter().galley(pos, galley.clone(), color);
-    emoji::paint(ui, &galley, pos);
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
+// Keep loaded Slack replies beside their parent while retaining their original
+// indices for reply, reaction, and edit actions. Orphan replies remain visible.
 fn message_order(messages: &[Message], group_threads: bool) -> Vec<usize> {
     if !group_threads {
         return (0..messages.len()).collect();
@@ -3268,41 +4599,115 @@ mod tests {
     }
 
     #[test]
-    fn narrow_inbox_keeps_both_filters_and_refresh_on_one_row() {
+    fn account_filter_toggles_visibility_and_persists_it() {
         let ctx = egui::Context::default();
-        let mut gui = Gui::new(App::new(None, true), &ctx);
-        Gui::apply_fonts(&ctx, FontStyle::Terminal);
-        let mut right_edge = 0.0;
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                // The smallest Inbox pane is 260 points including 12-point side margins.
-                ui.set_width(236.0);
-                right_edge = ui.max_rect().right();
-                gui.inbox_header(ui);
-            });
-        });
-        let rect = |label| {
-            output
-                .shapes
-                .iter()
-                .find_map(|shape| {
-                    if let egui::Shape::Text(text) = &shape.shape
-                        && text.galley.job.text == label
-                    {
-                        Some(text.galley.rect.translate(text.pos.to_vec2()))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| panic!("missing Inbox control {label}"))
+        let path = std::env::temp_dir().join(format!(
+            "chord-account-filter-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut gui = Gui::with_settings_path(App::new(None, true), &ctx, path.clone());
+        let frame = |gui: &mut Gui, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100., 650.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| gui.account_filter(ui, false));
+                },
+            )
         };
-        let show = rect("Show unimportant");
-        let unread = rect("Unread only");
-        let refresh = rect("↻");
-        assert!((show.center().y - unread.center().y).abs() < 2.0);
-        assert!((show.center().y - refresh.center().y).abs() < 3.0);
-        assert!(show.right() < unread.left() && unread.right() < refresh.left());
-        assert!(refresh.right() <= right_edge);
+        let label = |output: &egui::FullOutput, name: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == name => {
+                    Some(text.pos + text.galley.rect.center().to_vec2())
+                }
+                _ => None,
+            })
+        };
+        let click = |pos| {
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            for pressed in [true, false] {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            events
+        };
+        let initial = frame(&mut gui, vec![]);
+        frame(&mut gui, click(label(&initial, "Accounts").unwrap()));
+        let menu = frame(&mut gui, vec![]);
+        assert!(label(&menu, "Discord server importance").is_some());
+        frame(&mut gui, click(label(&menu, "Slack").unwrap()));
+        assert!(gui.app.hidden_accounts.contains("slack"));
+        assert!(gui.app.visible().iter().all(|chat| chat.source != "slack"));
+        let reloaded = Gui::with_settings_path(App::new(None, true), &ctx, path.clone());
+        assert!(reloaded.app.hidden_accounts.contains("slack"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn narrow_inbox_keeps_accounts_filters_and_refresh_on_one_row() {
+        for (width, account_label) in [(236., "≡"), (336., "Accounts")] {
+            let ctx = egui::Context::default();
+            let mut gui = Gui::new(App::new(None, true), &ctx);
+            Gui::apply_fonts(&ctx, FontStyle::Terminal);
+            let mut right_edge = 0.0;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width + 16., 400.),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        // The smallest Inbox pane is 260 points including 12-point side margins.
+                        ui.set_width(width);
+                        right_edge = ui.max_rect().right();
+                        gui.inbox_header(ui);
+                    });
+                },
+            );
+            let rect = |label| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape
+                            && text.galley.job.text == label
+                        {
+                            Some(text.galley.rect.translate(text.pos.to_vec2()))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("missing Inbox control {label}"))
+            };
+            let show = rect("Show unimportant");
+            let unread = rect("Unread only");
+            let accounts = rect(account_label);
+            let refresh = rect("↻");
+            assert!((show.center().y - unread.center().y).abs() < 2.0);
+            assert!((show.center().y - refresh.center().y).abs() < 3.0);
+            assert!((show.center().y - accounts.center().y).abs() < 3.0);
+            assert!(
+                show.right() < unread.left()
+                    && unread.right() < accounts.left()
+                    && accounts.right() < refresh.left(),
+                "{show:?} {unread:?} {accounts:?} {refresh:?}"
+            );
+            assert!(refresh.right() <= right_edge);
+        }
     }
 
     #[test]
@@ -3410,6 +4815,32 @@ mod tests {
         assert_eq!(restored.theme, gui.theme);
         assert!(restored.app.is_pinned(&id));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn authoritative_reaction_count_includes_users_missing_from_matrix() {
+        use crate::model::ReactionCount;
+        let message = Message {
+            reactions: vec![
+                json!({"reactionKey":"👍","participantID":"one","participantName":"One"}),
+                json!({"reactionKey":"👍","participantID":"two","participantName":"Two"}),
+            ],
+            reaction_counts: Some(vec![ReactionCount {
+                key: "👍".into(),
+                count: 4,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let groups = message_reaction_groups(&message, "");
+        assert_eq!(groups[0].count, 4);
+        assert_eq!(groups[0].names, ["One", "Two"]);
+        assert_eq!(groups[0].unnamed, 2);
+        let cleared = Message {
+            reaction_counts: Some(vec![]),
+            ..message
+        };
+        assert!(message_reaction_groups(&cleared, "").is_empty());
     }
 
     #[test]
@@ -3614,9 +5045,9 @@ mod tests {
                 enabled,
                 "button={button:?} clicks={clicks} pos={pos:?} rect={rect:?}"
             );
-            if let Some((target_chat, target_message)) = gui.reaction_target {
-                assert_eq!(target_chat.id, chat.id);
-                assert_eq!(target_message.id, message.id);
+            if let Some(target) = gui.reaction_target {
+                assert_eq!(target.chat.id, chat.id);
+                assert_eq!(target.message.id, message.id);
             }
         }
     }
@@ -4002,6 +5433,304 @@ mod tests {
             "{text}"
         );
     }
+    #[test]
+    fn message_toolbar_fits_and_keeps_actions_clickable() {
+        for (width, index, expected_width) in [(760., 0, 177.), (300., 1, 118.)] {
+            let ctx = egui::Context::default();
+            let mut gui = Gui::new(App::new(None, true), &ctx);
+            let chat = gui.app.active.clone().unwrap();
+            let message = gui.app.messages[index].clone();
+            let mut pane_right = 0.;
+            let mut frame = |events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 300.),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            pane_right = ui.available_rect_before_wrap().right();
+                            gui.message(ui, &chat, &message, index, gui.theme.palette(ctx.theme()));
+                        });
+                    },
+                )
+            };
+            let output = frame(vec![egui::Event::PointerMoved(egui::pos2(80., 28.))]);
+            let toolbar = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect)
+                        if rect.corner_radius == egui::CornerRadius::same(8)
+                            && rect.stroke.width == 1. =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("hover toolbar");
+            assert!(
+                (toolbar.width() - expected_width).abs() < 0.5,
+                "{toolbar:?}"
+            );
+            assert!((toolbar.height() - 34.).abs() < 0.5, "{toolbar:?}");
+
+            let more = egui::pos2(toolbar.right() - 17., toolbar.center().y);
+            let button = if message.is_sender {
+                more - egui::vec2(ACTION_SIZE + ACTION_GAP, 0.)
+            } else {
+                more
+            };
+            frame(vec![egui::Event::PointerMoved(button)]);
+            for pressed in [true, false] {
+                frame(vec![egui::Event::PointerButton {
+                    pos: button,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            if message.is_sender {
+                assert_eq!(gui.app.edit_message.as_deref(), Some(message.id.as_str()));
+                assert_eq!(gui.app.message_selection, index);
+            } else {
+                assert!(egui::Popup::is_any_open(&ctx));
+            }
+            assert!(
+                (toolbar.right() - (pane_right - 10.)).abs() < 0.5,
+                "{toolbar:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hovered_message_shortcuts_target_the_message_and_respect_text_focus() {
+        use egui::Key::{E, R};
+        for (key, index, typing, modifiers, activates) in [
+            (R, 0, false, egui::Modifiers::NONE, true),
+            (E, 1, false, egui::Modifiers::NONE, true),
+            (E, 0, false, egui::Modifiers::NONE, false),
+            (R, 0, true, egui::Modifiers::NONE, false),
+            (E, 1, true, egui::Modifiers::NONE, false),
+            (E, 1, false, egui::Modifiers::SHIFT, false),
+        ] {
+            let ctx = egui::Context::default();
+            let mut gui = Gui::new(App::new(None, true), &ctx);
+            let chat = gui.app.active.clone().unwrap();
+            let message = gui.app.messages[index].clone();
+            let id = composer_id(&chat);
+            let draw = |gui: &mut Gui, events, focus| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let composer =
+                                ui.add(egui::TextEdit::singleline(&mut gui.app.editor.text).id(id));
+                            if focus {
+                                composer.request_focus();
+                            }
+                            gui.message(ui, &chat, &message, index, gui.theme.palette(ctx.theme()));
+                        });
+                    },
+                );
+            };
+            draw(&mut gui, vec![], typing);
+            let letter = if key == R { "r" } else { "e" };
+            draw(
+                &mut gui,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(100., 50.)),
+                    egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                    egui::Event::Text(letter.into()),
+                ],
+                false,
+            );
+            assert_eq!(
+                gui.app.reply.as_ref().map(|reply| &reply.id),
+                (activates && key == R).then_some(&message.id)
+            );
+            assert_eq!(
+                gui.app.edit_message.as_ref(),
+                (activates && key == E).then_some(&message.id)
+            );
+            if activates {
+                assert!(ctx.memory(|memory| memory.has_focus(id)));
+                assert_eq!(
+                    gui.app.editor.text,
+                    if key == E { &message.text } else { "" }
+                );
+            } else if typing {
+                assert_eq!(gui.app.editor.text, letter);
+            }
+        }
+    }
+
+    #[test]
+    fn composer_completes_emoji_and_mentions_without_sending() {
+        for (query, key, expected) in [
+            (":thumbsup", egui::Key::Tab, "👍 "),
+            (":flag_mm", egui::Key::Enter, "🇲🇲 "),
+            (":my_custom", egui::Key::Enter, ":my_custom: "),
+            (":archived", egui::Key::Tab, ":archived: "),
+            ("@vict", egui::Key::Tab, "@Victoria "),
+            ("@vicky", egui::Key::Tab, "@Victoria "),
+        ] {
+            let ctx = egui::Context::default();
+            let mut gui = Gui::new(App::new(None, true), &ctx);
+            let mut chat = gui.app.active.clone().unwrap();
+            chat.source = "discord".into();
+            chat.server_id = Some("guild".into());
+            gui.app.messages[0].sender_id = Some("@discord_123:chord.local".into());
+            gui.mention_members.insert(
+                chat.id.clone(),
+                (
+                    std::time::Instant::now(),
+                    vec![MentionMember {
+                        id: "@discord_123:chord.local".into(),
+                        full_name: "Victoria".into(),
+                        aliases: vec!["vicky".into()],
+                        is_self: false,
+                    }],
+                ),
+            );
+            gui.room_custom_emoji.insert(
+                chat.id.clone(),
+                vec![RoomEmoji {
+                    name: "archived".into(),
+                    mxc: Some("mxc://chord.local/archived".into()),
+                    thumbnail: false,
+                }],
+            );
+            gui.discord_emoji.insert(
+                "guild".into(),
+                Some(Ok(vec![DiscordEmoji {
+                    id: "123456789012345678".into(),
+                    name: "my_custom".into(),
+                    mxc: None,
+                }])),
+            );
+            let run = |gui: &mut Gui, events, focus| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            if focus {
+                                ui.memory_mut(|memory| memory.request_focus(composer_id(&chat)));
+                            }
+                            gui.composer_completion_open = false;
+                            gui.composer(ui, &chat, gui.theme.palette(ctx.theme()));
+                        });
+                    },
+                );
+            };
+            run(&mut gui, vec![], true);
+            run(&mut gui, vec![egui::Event::Text(query.into())], false);
+            assert!(gui.composer_completion_open);
+            run(
+                &mut gui,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                false,
+            );
+            assert_eq!(gui.app.editor.text, expected);
+            assert!(!gui.composer_completion_open);
+        }
+    }
+
+    #[test]
+    fn reply_preview_keeps_cancel_inside_the_pane_and_escape_preserves_the_draft() {
+        let ctx = egui::Context::default();
+        let mut gui = Gui::new(App::new(None, true), &ctx);
+        let chat = gui.app.active.clone().unwrap();
+        let reply = Message {
+            sender_name: "Long sender name ".repeat(15),
+            text: "Long reply preview ".repeat(60),
+            ..Default::default()
+        };
+        gui.app.reply = Some(reply.clone());
+        gui.app.editor.set("my draft".into());
+        gui.app.mode = Mode::Compose;
+        let frame = |gui: &mut Gui, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(280., 220.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    gui.handle_escape(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        gui.composer(ui, &chat, gui.theme.palette(ctx.theme()));
+                    });
+                },
+            )
+        };
+        let output = frame(&mut gui, vec![]);
+        let close = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "×" => {
+                    Some(text.pos + text.galley.size() / 2.)
+                }
+                _ => None,
+            })
+            .expect("reply close button");
+        assert!((240. ..280.).contains(&close.x), "{close:?}");
+        frame(&mut gui, vec![egui::Event::PointerMoved(close)]);
+        for pressed in [true, false] {
+            frame(
+                &mut gui,
+                vec![egui::Event::PointerButton {
+                    pos: close,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert!(gui.app.reply.is_none());
+        assert_eq!(gui.app.editor.text, "my draft");
+
+        gui.app.reply = Some(reply);
+        frame(
+            &mut gui,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(gui.app.reply.is_none());
+        assert_eq!(gui.app.editor.text, "my draft");
+    }
+
     #[test]
     fn native_layout_renders_at_normal_and_compact_sizes() {
         for size in [[1240., 820.], [800., 600.]] {

@@ -1,10 +1,13 @@
 use crate::{
     api::Api,
-    model::{Conversation, Inbox, Message, SOURCES, clean},
+    model::{Conversation, Inbox, Message, ReactionCount, SOURCES, clean},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::Instant,
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -37,11 +40,106 @@ pub enum Mode {
 pub struct Editor {
     pub text: String,
     pub cursor: usize,
+    mentions: Vec<DraftMention>,
 }
+
+#[derive(Clone)]
+struct DraftMention {
+    range: std::ops::Range<usize>,
+    user_id: String,
+}
+
 impl Editor {
     pub fn set(&mut self, s: String) {
         self.cursor = s.len();
         self.text = s;
+        self.mentions.clear();
+    }
+
+    fn move_mentions(&mut self, range: std::ops::Range<usize>, replacement_len: usize) {
+        let shift = replacement_len as isize - range.len() as isize;
+        self.mentions.retain_mut(|mention| {
+            if mention.range.end <= range.start {
+                true
+            } else if mention.range.start >= range.end {
+                mention.range.start = mention.range.start.saturating_add_signed(shift);
+                mention.range.end = mention.range.end.saturating_add_signed(shift);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub fn reconcile_mentions(&mut self, before: &str) {
+        if self.mentions.is_empty() || before == self.text {
+            return;
+        }
+        let start = before
+            .chars()
+            .zip(self.text.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum::<usize>();
+        let suffix = before[start..]
+            .chars()
+            .rev()
+            .zip(self.text[start..].chars().rev())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum::<usize>();
+        self.move_mentions(
+            start..before.len() - suffix,
+            self.text.len() - suffix - start,
+        );
+    }
+
+    pub fn replace_completion(
+        &mut self,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+        mention_user: Option<String>,
+    ) {
+        self.move_mentions(range.clone(), replacement.len());
+        if let Some(user_id) = mention_user {
+            self.mentions.push(DraftMention {
+                range: range.start..range.start + replacement.trim_end().len(),
+                user_id,
+            });
+            self.mentions.sort_by_key(|mention| mention.range.start);
+        }
+        self.text.replace_range(range, replacement);
+    }
+
+    fn mention_payload(&self) -> Option<(String, BTreeSet<&str>)> {
+        let mut users = BTreeSet::new();
+        let mut html = String::new();
+        let mut cursor = 0;
+        for mention in &self.mentions {
+            let range = &mention.range;
+            let Some(label) = self
+                .text
+                .get(range.clone())
+                .filter(|label| label.starts_with('@'))
+            else {
+                continue;
+            };
+            if range.start < cursor
+                || self.text[range.end..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            append_html(&mut html, &self.text[cursor..range.start]);
+            html.push_str("<a href=\"https://matrix.to/#/");
+            html.push_str(&urlencoding::encode(&mention.user_id));
+            html.push_str("\">");
+            append_html(&mut html, label);
+            html.push_str("</a>");
+            users.insert(mention.user_id.as_str());
+            cursor = range.end;
+        }
+        append_html(&mut html, &self.text[cursor..]);
+        (!users.is_empty()).then_some((html, users))
     }
     pub fn insert(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
@@ -101,6 +199,18 @@ impl Editor {
                     .unwrap_or(self.text.len())
             }
             _ => {}
+        }
+    }
+}
+
+fn append_html(html: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            '\n' => html.push_str("<br>"),
+            _ => html.push(c),
         }
     }
 }
@@ -195,6 +305,7 @@ struct Outgoing {
 #[derive(Clone, Default)]
 struct Draft {
     text: String,
+    mentions: Vec<DraftMention>,
     reply: Option<Message>,
     attachment: Option<Value>,
     edit_message: Option<String>,
@@ -217,6 +328,7 @@ pub struct App {
     pub api: Option<Api>,
     pub demo: bool,
     pub source: usize,
+    pub hidden_accounts: BTreeSet<String>,
     pub unread: bool,
     pub conversations: Vec<Conversation>,
     pub messages: Vec<Message>,
@@ -272,6 +384,7 @@ pub struct App {
     pub archive_status: Value,
     pub last_connection_refresh: Instant,
     pub show_unimportant: bool,
+    pub unimportant_discord_servers: BTreeSet<String>,
     pub discord_scope: Option<String>,
     pub server_label: String,
     pub servers: Vec<Value>,
@@ -315,6 +428,7 @@ impl App {
             api,
             demo,
             source: 0,
+            hidden_accounts: BTreeSet::new(),
             unread: false,
             conversations: vec![],
             messages: vec![],
@@ -369,6 +483,7 @@ impl App {
             archive_status: Value::Null,
             last_connection_refresh: Instant::now(),
             show_unimportant: false,
+            unimportant_discord_servers: BTreeSet::new(),
             discord_scope: None,
             server_label: String::new(),
             servers: vec![],
@@ -418,14 +533,25 @@ impl App {
             });
         }
     }
+    pub fn account_visible(&self, conversation: &Conversation) -> bool {
+        !self.hidden_accounts.contains(&conversation.source)
+            && !self.hidden_accounts.contains(&conversation.account_key)
+    }
+
     pub fn visible(&self) -> Vec<&Conversation> {
         let mut chats: Vec<&Conversation> = self
             .conversations
             .iter()
             .filter(|c| {
-                (self.source == 0 || c.source == SOURCES[self.source].0)
+                self.account_visible(c)
+                    && (self.source == 0 || c.source == SOURCES[self.source].0)
                     && (!self.unread || c.unread)
-                    && (self.show_unimportant || c.local_priority != "unimportant")
+                    && (self.show_unimportant
+                        || (c.local_priority != "unimportant"
+                            && !(c.source == "discord"
+                                && c.server_id.as_ref().is_some_and(|id| {
+                                    self.unimportant_discord_servers.contains(id)
+                                }))))
             })
             .collect();
         let pins = self.tab_pins();
@@ -529,6 +655,9 @@ impl App {
         self.mode = Mode::Servers;
         self.server_query.clear();
         self.server_selection = 0;
+        self.refresh_discord_servers();
+    }
+    pub fn refresh_discord_servers(&self) {
         if let Some(api) = self.api.clone() {
             let tx = self.tx.clone();
             tokio::spawn(async move {
@@ -767,6 +896,11 @@ impl App {
                 "inbox"
             };
             let unread = self.unread;
+            let hidden_servers: Vec<_> = if self.show_unimportant {
+                Vec::new()
+            } else {
+                self.unimportant_discord_servers.iter().cloned().collect()
+            };
             let pins = self.tab_pins();
             let server = self.discord_scope.clone();
             let cursor = append.then(|| self.inbox_cursors.to_string());
@@ -780,6 +914,7 @@ impl App {
                         unread,
                         cursor.as_deref(),
                         server.as_deref(),
+                        &hidden_servers,
                         &pins,
                     )
                     .await;
@@ -795,6 +930,7 @@ impl App {
                             unread,
                             cursor.as_deref(),
                             server.as_deref(),
+                            &hidden_servers,
                             &pins,
                         )
                         .await;
@@ -838,6 +974,7 @@ impl App {
         if let Some(old) = &self.active {
             let draft = Draft {
                 text: self.editor.text.clone(),
+                mentions: self.editor.mentions.clone(),
                 reply: self.reply.clone(),
                 attachment: self.pending_attachment.clone(),
                 edit_message: self.edit_message.clone(),
@@ -855,6 +992,7 @@ impl App {
         let draft = self.drafts.get(&c.id).cloned().unwrap_or_default();
         self.editor = Editor::default();
         self.editor.set(draft.text);
+        self.editor.mentions = draft.mentions;
         self.reply = draft.reply;
         self.edit_message = draft.edit_message;
         self.pending_attachment = draft.attachment;
@@ -1131,6 +1269,14 @@ impl App {
                 body["expectedGroupToken"] = c.blue["confirmation_token"].clone();
             }
         } else {
+            if let Some((html, users)) = self.editor.mention_payload() {
+                if self.pending_attachment.is_some() {
+                    self.notice = "Send the tagged message and attachment separately.".into();
+                    return None;
+                }
+                body["html"] = json!(html);
+                body["mentions"] = json!({"userIds": users});
+            }
             if let Some(reply) = &self.reply {
                 body["replyToMessageID"] = json!(reply.id)
             }
@@ -1380,6 +1526,25 @@ impl App {
             .find(|message| message.id == message_id)
         {
             apply_user_reaction(&mut message.reactions, key, &self_id, add);
+            if let Some(counts) = &mut message.reaction_counts {
+                if let Some(count) = counts.iter_mut().find(|count| count.key == key) {
+                    if count.mine != add {
+                        count.mine = add;
+                        count.count = if add {
+                            count.count.saturating_add(1)
+                        } else {
+                            count.count.saturating_sub(1)
+                        };
+                    }
+                } else if add {
+                    counts.push(ReactionCount {
+                        key: key.to_owned(),
+                        count: 1,
+                        mine: true,
+                        shortcode: None,
+                    });
+                }
+            }
         }
     }
     fn pump_reactions(&mut self) {
@@ -2777,6 +2942,32 @@ mod tests {
         assert!(app.notice.contains("offline"));
     }
     #[test]
+    fn selected_mentions_keep_their_identity_through_edits_before_the_tag() {
+        let mut app = App::new(None, true);
+        app.editor.set("@vi".into());
+        app.editor
+            .replace_completion(0..3, "@Victoria ", Some("@discord_123:chord.local".into()));
+        let old = app.editor.text.clone();
+        app.editor.text.insert_str(0, "😀 <hi> ");
+        app.editor.reconcile_mentions(&old);
+        app.prepare_send();
+        let body = app.confirm_body.as_ref().unwrap();
+        assert_eq!(
+            body["mentions"],
+            json!({"userIds": ["@discord_123:chord.local"]})
+        );
+        assert_eq!(
+            body["html"],
+            "😀 &lt;hi&gt; <a href=\"https://matrix.to/#/%40discord_123%3Achord.local\">@Victoria</a> "
+        );
+
+        let old = app.editor.text.clone();
+        app.editor.text = old.replace("@Victoria", "@Victor");
+        app.editor.reconcile_mentions(&old);
+        assert!(app.editor.mention_payload().is_none());
+    }
+
+    #[test]
     fn native_send_submits_without_a_review_dialog() {
         let mut app = App::new(None, true);
         app.native_ui = true;
@@ -3324,6 +3515,31 @@ mod tests {
         app.set_unimportant(&hidden, false);
         app.show_unimportant = false;
         assert_eq!(app.visible()[0].id, hidden);
+    }
+
+    #[test]
+    fn discord_server_visibility_spares_dms_and_respects_show_unimportant() {
+        let mut app = App::new(None, true);
+        app.conversations = vec![
+            Conversation {
+                id: "channel".into(),
+                source: "discord".into(),
+                server_id: Some("123".into()),
+                ..Default::default()
+            },
+            Conversation {
+                id: "dm".into(),
+                source: "discord".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(app.visible().len(), 2);
+        app.unimportant_discord_servers.insert("123".into());
+        assert_eq!(app.visible()[0].id, "dm");
+        assert_eq!(app.visible().len(), 1);
+        app.show_unimportant = true;
+        assert_eq!(app.visible().len(), 2);
     }
 
     #[test]

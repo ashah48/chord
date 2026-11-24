@@ -43,7 +43,7 @@ function roomListing(c,timeline){
  const previewFromThread=!!(newestThread?.text&&c.preview?.text===newestThread.text);
  const activity=previewFromThread?(channelTime||storedTime):Math.max(storedTime,channelTime);
  const recent=m=>!threadMessage(m)&&!m.isSender&&Date.parse(m.timestamp)>Date.now()-30*86400000;
- const preview=channel?.text&&(previewFromThread||!c.preview?.text||channelTime>=storedTime)?{text:channel.text,senderName:channel.senderName,senderID:channel.senderID}:(previewFromThread?{text:''}:c.preview);
+ const preview=channel?.text&&(previewFromThread||!c.preview?.text||channelTime>=storedTime)?{text:channel.text,senderName:channel.senderName,senderID:channel.senderID,isSender:channel.isSender}:(previewFromThread?{text:''}:c.preview);
  return {...c,lastActivity:activity?new Date(activity).toISOString():c.lastActivity,direct:c.type==='single',signals:{mention:!!c.highlightCount||messages.some(m=>recent(m)&&m.isMention),replyToYou:messages.some(m=>recent(m)&&own.has(m.linkedMessageID))},preview};
 }
 
@@ -172,7 +172,7 @@ export class MatrixProvider{
    const locallyRead=old.localReadAt&&readBasis<=old.localReadAt;
    const readHighlightBaseline=old.localReadAt?Math.min(old.readHighlightBaseline??rawHighlights,rawHighlights):0;
    const lastActivity=channelEvent?.origin_server_ts?new Date(Math.max(channelEvent.origin_server_ts,Date.parse(old.lastActivity)||0)).toISOString():(old.lastActivity||new Date(0).toISOString());
-   const preview=channelEvent?.content?.body?{text:channelEvent.content.body,senderID:channelEvent.sender}:old.preview;
+   const preview=channelEvent?.content?.body?{text:channelEvent.content.body,senderID:channelEvent.sender,isSender:channelEvent.sender===this.account.userId}:old.preview;
    this.chats.set(roomId,{...old,id:roomId,accountID,network:network||networkFor(accountID||'matrix'),title,description,type,participants,lastActivity,rawHighlightCount:rawHighlights,readHighlightBaseline,highlightCount:locallyRead?0:Math.max(0,rawHighlights-readHighlightBaseline),unreadCount:locallyRead?0:notificationCount,isMarkedUnread:old.localMarkedUnread?true:locallyRead?false:marked??old.isMarkedUnread??false,isArchived:prefs.archived??old.isArchived??false,isMuted:old.isMuted||false,isReadOnly:false,capabilities:{reply:2,reaction:2,edit:2,archive:true,markAsUnread:true},preview});
   }
   if(snapshot.next_batch)this.syncToken=snapshot.next_batch;
@@ -209,7 +209,7 @@ export class MatrixProvider{
   const room=this.chats.get(event.roomId);
   if(event.kind==='message'){
    const message=this.normalizeMessage(event);const timeline=this.timelines.get(event.roomId)||[];const index=timeline.findIndex(m=>m.id===message.id);if(index>=0)timeline[index]=message;else timeline.push(message);timeline.sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));this.timelines.set(event.roomId,timeline);
-   if(room&&!threadMessage(message)&&Date.parse(message.timestamp)>=(Date.parse(room.lastActivity)||0)){room.preview={text:message.text,senderName:message.senderName,senderID:message.senderID};room.lastActivity=message.timestamp;}
+   if(room&&!threadMessage(message)&&Date.parse(message.timestamp)>=(Date.parse(room.lastActivity)||0)){room.preview={text:message.text,senderName:message.senderName,senderID:message.senderID,isSender:message.isSender};room.lastActivity=message.timestamp;}
   }else if(event.kind==='reaction'){
    const key=event.roomId+'|'+event.relatesTo;this.relationVersions.set(key,(this.relationVersions.get(key)||0)+1);const current=this.reactions.get(key)||this.archive?.message('matrix:'+event.roomId,event.relatesTo)?.reactions||[];const filtered=current.filter(r=>r.id!==event.eventId);if(event.added){const record=reactionRecord(event);if(record)filtered.push(record)}this.reactions.set(key,filtered);
   }else if(event.kind==='event'&&event.type==='m.room.redaction'){
@@ -231,26 +231,41 @@ export class MatrixProvider{
   let room=this.chats.get(roomId);if(!room){await this.refreshRooms();room=this.chats.get(roomId)}if(!room){const info=await this.client.rooms.get({roomId});room={id:roomId,accountID:'matrix',network:'Matrix',title:info.name||roomId,description:info.topic,type:info.isDM?'single':'group',participants:{items:[],total:info.memberCount||0,hasMore:false},lastActivity:new Date().toISOString(),unreadCount:0,isReadOnly:false,capabilities:{reply:2,reaction:2,edit:2,archive:true,markAsUnread:true}};this.chats.set(roomId,room);}
   const {members}=await this.client.rooms.listMembers({roomId,membership:'join'});room.participants={items:members.map(m=>({id:m.userId,fullName:m.displayName||m.userId,isSelf:m.userId===this.account.userId})),total:members.length,hasMore:false};return room;
  }
- async refreshReactions(roomId,items){
-  if(this.relationRefresh.has(roomId))return this.relationRefresh.get(roomId);
-  const due=items.filter(m=>Date.now()-(this.relationCache.get(roomId+'|'+m.id)||0)>300000);
-  if(!due.length)return;
-  const work=(async()=>{
-   for(let offset=0;offset<due.length;offset+=6)await Promise.all(due.slice(offset,offset+6).map(async m=>{
-    const key=roomId+'|'+m.id,version=this.relationVersions.get(roomId+'|'+m.id)||0;
-    try{const data=await this.raw('GET',`/_matrix/client/v1/rooms/${enc(roomId)}/relations/${enc(m.id)}/m.annotation/m.reaction`,undefined,{limit:'100'});if(version!==(this.relationVersions.get(key)||0))return;this.reactions.set(key,(data.chunk||[]).map(e=>reactionRecord({id:e.event_id,sender:e.sender,content:e.content})).filter(Boolean));this.relationCache.set(key,Date.now())}catch{}
-   }));
-   this.retain(roomId,items);this.scheduleSave();
-  })().finally(()=>{this.relationRefresh.delete(roomId)});
-  this.relationRefresh.set(roomId,work);return work;
+ async refreshReactions(roomId,items,fresh=false){
+  const due=items.filter(m=>fresh||Date.now()-(this.relationCache.get(roomId+'|'+m.id)||0)>300000);
+  for(let offset=0;offset<due.length;offset+=6)await Promise.all(due.slice(offset,offset+6).map(async m=>{
+   const key=roomId+'|'+m.id;
+   if(this.relationRefresh.has(key))return this.relationRefresh.get(key);
+   const version=this.relationVersions.get(key)||0;
+   const work=(async()=>{
+    try{
+     const records=new Map(),tokens=new Set();
+     let from;
+     do{
+      const data=await this.raw('GET',`/_matrix/client/v1/rooms/${enc(roomId)}/relations/${enc(m.id)}/m.annotation/m.reaction`,undefined,{limit:'100',...(from?{from}:{})});
+      for(const event of data.chunk||[]){
+       const record=reactionRecord({id:event.event_id,sender:event.sender,content:event.content});
+       if(record)records.set(record.id,record);
+      }
+      from=data.next_batch;
+      if(from&&tokens.has(from))return;
+      if(from)tokens.add(from);
+     }while(from);
+     if(version!==(this.relationVersions.get(key)||0))return;
+     this.reactions.set(key,[...records.values()]);this.relationCache.set(key,Date.now());
+    }catch{}
+   })().finally(()=>this.relationRefresh.delete(key));
+   this.relationRefresh.set(key,work);return work;
+  }));
+  if(due.length){this.retain(roomId,items);this.scheduleSave()}
  }
- async listMessages(roomId,cursor,direction,threadRoot){
-  const key=JSON.stringify([roomId,cursor||'',direction||'',threadRoot||'']);
+ async listMessages(roomId,cursor,direction,threadRoot,fresh=false){
+  const key=JSON.stringify([roomId,cursor||'',direction||'',threadRoot||'',fresh]);
   if(this.messageFetches.has(key))return this.messageFetches.get(key);
-  const work=this.fetchMessages(roomId,cursor,direction,threadRoot).finally(()=>{this.messageFetches.delete(key)});
+  const work=this.fetchMessages(roomId,cursor,direction,threadRoot,fresh).finally(()=>{this.messageFetches.delete(key)});
   this.messageFetches.set(key,work);return work;
  }
- async fetchMessages(roomId,cursor,direction,threadRoot){
+ async fetchMessages(roomId,cursor,direction,threadRoot,fresh){
   if(!this.chats.has(roomId))await this.getChat(roomId);
   const result=await this.client.messages.list({roomId,limit:50,...(threadRoot?{threadRoot}:{}),...(cursor?{cursor}:{}),direction:direction==='after'?'forward':'backward'});
   const items=result.messages.map(m=>this.normalizeMessage(m));
@@ -263,8 +278,10 @@ export class MatrixProvider{
   }
   for(const m of items)if(!m.threadRootID)m.replyCount=Math.max(m.replyCount||0,items.filter(reply=>reply.threadRootID===m.id).length);
   items.sort((a,b)=>Date.parse(a.timestamp)-Date.parse(b.timestamp));
-  // Cached emoji render with the text; recovering older reactions never blocks it.
-  this.refreshReactions(roomId,items).catch(e=>{this.error=e.message});
+  if(fresh){
+   await this.refreshReactions(roomId,items,true);
+   for(const item of items)item.reactions=this.reactions.get(roomId+'|'+item.id)||item.reactions;
+  }else this.refreshReactions(roomId,items).catch(e=>{this.error=e.message});
   const prior=this.timelines.get(roomId)||[];
   this.timelines.set(roomId,[...new Map([...prior,...items].map(m=>[m.id,m])).values()].sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp)));
   this.retain(roomId,items);
@@ -337,11 +354,11 @@ export class MatrixProvider{
    }
    if(eventId){
     if(method==='GET'){const {message}=await this.client.messages.get({roomId,eventId});if(!message)throw Object.assign(new Error('Message not found'),{status:404});return this.normalizeMessage(message)}
-    if(method==='PUT'){const r=await this.client.messages.edit({roomId,eventId,text:body.text});return {id:r.eventId,chatID:roomId,text:body.text}}
+    if(method==='PUT'){const r=await this.client.messages.edit({roomId,eventId,text:body.text,...(body.mentions?{html:body.html,mentions:body.mentions}:{})});return {id:r.eventId,chatID:roomId,text:body.text}}
     if(method==='DELETE'){await this.client.messages.redact({roomId,eventId});return {success:true}}
    }
    if(p.endsWith('/messages')){
-    if(method==='GET')return this.listMessages(roomId,q.get('cursor'),q.get('direction'),q.get('threadRoot'));
+    if(method==='GET')return this.listMessages(roomId,q.get('cursor'),q.get('direction'),q.get('threadRoot'),q.get('fresh')==='true');
     if(method==='POST'){
      let threadRoot=body.threadRootID;
      if(threadRoot&&(typeof threadRoot!=='string'||!threadRoot.startsWith('$')))throw Object.assign(new Error('Invalid thread root'),{status:400});
@@ -352,7 +369,7 @@ export class MatrixProvider{
       const message=target||this.normalizeMessage(fetched);
       threadRoot=message.threadRootID||message.id;
      }
-     let r;if(body.attachment){const upload=this.uploads.get(body.attachment.uploadID);if(!upload)throw new Error('Attachment upload expired');if(body.replyToMessageID)throw new Error('Replies with attachments are not yet supported by the independent transport. Send the text reply or attachment separately.');r=await this.client.messages.sendMedia({roomId,bytes:upload.bytes,filename:upload.name,contentType:upload.mime,caption:body.text,threadRoot,kind:upload.mime?.startsWith('image/')?'image':upload.mime?.startsWith('video/')?'video':upload.mime?.startsWith('audio/')?'audio':'file'});this.uploads.delete(body.attachment.uploadID)}else{if(!body.text?.trim())throw new Error('Message is empty');r=await this.client.messages.send({roomId,text:body.text,replyTo:body.replyToMessageID,threadRoot})}return {chatID:roomId,pendingMessageID:r.eventId};
+     let r;if(body.attachment){const upload=this.uploads.get(body.attachment.uploadID);if(!upload)throw new Error('Attachment upload expired');if(body.replyToMessageID)throw new Error('Replies with attachments are not yet supported by the independent transport. Send the text reply or attachment separately.');r=await this.client.messages.sendMedia({roomId,bytes:upload.bytes,filename:upload.name,contentType:upload.mime,caption:body.text,threadRoot,kind:upload.mime?.startsWith('image/')?'image':upload.mime?.startsWith('video/')?'video':upload.mime?.startsWith('audio/')?'audio':'file'});this.uploads.delete(body.attachment.uploadID)}else{if(!body.text?.trim())throw new Error('Message is empty');r=await this.client.messages.send({roomId,text:body.text,replyTo:body.replyToMessageID,threadRoot,...(body.mentions?{html:body.html,mentions:body.mentions}:{})})}return {chatID:roomId,pendingMessageID:r.eventId};
     }
    }
    if(method==='GET')return this.getChat(roomId);

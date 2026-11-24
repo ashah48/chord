@@ -146,6 +146,47 @@ test('direct conversations choose the other person for photos, excluding bridge 
  assert.equal(conversation.title,'Jiao Deng');assert.equal(conversation.contactIDs[0],jiao.id);
  assert.equal(conversation.contactIDs.includes(bot.id),false);assert.equal(conversation.contactIDs.includes(me.id),false);assert.equal(conversation.contactIDs.includes(other.id),true);
 });
+test('composer details retain the room nickname, other names, and cached custom emoji',()=>{
+ const book=memoryBook(),id='@discord_123:chord.local';
+ const person=book.observe({key:id,name:'Victoria',handle:'victoria23'});
+ person.customName='Vicky';
+ const directory=new Directory(book,{blue:async()=>[],config:()=>({})});
+ directory.catalog.rooms.set('!room',{network:'discord',serverID:'server'});
+ directory.catalog.discordEmoji=new Map([['server',new Map([['party','mxc://chord.local/party']])]]);
+ const details=directory.composerDetails('!room',{participants:{items:[{id,fullName:'Victoria B'}]}},{[id]:'Vic'});
+ assert.equal(details.participants.items[0].fullName,'Vic');
+ assert.deepEqual(details.participants.items[0].aliases,['Victoria B','Vicky','Victoria','victoria23']);
+ assert.deepEqual(details.customEmoji,[{name:'party',mxc:'mxc://chord.local/party'}]);
+});
+
+test('the self profile follows the conversation network and workspace',()=>{
+ const directory=new Directory(memoryBook(),{blue:async()=>[],config:()=>({})});
+ directory.catalog.selfIds=new Set([
+  '@max:chord.local','@discord_123:chord.local','@slack_tone-u1:chord.local',
+  '@slack_ttwo-u2:chord.local','@slack_ttwo-u3:chord.local',
+ ]);
+ const rooms=directory.catalog.rooms;
+ rooms.set('!buggy',{network:'discord',serverID:'buggy'});
+ rooms.set('!lab',{network:'slack',workspaceID:'TONE'});
+ rooms.set('!class',{network:'slack',workspaceID:'TTWO',receiver:'TTWO-U3'});
+ rooms.set('!ambiguous',{network:'slack',workspaceID:'TTWO'});
+ assert.equal(directory.selfProfileIdentity('!buggy'),'@discord_123:chord.local');
+ assert.equal(directory.selfProfileIdentity('!lab'),'@slack_tone-u1:chord.local');
+ assert.equal(directory.selfProfileIdentity('!class'),'@slack_ttwo-u3:chord.local');
+ assert.equal(directory.selfProfileIdentity('!ambiguous'),null);
+});
+
+test('inbox previews say You for the signed-in account and its bridge identities',()=>{
+ const book=memoryBook(),owner='@max:chord.local',puppet='@discord_123:chord.local',other='@discord_456:chord.local';
+ const directory=new Directory(book,{blue:async()=>[],config:()=>({matrixAccount:{userId:owner}})});
+ directory.catalog.selfIds.add(puppet);
+ for(const id of [owner,puppet,other])book.observe({key:id,name:'max'});
+ const conversation={id:'matrix:!dm',remoteId:'!dm',kind:'chat',source:'discord'};
+ for(const id of [owner,puppet])assert.equal(directory.enrichConversation({...conversation,previewSenderID:id}).previewSenderName,'You');
+ assert.equal(directory.enrichConversation({...conversation,previewSenderName:'max',previewIsSender:true}).previewSenderName,'You');
+ assert.equal(directory.enrichConversation({...conversation,previewSenderID:other}).previewSenderName,'max');
+});
+
 test('every inbox view sorts by recency, even when an older item has a higher importance score',()=>{
  const book=memoryBook();
  for(const id of ['new','old','invalid'])book.data.conversations[id]={priority:'important'};

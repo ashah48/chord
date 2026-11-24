@@ -27,17 +27,24 @@ fn media_group(key: &str) -> usize {
     }
 }
 
+#[derive(Clone)]
 pub enum Request {
     Image(Target),
     Avatar(String),
+    SelfAvatar(String),
     Emoji(String),
+    DiscordEmoji(String),
+    SlackEmoji { room: String, name: String },
 }
 impl Request {
     pub fn key(&self) -> String {
         match self {
             Self::Image(t) => t.key(),
             Self::Avatar(id) => format!("avatar:{id}"),
+            Self::SelfAvatar(conversation) => format!("avatar:self:{conversation}"),
             Self::Emoji(mxc) => format!("emoji:{mxc}"),
+            Self::DiscordEmoji(id) => format!("emoji:discord:{id}"),
+            Self::SlackEmoji { room, name } => format!("emoji:slack:{room}:{name}"),
         }
     }
 }
@@ -55,6 +62,35 @@ pub enum Event {
     File(std::path::PathBuf),
     Notice(String),
     Search(u64, Result<serde_json::Value, String>),
+    ComposerRoom(String, Vec<MentionMember>, Vec<RoomEmoji>),
+    DiscordEmojis(String, Result<Vec<DiscordEmoji>, String>),
+    DiscordReaction(String, String, Result<String, String>),
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionMember {
+    pub id: String,
+    pub full_name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub is_self: bool,
+}
+
+#[derive(serde::Deserialize)]
+pub struct RoomEmoji {
+    pub name: String,
+    pub mxc: Option<String>,
+    #[serde(default)]
+    pub thumbnail: bool,
+}
+
+#[derive(Clone, serde::Deserialize)]
+pub struct DiscordEmoji {
+    pub id: String,
+    pub name: String,
+    pub mxc: Option<String>,
 }
 pub struct Media {
     pub cache: HashMap<String, Entry>,
@@ -80,7 +116,7 @@ impl Default for Media {
 impl Media {
     pub fn request(&mut self, request: Request, api: Option<Api>, ctx: &egui::Context) {
         let key = request.key();
-        let avatar = matches!(&request, Request::Avatar(_));
+        let avatar = matches!(&request, Request::Avatar(_) | Request::SelfAvatar(_));
         let retry = matches!(self.cache.get(&key), Some(Entry::Failed(_)))
             && self
                 .retries
@@ -101,7 +137,10 @@ impl Media {
         if avatar {
             self.pending_avatars += 1;
         }
-        let emoji = matches!(&request, Request::Emoji(_));
+        let emoji = matches!(
+            &request,
+            Request::Emoji(_) | Request::DiscordEmoji(_) | Request::SlackEmoji { .. }
+        );
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
@@ -109,7 +148,10 @@ impl Media {
     let value=match request {
      Request::Image(t)=>api.post(&Api::conversation(&t.chat,"attachment"),serde_json::json!({"messageID":t.message,"index":t.index,"attachmentID":t.attachment["id"]})).await?,
      Request::Avatar(id)=>api.get(&format!("/api/contacts/{}/avatar",urlencoding::encode(&id))).await?,
+     Request::SelfAvatar(conversation)=>api.get(&Api::conversation(&conversation,"self-avatar")).await?,
      Request::Emoji(mxc)=>api.get(&format!("/api/matrix/emoji?mxc={}",urlencoding::encode(&mxc))).await?,
+     Request::DiscordEmoji(id)=>api.get(&format!("/api/discord/emoji-image?id={}",urlencoding::encode(&id))).await?,
+     Request::SlackEmoji { room, name }=>api.get(&format!("/api/slack/emoji-image?roomID={}&name={}",urlencoding::encode(&room),urlencoding::encode(&name))).await?,
     };
     let encoded=value["data"].as_str().ok_or_else(||anyhow::anyhow!("No image data"))?.to_owned();
     let permit = IMAGE_DECODES.acquire().await?;

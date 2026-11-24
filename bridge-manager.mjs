@@ -27,4 +27,16 @@ export async function submitBridgeLogin(config,id,values){
  return accept(config,id,await call(config,id,`/v3/login/step/${encodeURIComponent(state.login_id)}/${encodeURIComponent(state.step_id)}/${state.type}${txn}`,'POST',values));
 }
 export async function guilds(config){return call(config,'discord','/v1/guilds')}
+export async function discordRoomEmoji(config,roomID,emojiID){
+ if(!roomID?.startsWith('!')||emojiID&&!/^\d{15,22}$/.test(emojiID))throw Object.assign(new Error('Invalid Discord emoji request'),{status:400});
+ const query=new URLSearchParams({room_id:roomID});
+ if(emojiID)query.set('emoji_id',emojiID);
+ return call(config,'discord','/v1/room-emoji?'+query,'GET',undefined,15000);
+}
+export async function discordRoomNicknames(config,roomID){
+ return call(config,'discord','/v1/room-nicknames?'+new URLSearchParams({room_id:roomID}),'GET',undefined,3000);
+}
+export async function discordReactionCounts(config,roomID,messages){
+ return call(config,'discord','/v1/room-reactions?'+new URLSearchParams({room_id:roomID}),'POST',{messages},12000);
+}
 export async function enableGuild(config,id){if(!/^\d+$/.test(id))throw new Error('Invalid guild ID');return call(config,'discord','/v1/guilds/'+id,'POST',{auto_create_channels:true})}

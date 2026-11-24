@@ -2,6 +2,7 @@
 
 Run in nix-shell -p python3Packages.pillow --run
 'python scripts/build-emoji-atlas.py private/twemoji-17.0.3.tar.gz'.
+Pass Unicode's emoji-test.txt as a second argument to regenerate the catalog.
 """
 import io
 import json
@@ -27,3 +28,17 @@ with tarfile.open(sys.argv[1]) as archive:
     license_entry = next(m for m in archive.getmembers() if m.name.endswith('/LICENSE-GRAPHICS'))
     (root / 'Twemoji-LICENSE.txt').write_bytes(archive.extractfile(license_entry).read())
     print(f'{len(entries)} emoji; atlas {atlas.size}')
+
+if len(sys.argv) > 2:
+    with (root / 'emoji-catalog.tsv').open('w', encoding='utf-8') as output:
+        print('# Unicode Emoji 17.0 — https://www.unicode.org/Public/17.0.0/emoji/emoji-test.txt', file=output)
+        print('# Copyright © 2025 Unicode, Inc. See Unicode-Emoji-LICENSE.txt.', file=output)
+        for line in Path(sys.argv[2]).read_text(encoding='utf-8').splitlines():
+            if line.startswith('# group: '):
+                print(f'[{line[9:]}]', file=output)
+            elif ';' in line and not line.startswith('#'):
+                _, rest = line.split(';', 1)
+                status, _, item = rest.partition('#')
+                if status.strip() in ('fully-qualified', 'component'):
+                    glyph, _, name = item.split(maxsplit=2)
+                    print(glyph, name, sep='\t', file=output)

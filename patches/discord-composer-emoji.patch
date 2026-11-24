@@ -1,0 +1,113 @@
+--- a/formatter.go
++++ b/formatter.go
+@@ -98,6 +98,7 @@
+ const formatterContextPortalKey = "fi.mau.discord.portal"
+ const formatterContextAllowedMentionsKey = "fi.mau.discord.allowed_mentions"
+ const formatterContextInputAllowedMentionsKey = "fi.mau.discord.input_allowed_mentions"
++const chordFormatterSessionKey = "chord.discord.session"
+ const formatterContextInputAllowedLinkPreviewsKey = "fi.mau.discord.input_allowed_link_previews"
+ 
+ func appendIfNotContains(arr []string, newItem string) []string {
+@@ -213,6 +214,10 @@
+ 			// If we're in a code block, don't escape markdown
+ 			return s
+ 		}
++		if session, _ := ctx.ReturnData[chordFormatterSessionKey].(*discordgo.Session); session != nil && !ctx.TagStack.Has("a") {
++			portal := ctx.ReturnData[formatterContextPortalKey].(*Portal)
++			return portal.formatDiscordShortcodes(s, session)
++		}
+ 		return escapeDiscordMarkdown(s)
+ 	},
+ 	SpoilerConverter: func(text, reason string, ctx format.Context) string {
+@@ -239,7 +244,7 @@
+ 	},
+ }
+ 
+-func (portal *Portal) parseMatrixHTML(content *event.MessageEventContent, allowedLinkPreviews []string) (string, *discordgo.MessageAllowedMentions) {
++func (portal *Portal) parseMatrixHTML(content *event.MessageEventContent, allowedLinkPreviews []string, session *discordgo.Session) (string, *discordgo.MessageAllowedMentions) {
+ 	allowedMentions := &discordgo.MessageAllowedMentions{
+ 		Parse:       []discordgo.AllowedMentionType{},
+ 		Users:       []string{},
+@@ -249,12 +254,50 @@
+ 		ctx := format.NewContext()
+ 		ctx.ReturnData[formatterContextInputAllowedLinkPreviewsKey] = allowedLinkPreviews
+ 		ctx.ReturnData[formatterContextPortalKey] = portal
++		ctx.ReturnData[chordFormatterSessionKey] = session
+ 		ctx.ReturnData[formatterContextAllowedMentionsKey] = allowedMentions
+ 		if content.Mentions != nil {
+ 			ctx.ReturnData[formatterContextInputAllowedMentionsKey] = content.Mentions.UserIDs
+ 		}
+ 		return variationselector.FullyQualify(matrixHTMLParser.Parse(content.FormattedBody, ctx)), allowedMentions
+ 	} else {
+-		return variationselector.FullyQualify(escapeDiscordMarkdown(content.Body)), allowedMentions
+-	}
+-}
++		return variationselector.FullyQualify(portal.formatDiscordShortcodes(content.Body, session)), allowedMentions
++	}
++}
++
++var chordEmojiShortcode = regexp.MustCompile(`:[A-Za-z0-9_~]+:`)
++
++func (portal *Portal) formatDiscordShortcodes(text string, session *discordgo.Session) string {
++	matches := chordEmojiShortcode.FindAllStringIndex(text, -1)
++	if session == nil || portal.GuildID == "" || len(matches) == 0 {
++		return escapeDiscordMarkdown(text)
++	}
++	guild, err := session.State.Guild(portal.GuildID)
++	if err != nil {
++		return escapeDiscordMarkdown(text)
++	}
++	session.State.RLock()
++	emojis := make(map[string]string, len(guild.Emojis))
++	for _, emoji := range guild.Emojis {
++		if emoji != nil && emoji.ID != "" && emoji.Name != "" {
++			emojis[strings.ToLower(emoji.Name)] = emoji.MessageFormat()
++		}
++	}
++	session.State.RUnlock()
++
++	var output strings.Builder
++	offset := 0
++	for _, match := range matches {
++		start, end := match[0], match[1]
++		if start > 0 && !strings.ContainsRune(" \t\n([{", rune(text[start-1])) {
++			continue
++		}
++		if emoji, ok := emojis[strings.ToLower(text[start+1:end-1])]; ok {
++			output.WriteString(escapeDiscordMarkdown(text[offset:start]))
++			output.WriteString(emoji)
++			offset = end
++		}
++	}
++	output.WriteString(escapeDiscordMarkdown(text[offset:]))
++	return output.String()
++}
+--- a/portal.go
++++ b/portal.go
+@@ -1552,7 +1552,7 @@
+ 		edits := portal.bridge.DB.Message.GetByMXID(portal.Key, editMXID)
+ 		if edits != nil {
+ 			newContentRaw, _ := evt.Content.Raw["m.new_content"].(map[string]any)
+-			discordContent, allowedMentions := portal.parseMatrixHTML(content.NewContent, parseAllowedLinkPreviews(newContentRaw))
++			discordContent, allowedMentions := portal.parseMatrixHTML(content.NewContent, parseAllowedLinkPreviews(newContentRaw), sess)
+ 			var err error
+ 			var msg *discordgo.Message
+ 			if !isWebhookSend {
+@@ -1631,7 +1631,7 @@
+ 	}
+ 	switch content.MsgType {
+ 	case event.MsgText, event.MsgEmote, event.MsgNotice:
+-		sendReq.Content, sendReq.AllowedMentions = portal.parseMatrixHTML(content, parseAllowedLinkPreviews(evt.Content.Raw))
++		sendReq.Content, sendReq.AllowedMentions = portal.parseMatrixHTML(content, parseAllowedLinkPreviews(evt.Content.Raw), sess)
+ 		if content.MsgType == event.MsgEmote {
+ 			sendReq.Content = fmt.Sprintf("_%s_", sendReq.Content)
+ 		}
+@@ -1644,7 +1644,7 @@
+ 		filename := content.Body
+ 		if content.FileName != "" && content.FileName != content.Body {
+ 			filename = content.FileName
+-			sendReq.Content, sendReq.AllowedMentions = portal.parseMatrixHTML(content, parseAllowedLinkPreviews(evt.Content.Raw))
++			sendReq.Content, sendReq.AllowedMentions = portal.parseMatrixHTML(content, parseAllowedLinkPreviews(evt.Content.Raw), sess)
+ 		}
+ 
+ 		if evt.Content.Raw["page.codeberg.everypizza.msc4193.spoiler"] == true {

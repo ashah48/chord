@@ -257,6 +257,7 @@ async fn call(api: &Api, name: &str, mut args: Value) -> Result<Value> {
                 args["cursor"].as_str(),
                 args["server"].as_str(),
                 &[],
+                &[],
             )
             .await
         }

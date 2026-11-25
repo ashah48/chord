@@ -403,7 +403,7 @@ fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
         });
         let welcome = vec![
             Line::from(""),
-            Line::from(Span::styled("c·", Style::new().fg(t.green).bold())),
+            Line::from(Span::styled("Chord", Style::new().fg(t.green).bold())),
             Line::from(""),
             Line::from(Span::styled(
                 "A little less switching.",

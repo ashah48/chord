@@ -171,8 +171,7 @@ impl Gui {
         ctx.set_fonts(fonts);
     }
     fn show_logo(&mut self, ui: &mut egui::Ui, size: f32, fallback: RichText) {
-        if cfg!(target_os = "macos")
-            && self.logo.is_none()
+        if self.logo.is_none()
             && let Ok(icon) = image::load_from_memory(include_bytes!("../assets/macos/icon.png"))
         {
             let side = icon.width() * 824 / 1024;
@@ -190,9 +189,7 @@ impl Gui {
                 egui::TextureOptions::LINEAR,
             ));
         }
-        if cfg!(target_os = "macos")
-            && let Some(logo) = &self.logo
-        {
+        if let Some(logo) = &self.logo {
             ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(size)));
         } else {
             ui.label(fallback);
@@ -282,7 +279,7 @@ impl Gui {
                     self.show_logo(
                         ui,
                         30.,
-                        RichText::new("c·").size(30.).color(p.accent).strong(),
+                        RichText::new("Chord").size(30.).color(p.accent).strong(),
                     );
                     ui.add_space(10.);
                     egui::containers::menu::MenuButton::new("⚙")
@@ -1178,7 +1175,7 @@ impl Gui {
                 let Some(chat) = self.app.active.clone() else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() * 0.32);
-                        self.show_logo(ui, 64., RichText::new("c·").size(58.).color(p.accent));
+                        self.show_logo(ui, 64., RichText::new("Chord").size(58.).color(p.accent));
                         ui.heading("Your conversations");
                         ui.label(
                             RichText::new("Slack, Discord, WhatsApp, Messages, and email")
@@ -1742,9 +1739,9 @@ impl Gui {
             && self.reaction_target.is_none()
             && self.reaction_detail.is_none()
             && !egui::Popup::is_any_open(ui.ctx())
-            && !ui
+            && ui
                 .memory(|memory| memory.focused())
-                .is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some())
+                .is_none_or(|id| egui::TextEdit::load_state(ui.ctx(), id).is_none())
         {
             message_shortcut(ui, can_reply, can_edit)
         } else {
@@ -1782,7 +1779,7 @@ impl Gui {
         if show_actions {
             egui::Frame::new()
                 .fill(p.bg)
-                .stroke(egui::Stroke::new(1., p.line))
+                .stroke(egui::Stroke::new(1.0_f32, p.line))
                 .corner_radius(8)
                 .inner_margin(ACTION_PADDING)
                 .show(&mut toolbar, |ui| {
@@ -1811,7 +1808,7 @@ impl Gui {
                                 ui.allocate_exact_size(egui::vec2(1., 15.), egui::Sense::hover());
                             ui.painter().line_segment(
                                 [divider.center_top(), divider.center_bottom()],
-                                egui::Stroke::new(1., p.line),
+                                egui::Stroke::new(1.0_f32, p.line),
                             );
                         }
                         if can_react {
@@ -1870,18 +1867,17 @@ impl Gui {
                     });
                 });
         }
-        if has_thread {
-            if !reaction_clicked.get()
-                && (response.clicked() || thread_clicked)
-                && !response.double_clicked()
-            {
-                let target = (chat.id.clone(), m.id.clone());
-                if self.expanded_thread.as_ref() == Some(&target) {
-                    self.expanded_thread = None;
-                } else {
-                    self.expanded_thread = Some(target);
-                    self.app.load_inline_thread(&m.id);
-                }
+        if has_thread
+            && !reaction_clicked.get()
+            && (response.clicked() || thread_clicked)
+            && !response.double_clicked()
+        {
+            let target = (chat.id.clone(), m.id.clone());
+            if self.expanded_thread.as_ref() == Some(&target) {
+                self.expanded_thread = None;
+            } else {
+                self.expanded_thread = Some(target);
+                self.app.load_inline_thread(&m.id);
             }
         }
         if synced && chat.can_react {
@@ -2278,7 +2274,7 @@ impl Gui {
             .frame(
                 egui::Frame::popup(&ctx.style())
                     .fill(p.panel)
-                    .stroke(egui::Stroke::new(1., p.line))
+                    .stroke(egui::Stroke::new(1.0_f32, p.line))
                     .inner_margin(10.)
                     .corner_radius(10),
             )
@@ -2745,7 +2741,7 @@ impl Gui {
             return;
         };
         let query = query.to_lowercase();
-        if !edit.response.has_focus() && !(menu.visible && over_popup) {
+        if !(edit.response.has_focus() || menu.visible && over_popup) {
             store(ComposerCompletionMenu::default());
             return;
         }
@@ -2903,7 +2899,7 @@ impl Gui {
         .frame(
             egui::Frame::popup(ui.style())
                 .fill(p.panel)
-                .stroke(egui::Stroke::new(1., p.line))
+                .stroke(egui::Stroke::new(1.0_f32, p.line))
                 .inner_margin(6)
                 .corner_radius(8),
         )
@@ -4222,7 +4218,7 @@ fn message_action(ui: &mut egui::Ui, action: MessageAction, p: Palette) -> egui:
     let center = response.rect.center();
     let at = |x, y| center + egui::vec2(x, y);
     let ink = if response.hovered() { p.text } else { p.muted };
-    let stroke = egui::Stroke::new(1.5, ink);
+    let stroke = egui::Stroke::new(1.5_f32, ink);
     let painter = ui.painter();
     match action {
         MessageAction::React => {
@@ -4538,16 +4534,13 @@ pub fn run(app: App, smoke: Option<AppearanceSmokeTest>) -> anyhow::Result<()> {
         .with_app_id("dev.chord.Chord")
         .with_inner_size([1240., 820.])
         .with_min_inner_size([760., 520.]);
-    // Without an explicit icon, eframe replaces the bundle's Dock icon with the egui logo.
-    if cfg!(target_os = "macos") {
-        let icon =
-            image::load_from_memory(include_bytes!("../assets/macos/icon.png"))?.into_rgba8();
-        viewport = viewport.with_icon(egui::IconData {
-            width: icon.width(),
-            height: icon.height(),
-            rgba: icon.into_raw(),
-        });
-    }
+    // Without an explicit icon, eframe uses the egui logo for the window and the Dock.
+    let icon = image::load_from_memory(include_bytes!("../assets/macos/icon.png"))?.into_rgba8();
+    viewport = viewport.with_icon(egui::IconData {
+        width: icon.width(),
+        height: icon.height(),
+        rgba: icon.into_raw(),
+    });
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Glow,

@@ -25,10 +25,11 @@ nix-shell shell.nix --run './scripts/bootstrap.sh'
 ./scripts/launch.sh
 ```
 
-Bootstrap initializes the pinned upstream submodules, applies Chord's Matrix
-history/media patch, installs project dependencies, and builds the release
-client. It can be run again. Conflicting vendor edits stop the bootstrap for
-review. Dependencies stay in the project and temporary Nix shells.
+Bootstrap installs project dependencies and builds the release client. Beeper's
+Pickle and ai-bridge source code is included under `vendor/`, with Chord's Matrix
+history/media fixes already applied. No submodule setup is needed. See
+`vendor/README.md` for upstream revisions and local changes. Dependencies stay
+in the project and temporary Nix shells.
 
 The launcher reuses an already running local engine and API. It starts
 project-owned processes when needed. The first engine build may take several
@@ -164,7 +165,7 @@ API reads return `_cache` metadata when served from storage. `fresh=true` or the
 `X-Chord-Refresh: true` header requests revalidation while keeping cached content
 available to concurrent readers.
 
-## Search and Important mode
+## Search and Inbox filters
 
 Ctrl+K focuses search. Choose Conversations to search conversation names and
 Gmail, or Message text to search every locally retained message, including older
@@ -178,11 +179,10 @@ Local coverage expands as history syncs or is fetched. Gmail syntax remains avai
 in Conversations and the mail search API. `/api/search?remote=true&query=...` explicitly
 searches providers using the original unified search.
 
-The All tab opens by default. Mark a conversation Important from its menu to
-include it in the Important tab. Drag a conversation to the top or choose Pin
-to place it above other conversations in the current list. A conversation can
-be both pinned and Important. Muting still controls unread badges. Existing
-Unimportant rules revert to the normal setting.
+Inbox shows conversations by default. Use **Mark as unimportant** in a
+conversation's menu to hide it, then check **Show unimportant** to reveal it
+or choose **Restore to Inbox**. **Unread only** works with either view.
+Pins still control ordering, and muting still controls unread badges.
 
 Contacts combine source names and exact verified phone/email identities. Matching
 names alone never merge people. Profiles support local names, favorites, explicit
@@ -195,8 +195,8 @@ Discord attention rules can be configured locally under `discordAttention` in
 and `mentionsOnlyServerIDs` allows unread badges only for unread highlighted mentions.
 Discord unread badges reflect those rules. All servers
 remain searchable in the picker; Show other servers reveals the full list.
-Other Discord channels stay accessible under All Discord channels and search, with
-unread badges suppressed. These rules do not alter network read receipts or mute settings.
+All Discord channels appear in Inbox unless marked unimportant. Channels outside
+the unread rules keep their unread badges suppressed. These rules do not alter network read receipts or mute settings.
 
 Double-click or right-click a message to open the reaction picker on supported chat
 connections, including Slack, Discord, WhatsApp, and Matrix. Selecting your existing
@@ -220,7 +220,7 @@ operation documentation is available at `GET /api/openapi.json`.
 | Endpoint | Use |
 | --- | --- |
 | `GET /api/connections` | Live connection states, `refresh=true` bypasses the 30-second cache |
-| `GET /api/inbox?view=focus` | Conversations manually marked Important |
+| `GET /api/inbox?view=inbox` | Inbox without conversations marked unimportant |
 | `GET /api/inbox?view=all&source=slack` | Per-source inbox, with pagination |
 | `GET /api/search?query=...` | Unified message and email search |
 | `GET /api/conversations/{id}/messages` | Conversation history with attachments and reactions |

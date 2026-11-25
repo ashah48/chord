@@ -1,0 +1,17 @@
+{
+  "name": "@beeper/pickle-example-beeper-streaming-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "create-account": "node src/create-account.mjs",
+    "start": "node src/index.mjs"
+  },
+  "dependencies": {
+    "@beeper/pickle-chat-adapter": "workspace:*",
+    "@beeper/pickle": "workspace:*",
+    "chat": "^4.26.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

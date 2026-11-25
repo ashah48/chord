@@ -17,9 +17,9 @@ import {matrixAction,closeMatrixWorker} from './matrix-transport.mjs';
 import {searchMessages} from './search.mjs';
 import {connectionStates} from './connections.mjs';
 import {avatarService} from './avatars.mjs';
-import {downloadEmoji} from './emoji-media.mjs';
+import {downloadEmoji,downloadDiscordEmoji,downloadSlackEmoji} from './emoji-media.mjs';
 import {applyLocalRules,rankInbox} from './importance.mjs';
-import {bridgeInfo,startBridgeLogin,submitBridgeLogin,loginState,guilds,enableGuild} from './bridge-manager.mjs';
+import {bridgeInfo,startBridgeLogin,submitBridgeLogin,loginState,guilds,enableGuild,discordRoomEmoji,discordRoomNicknames,discordReactionCounts} from './bridge-manager.mjs';
 
 export const root=path.dirname(fileURLToPath(import.meta.url));
 const run=promisify(execFile),port=Number(process.env.PORT||4789),dataDir=process.env.CHORD_DATA_DIR||path.join(root,'private'),file=path.join(dataDir,'config.json');
@@ -32,8 +32,11 @@ const readCache=new ReadCache(path.join(dataDir,'read-cache.sqlite'),{namespace,
 archive.start();
 const timelineSeed=new TimelineSeed(dataDir);
 const directory=await Directory.open(dataDir,{blue:blueCached,config:()=>config});
-function importantConversationIDs(){
- return Object.keys(directory.book.data.conversations).filter(id=>directory.book.preference(id).priority==='important');
+function conversationIDsWithPriority(priority){
+ return Object.keys(directory.book.data.conversations).filter(id=>directory.book.preference(id).priority===priority);
+}
+function hiddenDiscordServers(url){
+ return new Set(url.searchParams.get('view')==='inbox'?url.searchParams.getAll('hideDiscordServer'):[]);
 }
 function queryKey(url){const q=new URLSearchParams(url.searchParams);q.delete('fresh');q.sort();return q.toString()}
 function blueCached(method,signature='',args=[]){return readCache.get('blue:'+method+':'+JSON.stringify(args),()=>blue(method,signature,args),{maxAge:method==='ListContacts'?3600000:5000})}
@@ -46,16 +49,17 @@ async function seedInbox(url){
  const known=new Map();for(const row of previous)for(const c of row.value.items||[])known.set(c.id,c);
  for(const c of await timelineSeed.chats()){
   const id='matrix:'+c.id;
-  if(!known.has(id))known.set(id,{...c,id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||'',unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,direct:c.type==='single',participants:(c.participants?.items||[]).map(p=>p.id),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly});
+  if(!known.has(id))known.set(id,{...c,id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||'',previewSenderName:c.preview?.senderName||'',previewSenderID:c.preview?.senderID,previewIsSender:c.preview?.isSender===true,unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,direct:c.type==='single',participants:(c.participants?.items||[]).map(p=>p.id),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly});
  }
  const view=url.searchParams.get('view')||'all',pinned=new Set(url.searchParams.getAll('pin'));
- const marked=view==='focus'?new Set(importantConversationIDs()):null;
- const candidates=[...known.values()].filter(c=>(!marked||marked.has(c.id))&&!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query)));
+ const marked=view==='focus'?new Set(conversationIDsWithPriority('important')):null;
+ const hiddenServers=hiddenDiscordServers(url);
+ const candidates=[...known.values()].filter(c=>(c.source!=='discord'||!hiddenServers.has(directory.catalog.rooms.get(c.remoteId)?.serverID))&&(view!=='inbox'||directory.book.preference(c.id).priority!=='unimportant')&&(!marked||marked.has(c.id))&&!isStatusConversation(c,config.matrixAccount?.userId)&&(config.emailEnabled!==false||c.kind!=='email')&&!c.isArchived&&(source==='all'||c.source===source)&&(!query||c.title?.toLowerCase().includes(query)));
  candidates.sort((a,b)=>(Date.parse(b.timestamp)||0)-(Date.parse(a.timestamp)||0));
  let matrixCount=0;
  let items=candidates.filter(c=>!c.id.startsWith('matrix:')||matrixCount++<200||pinned.has(c.id)).map(c=>directory.enrichConversation(c));
  if(!items.length)return undefined;
- items=applyLocalRules(applyAttention(items,config.discordAttention,{server,query}),directory.book);
+ items=applyLocalRules(applyAttention(items,config.discordAttention),directory.book);
  if(unread)items=items.filter(c=>c.unread);if(server)items=items.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));
  return {...rankInbox(items,directory.book,{view}),errors:[],cursors:{},hasMore:false};
 }
@@ -69,6 +73,31 @@ async function cachedMessages(id,url){
  }
  const context={conversationID:c.threadRoot?'matrix:'+c.remote:id};
  return readCache.get(key,async()=>{await directory.refresh();const page=await conversation(id,url);page.items=await directory.enrichMessages(page.items||[],{source:c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network,workspaceID:directory.catalog.rooms.get(c.remote)?.workspaceID});context.conversation=directory.conversations.get(id)||{source:c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network};return page},{context,maxAge:c.kind==='mail'?15000:2000,fresh:url.searchParams.get('fresh')==='true',seed:!url.searchParams.has('cursor')?async()=>{const sourceFor=()=>c.kind==='mail'?'mail:'+c.account:c.kind==='blueferry'?'iphone':directory.catalog.rooms.get(c.remote)?.network;const local=archive.store.page(id);if(local.items.length){await directory.refresh();local.items=await directory.enrichMessages(local.items,{source:sourceFor(),workspaceID:directory.catalog.rooms.get(c.remote)?.workspaceID});return {...local,hasMore:false,oldestCursor:null}}const page=await timelineSeed.page(id);if(!page)return;page.items=await directory.enrichMessages(page.items,{source:timelineSeed.rooms.get(c.remote)?.accountID||sourceFor(),workspaceID:directory.catalog.rooms.get(c.remote)?.workspaceID});return page}:undefined});
+}
+async function addDiscordReactionCounts(id,page,fresh){
+ const c=parseConversation(id);
+ if(c.kind!=='matrix'||!page.items?.length)return page;
+ await directory.refresh();
+ if(directory.catalog.rooms.get(c.remote)?.network!=='discord')return page;
+ const messages=[...new Set(page.items.map(m=>m.id).filter(id=>id?.startsWith('$')))].sort();
+ if(!messages.length)return page;
+ const key='discord-reaction-counts:'+c.remote+':'+createHash('sha256').update(JSON.stringify(messages)).digest('hex');
+ try{
+  const counts=await readCache.get(key,()=>discordReactionCounts(config,c.remote,messages),{maxAge:15000,fresh});
+  return {...page,items:page.items.map(message=>{
+   const summaries=counts[message.id];
+   if(!Array.isArray(summaries))return message;
+   const own=reaction=>reaction.participantName==='You'||directory.catalog.selfIds.has(reaction.participantID);
+   const identity=key=>key?.startsWith('mxc://')?key:key?.replaceAll('\uFE0F','');
+   const reactions=[];
+   for(const summary of summaries){
+    const matches=(message.reactions||[]).filter(reaction=>identity(reaction.reactionKey)===identity(summary.key));
+    reactions.push(...matches.filter(reaction=>summary.mine||!own(reaction)).map(reaction=>({...reaction,reactionKey:summary.key})));
+    if(summary.mine&&!matches.some(own))reactions.push({reactionKey:summary.key,participantName:'You',participantID:config.matrixAccount.userId});
+   }
+   return {...message,reactions,reactionCounts:summaries};
+  })};
+ }catch{return page}
 }
 const warmQueue=[],warmSeen=new Map();let warmActive=0;
 function warmConversations(items){
@@ -92,6 +121,22 @@ async function connections(force=false){
  if(connectionWork)return connectionWork;
  connectionWork=connectionStates({config,bridgeInfo,mailAccounts,checkMail,blue}).then(v=>connectionCache=v).finally(()=>{connectionWork=null});return connectionWork;
 }
+const discordEmojiMaxAge=5*60*1000;
+function discordEmojiCatalog(roomID,serverID){
+ return readCache.get('discord-emoji-catalog:'+(serverID||roomID),()=>discordRoomEmoji(config,roomID),{maxAge:discordEmojiMaxAge});
+}
+let lastDiscordEmojiWarm=0;
+async function warmDiscordEmojiCatalogs(){
+ if(Date.now()-lastDiscordEmojiWarm<discordEmojiMaxAge)return;
+ lastDiscordEmojiWarm=Date.now();
+ const info=await bridgeInfo(config,'discord');
+ if(!(info.Discord||info.discord)?.connected)return;
+ const servers=new Map();
+ for(const [roomID,room] of directory.catalog.rooms){
+  if(room.network==='discord'&&room.serverID)servers.set(room.serverID,roomID);
+ }
+ for(const [serverID,roomID] of servers)await discordEmojiCatalog(roomID,serverID).catch(()=>{});
+}
 function equal(a,b){const x=Buffer.from(a||''),y=Buffer.from(b||'');return x.length===y.length&&timingSafeEqual(x,y)}
 async function input(req){let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>32*1024*1024)throw Object.assign(new Error('Request exceeds 32 MB'),{status:413})}try{return raw?JSON.parse(raw):{}}catch{throw Object.assign(new Error('Invalid JSON'),{status:400})}}
 function json(res,value,status=200){res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});res.end(JSON.stringify(value))}
@@ -113,8 +158,13 @@ async function inbox(url){
  const server=params.get('server');
  if(server&&!/^(all|dm|[0-9]+)$/.test(server))throw Object.assign(new Error('Invalid Discord server'),{status:400});
  const pinSet=new Set(params.getAll('pin')),items=[],errors=[],cursors={},jobs=[];
- const marked=view==='focus'?importantConversationIDs():null;
+ const marked=view==='focus'?conversationIDsWithPriority('important'):null;
  const matrixMarked=marked?.filter(id=>id.startsWith('matrix:'))??[];
+ const hidden=new Set(view==='inbox'?conversationIDsWithPriority('unimportant'):[]);
+ const hiddenServers=hiddenDiscordServers(url);
+ if(hiddenServers.size)for(const [id,room] of directory.catalog.rooms){
+  if(room.network==='discord'&&hiddenServers.has(room.serverID))hidden.add('matrix:'+id);
+ }
  let continuation;
  if(cursor?.startsWith('{')){
   try{continuation=JSON.parse(cursor)}catch{throw Object.assign(new Error('Invalid inbox cursor'),{status:400})}
@@ -132,9 +182,10 @@ async function inbox(url){
   if(continuation?.matrix)q.set('cursor',continuation.matrix);
   if(query)q.set('query',query);
   if(marked)for(const id of matrixMarked)q.append('onlyRoom',id.slice(7));
+  for(const id of hidden)if(id.startsWith('matrix:'))q.append('excludeRoom',id.slice(7));
   if(!continuation)for(const id of pinSet)if(id.startsWith('matrix:'))q.append('includeRoom',id.slice(7));
   const d=await matrix('/v1/chats'+(query?'/search':'')+'?'+q);
-  items.push(...(d.items||[]).filter(c=>!c.accountID?.includes('blueferry')).map(c=>({...c,id:'matrix:'+c.id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||c.network||'',previewSenderName:c.preview?.senderName||'',previewSenderID:c.preview?.senderID,unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,participants:(Array.isArray(c.participants)?c.participants:(c.participants?.items||[])).map(p=>typeof p==='string'?p:p.id).filter(Boolean),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly})));
+  items.push(...(d.items||[]).filter(c=>!c.accountID?.includes('blueferry')).map(c=>({...c,id:'matrix:'+c.id,remoteId:c.id,kind:'chat',source:c.accountID,title:c.title,preview:c.preview?.text||c.network||'',previewSenderName:c.preview?.senderName||'',previewSenderID:c.preview?.senderID,previewIsSender:c.preview?.isSender===true,unread:!!(c.unreadCount||c.isMarkedUnread),timestamp:c.lastActivity,participants:(Array.isArray(c.participants)?c.participants:(c.participants?.items||[])).map(p=>typeof p==='string'?p:p.id).filter(Boolean),canReply:!c.isReadOnly,canReact:!c.isReadOnly,canSend:!c.isReadOnly})));
   if(d.hasMore&&d.oldestCursor)cursors.matrix=d.oldestCursor;
  });
  if(!continuation&&(source==='all'||source==='iphone')&&(!marked||marked.some(id=>id.startsWith('blueferry:'))))load('iphone',async()=>{
@@ -153,8 +204,8 @@ async function inbox(url){
   });
  }
  await Promise.all(jobs);
- const candidates=items.filter(c=>!c.isArchived&&!isStatusConversation(c,config.matrixAccount?.userId)).map(c=>directory.enrichConversation(c));
- let enriched=applyLocalRules(applyAttention(candidates,config.discordAttention,{server,query}),directory.book);
+ const candidates=items.filter(c=>!hidden.has(c.id)&&!c.isArchived&&!isStatusConversation(c,config.matrixAccount?.userId)).map(c=>directory.enrichConversation(c));
+ let enriched=applyLocalRules(applyAttention(candidates,config.discordAttention),directory.book);
  if(unread)enriched=enriched.filter(c=>c.unread);
  if(server)enriched=enriched.filter(c=>c.source==='discord'&&(server==='all'||(server==='dm'?!c.serverID:c.serverID===server)));
  const ranked=rankInbox(enriched,directory.book,{view});
@@ -163,7 +214,7 @@ async function inbox(url){
 }
 function parseConversation(id){const thread=id.match(/^matrix-thread:([^:]+):([^:]+)$/);if(thread){const remote=decodeURIComponent(thread[1]),threadRoot=decodeURIComponent(thread[2]);if(!remote.startsWith('!')||!threadRoot.startsWith('$'))throw Object.assign(new Error('Invalid thread identity'),{status:400});return {kind:'matrix',remote,threadRoot}};if(id.startsWith('archive:'))return {kind:'archive',...archive.store.decodeToken(id)};if(id.startsWith('matrix:'))return {kind:'matrix',remote:id.slice(7)};if(id.startsWith('blueferry:'))return {kind:'blueferry',remote:id.slice(10)};const m=id.match(/^mail:(home|cmu):(.+)$/);if(m)return {kind:'mail',account:m[1],remote:m[2]};throw Object.assign(new Error('Unknown conversation ID'),{status:400})}
 async function conversation(id,url){const c=parseConversation(id);
- if(c.kind==='matrix'){const q=new URLSearchParams();if(url.searchParams.has('cursor'))q.set('cursor',url.searchParams.get('cursor'));if(c.threadRoot)q.set('threadRoot',c.threadRoot);return matrix('/v1/chats/'+encodeURIComponent(c.remote)+'/messages?'+q)}
+ if(c.kind==='matrix'){const q=new URLSearchParams();if(url.searchParams.get('fresh')==='true')q.set('fresh','true');if(url.searchParams.has('cursor'))q.set('cursor',url.searchParams.get('cursor'));if(c.threadRoot)q.set('threadRoot',c.threadRoot);return matrix('/v1/chats/'+encodeURIComponent(c.remote)+'/messages?'+q)}
  if(c.kind==='mail'){const d=await readMail(c.account,c.remote);return {...d,items:d.items.map(m=>({...m,chatID:id,senderName:m.from,timestamp:m.date,linkedMessageID:null,reactions:[]}))}}
  const t=presentThreads(await blueCached('ListThreads','u',[500])).find(t=>t.key===c.remote);if(!t)throw Object.assign(new Error('Phone conversation not found'),{status:404});return {items:(t.messages||[]).map((m,i)=>({...m,id:m.handle||String(i),text:m.body,timestamp:m.timestamp,isSender:m.outgoing,senderID:m.address,senderName:m.sender||m.address||t.name,reactions:[],attachments:[]})),thread:t,hasMore:false};
 }
@@ -185,7 +236,7 @@ export const server=http.createServer(async(req,res)=>{try{
   return json(res,archive.store.search(url.searchParams.get('query')||'',{limit:url.searchParams.get('limit')||60,offset:url.searchParams.get('offset')||0}));
  }
  if(p==='/api/connections'&&req.method==='GET')return json(res,await connections(url.searchParams.get('refresh')==='true'));
- if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:important-v1:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
+ if(p==='/api/inbox'&&req.method==='GET')return json(res,await readCache.get('inbox:visibility-v2:'+createHash('sha256').update(JSON.stringify(config.discordAttention||null)).digest('hex').slice(0,12)+':'+(config.emailEnabled===false?'email-paused:':'')+queryKey(url),async()=>{const page=await inbox(url);setImmediate(()=>warmConversations(page.items));return page},{maxAge:5000,fresh:url.searchParams.get('fresh')==='true',seed:()=>seedInbox(url)}));
  if(p==='/api/discord/servers'&&req.method==='GET'){await directory.refresh();const rooms=[...directory.catalog.rooms.values()].filter(r=>r.network==='discord');return json(res,{items:directory.catalog.servers.map(g=>({...g,preferred:!config.discordAttention||(config.discordAttention.visibleServerIDs||[]).includes(g.id),channelCount:rooms.filter(r=>r.serverID===g.id).length})).sort((a,b)=>a.name.localeCompare(b.name)),directMessageCount:rooms.filter(r=>!r.serverID).length})}
  if(p==='/api/contacts'&&req.method==='GET'){directory.refresh().catch(()=>{});return json(res,{items:directory.book.list(url.searchParams.get('query')||''),errors:directory.catalog.errors})}
  if(p==='/api/slack/cache-profiles'&&req.method==='POST'){const b=await input(req);return json(res,await cacheSlackProfiles(b.workspace,{dataDir,directory,cache:readCache,photos:b.photos!==false}))}
@@ -198,11 +249,28 @@ export const server=http.createServer(async(req,res)=>{try{
  if(p==='/api/preferences/conversation'&&req.method==='POST'){const b=await input(req);parseConversation(b.conversationID);return json(res,await directory.book.setPreference(b.conversationID,b))}
 
  if(p.startsWith('/api/conversations/')){
-  const match=p.match(/^\/api\/conversations\/([^/]+)\/(messages|details|attachment|send|archive|read|unread|reaction|edit)$/);if(!match)return json(res,{error:'Unknown conversation action'},404);const id=decodeURIComponent(match[1]),action=match[2],c=parseConversation(id);
-  if(c.kind==='archive'&&!['messages','details','attachment'].includes(action))return json(res,{error:'The local archive is read-only. Open the live conversation to make changes.'},422);
+  const match=p.match(/^\/api\/conversations\/([^/]+)\/(messages|details|self-avatar|attachment|send|archive|read|unread|reaction|edit)$/);if(!match)return json(res,{error:'Unknown conversation action'},404);const id=decodeURIComponent(match[1]),action=match[2],c=parseConversation(id);
+  if(c.kind==='archive'&&!['messages','details','self-avatar','attachment'].includes(action))return json(res,{error:'The local archive is read-only. Open the live conversation to make changes.'},422);
   if(c.kind==='archive'&&action==='details')return json(res,{...archive.store.getConversation(c.id),localArchive:true,readOnly:true});
-  if(action==='details'&&req.method==='GET'){if(c.kind==='matrix')return json(res,await matrix('/v1/chats/'+encodeURIComponent(c.remote)));if(c.kind==='blueferry')return json(res,{...(await conversation(id,url)).thread,status:await blue('GetStatus')});return json(res,{account:mailAccounts().find(a=>a.id===c.account),threadID:c.remote})}
-  if(action==='messages'&&req.method==='GET')return json(res,await cachedMessages(id,url));
+  if(action==='self-avatar'&&req.method==='GET'){
+   await directory.refresh();
+   const identity=c.kind==='matrix'?directory.selfProfileIdentity(c.remote):null;
+   if(!identity)return json(res,{error:'No profile photo for this account'},404);
+   const profile={id:'self:'+identity,identities:[{key:identity}]};
+   const result=await readCache.get('media:avatar:'+profile.id,()=>avatar(profile,config.matrixAccount),{maxAge:600000,kind:'media'});
+   return result?json(res,result):json(res,{error:'No profile photo for this account'},404);
+  }
+  if(action==='details'&&req.method==='GET'){if(c.kind==='matrix'){
+    const [details]=await Promise.all([matrix('/v1/chats/'+encodeURIComponent(c.remote)),directory.refresh()]);
+    const room=directory.catalog.rooms.get(c.remote);
+    const nicknames=room?.network==='discord'&&room.serverID
+     ?await discordRoomNicknames(config,c.remote).catch(()=>({})):{};
+    return json(res,directory.composerDetails(c.remote,details,nicknames));
+   }if(c.kind==='blueferry')return json(res,{...(await conversation(id,url)).thread,status:await blue('GetStatus')});return json(res,{account:mailAccounts().find(a=>a.id===c.account),threadID:c.remote})}
+  if(action==='messages'&&req.method==='GET'){
+   const page=await cachedMessages(id,url);
+   return json(res,await addDiscordReactionCounts(id,page,url.searchParams.get('fresh')==='true'));
+  }
   const b=await input(req);if(action==='send'&&req.method==='POST')return json(res,await send(id,b));
   if(action==='attachment'&&req.method==='POST'){
    if(c.kind==='archive'){const result=archive.store.attachment(c.id,b.messageID,b.index??0,b.attachmentID);return result?json(res,result):json(res,{error:'This attachment has not been downloaded locally.'},404)}
@@ -220,7 +288,7 @@ export const server=http.createServer(async(req,res)=>{try{
   }
   if(c.kind!=='matrix')throw Object.assign(new Error('Native message replies and reactions are unavailable for this connection'),{status:422});
   if(action==='reaction')return json(res,await matrix('/v1/chats/'+encodeURIComponent(c.remote)+'/messages/'+encodeURIComponent(b.messageID)+'/reactions'+(b.remove?'/'+encodeURIComponent(b.reactionKey):''),b.remove?'DELETE':'POST',b.remove?undefined:{reactionKey:b.reactionKey}));
-  if(action==='edit')return json(res,await matrix('/v1/chats/'+encodeURIComponent(c.remote)+'/messages/'+encodeURIComponent(b.messageID),'PUT',{text:b.text}));
+  if(action==='edit')return json(res,await matrix('/v1/chats/'+encodeURIComponent(c.remote)+'/messages/'+encodeURIComponent(b.messageID),'PUT',{text:b.text,...(b.mentions?{html:b.html,mentions:b.mentions}:{})}));
  }
  if(p.startsWith('/api/v1/'))return json(res,await matrix(p.slice(4)+url.search,req.method,req.method==='GET'?undefined:await input(req)));
  if(p==='/api/blueferry/status')return json(res,await blue('GetStatus'));
@@ -245,6 +313,25 @@ export const server=http.createServer(async(req,res)=>{try{
  if(p==='/api/matrix/diagnostics'){const roomId=url.searchParams.get('roomID');if(!roomId)throw new Error('A roomID is required');return json(res,await matrixAction({config,dataDir},'diagnostics',roomId))}
  if(p==='/api/matrix/refresh'&&req.method==='POST')return json(res,await matrixAction({config,dataDir},'refresh'));
  if(p==='/api/matrix/emoji'&&req.method==='GET'){const mxc=url.searchParams.get('mxc')||'';return json(res,await readCache.get('media:emoji:'+mxc,()=>downloadEmoji(config.matrixAccount,mxc),{maxAge:30*86400000,kind:'media'}))}
+ if(p==='/api/discord/room-emoji'&&req.method==='GET'){
+  const roomID=url.searchParams.get('roomID'),emojiID=url.searchParams.get('emojiID');
+  if(emojiID||!roomID?.startsWith('!'))return json(res,await discordRoomEmoji(config,roomID,emojiID));
+  await directory.refresh();
+  const page=await discordEmojiCatalog(roomID,directory.catalog.rooms.get(roomID)?.serverID);
+  setImmediate(()=>warmDiscordEmojiCatalogs().catch(()=>{}));
+  return json(res,page);
+ }
+ if(p==='/api/slack/emoji-image'&&req.method==='GET'){
+  await directory.refresh();
+  const room=directory.catalog.rooms.get(url.searchParams.get('roomID')),name=url.searchParams.get('name');
+  const item=room?.network==='slack'?directory.catalog.slackEmojiCatalog.get(room.workspaceID)?.get(name):null;
+  if(!item?.url)return json(res,{error:'Slack emoji image unavailable'},404);
+  return json(res,await readCache.get('media:slack-emoji:'+room.workspaceID+':'+name,()=>downloadSlackEmoji(item.url),{maxAge:30*86400000,kind:'media'}));
+ }
+ if(p==='/api/discord/emoji-image'&&req.method==='GET'){
+  const id=url.searchParams.get('id')||'';
+  return json(res,await readCache.get('media:discord-emoji:'+id,()=>downloadDiscordEmoji(id),{maxAge:30*86400000,kind:'media'}));
+ }
  if(p==='/api/openapi.json')return json(res,JSON.parse(await readFile(path.join(root,'openapi.json'),'utf8')));
  if(p==='/api/audit')return json(res,JSON.parse(await readFile(path.join(dataDir,'audit.json'),'utf8')));
  return json(res,{error:'Not found'},404);

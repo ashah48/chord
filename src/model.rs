@@ -45,12 +45,22 @@ pub struct Emote {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReactionCount {
+    pub key: String,
+    pub count: usize,
+    pub mine: bool,
+    pub shortcode: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Message {
     pub historical_version: bool,
     pub id: String,
     pub text: String,
     pub sender_name: String,
+    #[serde(rename = "senderID")]
+    pub sender_id: Option<String>,
     #[serde(rename = "senderContactID")]
     pub sender_contact_id: Option<String>,
     pub timestamp: String,
@@ -60,6 +70,7 @@ pub struct Message {
     pub thread_root_id: Option<String>,
     pub reply_count: usize,
     pub reactions: Vec<Value>,
+    pub reaction_counts: Option<Vec<ReactionCount>>,
     pub attachments: Vec<Value>,
     /// Slack custom emoji used in `text`, as `:name:` plus the homeserver image.
     pub emotes: Vec<Emote>,
@@ -85,7 +96,6 @@ pub struct Inbox {
     pub items: Vec<Conversation>,
     pub errors: Vec<Value>,
     pub cursors: Value,
-    pub summary: Value,
 }
 
 pub const SOURCES: &[(&str, &str, &str)] = &[

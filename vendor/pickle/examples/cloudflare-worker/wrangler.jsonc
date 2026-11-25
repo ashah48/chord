@@ -1,0 +1,26 @@
+{
+  "name": "pickle-example",
+  "main": "src/index.js",
+  "compatibility_date": "2026-04-24",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MATRIX_CLIENT",
+        "class_name": "MatrixClientObject"
+      },
+      {
+        "name": "MATRIX_SYNC",
+        "class_name": "MatrixSyncObject"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MatrixClientObject", "MatrixSyncObject"]
+    }
+  ],
+  "vars": {
+    "MATRIX_SYNC_WEBHOOK_URL": "https://replace-with-your-worker.example.com/matrix/webhook"
+  }
+}

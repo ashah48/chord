@@ -121,31 +121,15 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
     let n = app.visible().len();
     let tabs = vec![
-        Span::styled(
-            format!(
-                "  {}  ",
-                if app.unread {
-                    "UNREAD"
-                } else if app.focus_enabled() {
-                    "FOCUS"
-                } else {
-                    "ALL"
-                }
-            ),
-            Style::new().fg(t.green).bold(),
-        ),
+        Span::styled("  INBOX  ", Style::new().fg(t.green).bold()),
         Span::styled(format!("{n} conversations"), Style::new().fg(t.muted)),
         Span::styled("   / ", Style::new().fg(t.faint)),
         Span::styled(app.source_title(), Style::new().fg(t.text)),
         Span::styled(
             format!(
-                "   {} hidden · v {}",
-                app.inbox_summary["hidden"].as_u64().unwrap_or(0),
-                if app.focus_enabled() {
-                    "show all"
-                } else {
-                    "focus"
-                }
+                "   [{}] Show unimportant · [{}] Unread only",
+                if app.show_unimportant { "x" } else { " " },
+                if app.unread { "x" } else { " " }
             ),
             Style::new().fg(t.faint),
         ),
@@ -312,18 +296,7 @@ fn render_sources(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
 fn render_inbox(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled(
-            if app.unread {
-                "Unread"
-            } else if app.focus_enabled() {
-                "Important"
-            } else if app.discord_scope.is_some() {
-                "Channels"
-            } else {
-                "All conversations"
-            },
-            Style::new().fg(t.text).bold(),
-        ),
+        Span::styled("Inbox", Style::new().fg(t.text).bold()),
         Span::styled(
             format!("  {} ", app.visible().len()),
             Style::new().fg(t.faint),
@@ -336,8 +309,8 @@ fn render_inbox(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
     if visible.is_empty() {
         let text = if app.loading {
             "\n  Loading your conversations…"
-        } else if app.focus_enabled() {
-            "\n  Nothing needs your attention here.\n\n  v shows all conversations.\n  * marks a chat important.\n  c opens your contacts."
+        } else if app.unread {
+            "\n  No unread conversations in this view."
         } else {
             "\n  Nothing here yet.\n\n  Press a to connect your accounts.\n  Email and iPhone appear as\n  soon as they are available."
         };
@@ -356,29 +329,11 @@ fn render_inbox(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
             let selected = i == app.selection;
             let bg = if selected { t.raised } else { t.panel };
             let width = inner.width as usize;
-            let reason = c.importance["reasons"][0].as_str().unwrap_or("");
-            let reason = match reason {
-                "Recent direct conversation" => "Direct message",
-                "Unread direct message" => "Unread DM",
-                "You participate in this conversation" => "Active chat",
-                "Reply to your message" => "Reply to you",
-                "Marked important in email" => "Important email",
-                "Unread personal email" => "Personal email",
-                "Pinned by you" => "Pinned",
-                "Favorite contact" => "Favorite",
-                _ => reason,
-            };
-            let label = if app.focus_enabled() && !reason.is_empty() {
-                format!(
-                    "{} · {}",
-                    c.server_name.as_deref().unwrap_or(source_label(&c.source)),
-                    reason
-                )
+            let source = c.server_name.as_deref().unwrap_or(source_label(&c.source));
+            let label = if c.local_priority == "unimportant" {
+                format!("{source} · Unimportant")
             } else {
-                c.server_name
-                    .as_deref()
-                    .unwrap_or(source_label(&c.source))
-                    .to_owned()
+                source.to_owned()
             };
             let first = Line::from(vec![
                 Span::styled(if c.unread { "● " } else { "  " }, Style::new().fg(t.green)),
@@ -448,7 +403,7 @@ fn render_thread(frame: &mut Frame, app: &App, area: Rect, t: Theme) {
         });
         let welcome = vec![
             Line::from(""),
-            Line::from(Span::styled("c·", Style::new().fg(t.green).bold())),
+            Line::from(Span::styled("Chord", Style::new().fg(t.green).bold())),
             Line::from(""),
             Line::from(Span::styled(
                 "A little less switching.",
@@ -1268,8 +1223,8 @@ fn render_help(frame: &mut Frame, t: Theme) {
     let rows = [
         ("1…7", "switch account; 3 opens Discord servers"),
         ("s", "browse Discord servers and direct messages"),
-        ("v", "switch between Important and every conversation"),
-        ("* / =", "mark important / restore automatic importance"),
+        ("v / u", "show unimportant / unread only"),
+        ("* / =", "mark as unimportant / restore to Inbox"),
         ("c", "contacts: search, rename, favorite, and link accounts"),
         ("j / k", "move through conversations or messages"),
         ("tab / h / l", "change pane; enter opens a conversation"),

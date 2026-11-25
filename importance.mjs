@@ -1,6 +1,6 @@
 export function importance(_conversation,{preference={}}={}){
  const important=preference.priority==='important';
- return {important,score:important?1000:0,reasons:important?['Marked important by you']:[],rule:important?'important':'auto'};
+ return {important,score:important?1000:0,reasons:important?['Marked important by you']:[],rule:preference.priority||'auto'};
 }
 
 export function applyLocalRules(items,book,now=Date.now()){
@@ -20,8 +20,8 @@ export function rankInbox(items,book,{view='all',now=Date.now()}={}){
   return {...next,importance:importance(next,{preference:book.preference(c.id,now)})};
  });
  const focused=ranked.filter(c=>c.importance.important);
- const visible=view==='focus'?focused:ranked;
+ const visible=view==='focus'?focused:view==='inbox'?ranked.filter(c=>c.localPriority!=='unimportant'):ranked;
  const timestamp=c=>{const value=Date.parse(c.timestamp);return Number.isFinite(value)?value:0};
  visible.sort((a,b)=>timestamp(b)-timestamp(a));
- return {items:visible,summary:{total:ranked.length,important:focused.length,hidden:view==='focus'?ranked.length-focused.length:0},view};
+ return {items:visible,summary:{total:ranked.length,important:focused.length,hidden:ranked.length-visible.length},view};
 }

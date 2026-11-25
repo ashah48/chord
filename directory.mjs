@@ -32,6 +32,42 @@ export class Directory{
   })().finally(()=>{this.refreshing=null});return this.refreshing;
  }
  observeMail(from){const entry=mailbox(from);if(!entry.key)return null;return this.book.observe({...entry,source:'email',rank:40})}
+ selfProfileIdentity(roomID){
+  const room=this.catalog.rooms.get(roomID);
+  if(!room||!['discord','slack','whatsapp'].includes(room.network))return null;
+  const prefix='@'+room.network+'_';
+  const ids=[...this.catalog.selfIds].filter(id=>id.startsWith(prefix));
+  const loginId=id=>id.slice(prefix.length).split(':')[0].toLowerCase();
+  const exact=ids.find(id=>room.receiver&&loginId(id)===room.receiver.toLowerCase());
+  if(exact)return exact;
+  if(room.network==='slack'){
+   const workspace=room.workspaceID?.toLowerCase();
+   const matches=ids.filter(id=>workspace&&loginId(id).startsWith(workspace+'-'));
+   return matches.length===1?matches[0]:null;
+  }
+  if(room.network==='whatsapp'){
+   const phones=ids.filter(id=>!loginId(id).startsWith('lid-'));
+   return phones.length===1?phones[0]:ids.length===1?ids[0]:null;
+  }
+  return ids.length===1?ids[0]:null;
+ }
+ composerDetails(roomID,details,nicknames={}){
+  const room=this.catalog.rooms.get(roomID);
+  const participants=details.participants||{};
+  const items=(participants.items||[]).map(member=>{
+   const person=this.book.person(member.id);
+   const roomName=room?.direct&&room.otherUser===member.id?room.title:null;
+   const name=nicknames[member.id]||person?.customName||roomName||member.fullName;
+   const aliases=[member.fullName,person?.customName,...(person?.identities||[]).flatMap(identity=>[identity.name,identity.handle])]
+    .filter(alias=>typeof alias==='string'&&alias&&alias!==name&&alias!==member.id);
+   return {...member,fullName:name,aliases:[...new Set(aliases)]};
+  });
+  const slack=room?.network==='slack'?this.catalog.slackEmojiCatalog?.get(room.workspaceID):null;
+  const discord=room?.network==='discord'?this.catalog.discordEmoji?.get(room.serverID):null;
+  const customEmoji=slack?[...slack].map(([name,{mxc,url}])=>({name,mxc,thumbnail:!!url}))
+   :[...(discord||[])].map(([name,mxc])=>({name,mxc}));
+  return {...details,participants:{...participants,items},customEmoji};
+ }
  enrichConversation(c){
   const room=this.catalog.rooms.get(c.remoteId);
   const self=this.catalog.selfIds;
@@ -54,7 +90,9 @@ export class Directory{
   const catalogActivity=room?.activity;
   const channelActivity=Date.parse(c.lastActivity);
   const timestamp=Number.isFinite(channelActivity)?channelActivity:Math.max(catalogActivity?.lastMessageAt||0,Date.parse(c.timestamp)||0);
-  const enriched={...c,avatarContacts,previewSenderName:this.book.name(c.previewSenderID,c.previewSenderName)||c.previewSenderName||'',serverID:room?.serverID||null,serverName:room?.serverName||null,accountKey,accountName,channelID:room?.portalId||null,channelName:room?.title||null,...(catalogActivity?{activity:{...catalogActivity,lastMessageAt:timestamp}}:{}),direct,groupDM:!!room?.groupDM,contactIDs,knownContact:contactIDs.some(id=>{const p=this.book.data.people[id];return p?.customName||p?.favorite||p?.identities.some(i=>i.source!=='email')}),isBot:direct&&!!this.book.person(other)?.identities.some(i=>i.isBot),title:direct&&resolved&&c.kind!=='email'?resolved:c.title,...(Number.isFinite(channelActivity)||catalogActivity?.lastMessageAt?{timestamp:new Date(timestamp).toISOString()}:{})};this.conversations.set(c.id,enriched);return enriched;
+  const ownPreview=c.previewIsSender===true||Boolean(c.previewSenderID&&(self.has(c.previewSenderID)||c.previewSenderID===this.config().matrixAccount?.userId));
+  const previewSenderName=ownPreview?'You':this.book.name(c.previewSenderID,c.previewSenderName)||c.previewSenderName||'';
+  const enriched={...c,avatarContacts,previewSenderName,serverID:room?.serverID||null,serverName:room?.serverName||null,accountKey,accountName,channelID:room?.portalId||null,channelName:room?.title||null,...(catalogActivity?{activity:{...catalogActivity,lastMessageAt:timestamp}}:{}),direct,groupDM:!!room?.groupDM,contactIDs,knownContact:contactIDs.some(id=>{const p=this.book.data.people[id];return p?.customName||p?.favorite||p?.identities.some(i=>i.source!=='email')}),isBot:direct&&!!this.book.person(other)?.identities.some(i=>i.isBot),title:direct&&resolved&&c.kind!=='email'?resolved:c.title,...(Number.isFinite(channelActivity)||catalogActivity?.lastMessageAt?{timestamp:new Date(timestamp).toISOString()}:{})};this.conversations.set(c.id,enriched);return enriched;
  }
  async profile(key){
   if(!/^@[^:]+:chord\.local$/.test(key)||this.profiles.get(key)>Date.now())return;

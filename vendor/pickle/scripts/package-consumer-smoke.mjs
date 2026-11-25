@@ -1,0 +1,139 @@
+import { execFile } from "node:child_process";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+const rootPath = join(dirname(fileURLToPath(import.meta.url)), "..");
+const tempRoot = await mkdtemp(join(tmpdir(), "pickle-package-consumer-"));
+const packDir = join(tempRoot, "packs");
+const consumerDir = join(tempRoot, "consumer");
+
+let passed = false;
+
+try {
+  if (!relative(rootPath, consumerDir).startsWith("..")) {
+    throw new Error(`consumer directory must be outside the repo: ${consumerDir}`);
+  }
+
+  await mkdir(packDir, { recursive: true });
+  await mkdir(consumerDir, { recursive: true });
+
+  const picklePackage = await readPackage(join(rootPath, "packages/pickle/package.json"));
+  const cloudflarePackage = await readPackage(join(rootPath, "packages/cloudflare/package.json"));
+  const adapterPackage = await readPackage(join(rootPath, "packages/chat-adapter/package.json"));
+
+  const cloudflareTarball = await packPackage(cloudflarePackage.name, packDir);
+  const pickleTarball = await packPackage(picklePackage.name, packDir);
+  const adapterTarball = await packPackage(adapterPackage.name, packDir);
+
+  const dependencies = {
+    [cloudflarePackage.name]: `file:${cloudflareTarball}`,
+    [picklePackage.name]: `file:${pickleTarball}`,
+    [adapterPackage.name]: `file:${adapterTarball}`,
+  };
+  const overrides = {
+    [cloudflarePackage.name]: `file:${cloudflareTarball}`,
+    [picklePackage.name]: `file:${pickleTarball}`,
+  };
+
+  for (const dependencyName of Object.keys(adapterPackage.dependencies ?? {})) {
+    if (dependencyName !== picklePackage.name) {
+      const spec = await installedPackageLink("packages/chat-adapter", dependencyName);
+      dependencies[dependencyName] = spec;
+      overrides[dependencyName] = spec;
+    }
+  }
+
+  if (adapterPackage.peerDependencies?.chat) {
+    dependencies.chat = await installedPackageLink("packages/chat-adapter", "chat");
+  }
+
+  await writeFile(
+    join(consumerDir, "package.json"),
+    `${JSON.stringify(
+      {
+        name: "pickle-package-consumer-smoke",
+        private: true,
+        type: "module",
+        dependencies,
+        pnpm: {
+          overrides,
+        },
+      },
+      null,
+      2
+    )}\n`
+  );
+
+  await execFileAsync(
+    "pnpm",
+    ["install", "--offline", "--ignore-scripts", "--no-frozen-lockfile", "--reporter=append-only"],
+    { cwd: consumerDir }
+  );
+
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `
+        import * as pickle from "@beeper/pickle";
+        import * as auth from "@beeper/pickle/auth";
+        import * as beeperAuth from "@beeper/pickle/beeper/auth";
+        import * as helpers from "@beeper/pickle/helpers";
+        import * as node from "@beeper/pickle/node";
+        import * as cloudflare from "@beeper/pickle-cloudflare";
+        import * as adapter from "@beeper/pickle-chat-adapter";
+
+        const checks = {
+          pickle: ["createMatrixClient"].every((key) => key in pickle),
+          auth: ["loginWithMatrixPassword", "loginWithMatrixToken"].every((key) => key in auth),
+          beeperAuth: ["createBeeperLogin"].every((key) => key in beeperAuth),
+          helpers: ["onMessage", "onReaction", "onInvite", "onRawEvent"].every((key) => key in helpers),
+          node: ["createMatrixClient"].every((key) => key in node),
+          cloudflare: ["createCloudflareKVMatrixStore", "createDurableObjectMatrixStore", "MatrixSyncDurableObject"].every((key) => key in cloudflare),
+          adapter: ["createMatrixAdapter", "MatrixAdapter", "MatrixFormatConverter"].every((key) => key in adapter),
+        };
+
+        if (!Object.values(checks).every(Boolean)) {
+          throw new Error(JSON.stringify(checks));
+        }
+        console.log(JSON.stringify(checks));
+      `,
+    ],
+    { cwd: consumerDir }
+  );
+
+  console.log(stdout.trim());
+  passed = true;
+} finally {
+  if (passed) {
+    await rm(tempRoot, { recursive: true, force: true });
+  } else {
+    console.error(`Package consumer smoke temp directory preserved at ${tempRoot}`);
+  }
+}
+
+async function readPackage(path) {
+  return JSON.parse(await readFile(path, "utf8"));
+}
+
+async function packPackage(packageName, destination) {
+  const { stdout } = await execFileAsync(
+    "pnpm",
+    ["--filter", packageName, "pack", "--pack-destination", destination, "--json"],
+    { cwd: rootPath }
+  );
+  const packResult = JSON.parse(stdout);
+  return packResult.filename;
+}
+
+async function installedPackageLink(importerPath, packageName) {
+  const packageJsonPath = join(rootPath, importerPath, "node_modules", packageName, "package.json");
+  const packageDir = await realpath(dirname(packageJsonPath));
+  return `link:${packageDir}`;
+}

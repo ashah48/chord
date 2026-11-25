@@ -9,6 +9,25 @@ export async function downloadEmoji(account,mxc,fetcher=fetch){
  if(!match||!account?.homeserver||!account?.accessToken)throw Object.assign(new Error('Invalid custom emoji'),{status:400});
  const url=new URL(`/_matrix/client/v1/media/download/${encodeURIComponent(match[1])}/${encodeURIComponent(match[2])}`,account.homeserver);
  const response=await fetcher(url,{headers:{Authorization:'Bearer '+account.accessToken},signal:AbortSignal.timeout(15000)});
+ return emojiResponse(response);
+}
+
+export async function downloadDiscordEmoji(id,fetcher=fetch){
+ if(!/^\d{15,22}$/.test(id))throw Object.assign(new Error('Invalid Discord emoji'),{status:400});
+ const response=await fetcher(new URL(`https://cdn.discordapp.com/emojis/${id}.png?size=64`),{signal:AbortSignal.timeout(10000)});
+ return emojiResponse(response);
+}
+
+export async function downloadSlackEmoji(address,fetcher=fetch){
+ const url=URL.parse(address||'');
+ if(url?.protocol!=='https:'||!['emoji.slack-edge.com','a.slack-edge.com'].includes(url.hostname)
+    ||url.port||url.username||url.password){
+  throw Object.assign(new Error('Slack emoji image unavailable'),{status:404});
+ }
+ return emojiResponse(await fetcher(url,{redirect:'error',signal:AbortSignal.timeout(10000)}));
+}
+
+async function emojiResponse(response){
  if(!response.ok)throw Object.assign(new Error('Custom emoji unavailable'),{status:response.status||502});
  const mimeType=(response.headers.get('content-type')||'').split(';')[0].trim().toLowerCase();
  if(!mimeType.startsWith('image/'))throw Object.assign(new Error('Custom emoji is not an image'),{status:415});

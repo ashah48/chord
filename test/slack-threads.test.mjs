@@ -18,3 +18,33 @@ test('Slack replies target the original thread root, including replies to a repl
  await p.request('/v1/chats/!room/messages','POST',{threadRootID:'$root',attachment:{uploadID:'photo'}});assert.equal(media[0].threadRoot,'$root');
  await p.request('/v1/chats/!room/messages','POST',{text:'channel message'});assert.equal(sent[3].threadRoot,undefined);
 });
+
+test('selected mentions preserve the Matrix user ID and link when sending or editing',async()=>{
+ const sent=[],edited=[];
+ const p=new MatrixProvider({messages:{
+  send:async options=>{sent.push(options);return {eventId:'$sent'}},
+  edit:async options=>{edited.push(options);return {eventId:'$edited'}},
+ }},{userId:'@me:example.org'},{save:false});
+ const body={text:'Hi @Max',html:'Hi <a href="https://matrix.to/#/@max:example.org">@Max</a>',mentions:{userIds:['@max:example.org']}};
+ await p.request('/v1/chats/!room/messages','POST',body);
+ await p.request('/v1/chats/!room/messages/$sent','PUT',body);
+ for(const options of [...sent,...edited]){
+  assert.equal(options.html,body.html);
+  assert.deepEqual(options.mentions,body.mentions);
+ }
+});
+
+test('explicit message refresh waits for every Matrix reaction page',async()=>{
+ const calls=[];
+ const p=new MatrixProvider({messages:{list:async()=>({messages:[event('$root')]})}},{userId:'@me'},{save:false});
+ p.chats.set('!room',{accountID:'slack',participants:{items:[]}});
+ p.relationCache.set('!room|$root',Date.now());
+ const reaction=id=>({event_id:id,sender:id,content:{'m.relates_to':{key:'👍'}}});
+ p.raw=async(_method,_path,_body,query)=>{
+  calls.push(query.from);
+  return query.from?{chunk:[reaction('three'),reaction('four')]}:{chunk:[reaction('one'),reaction('two')],next_batch:'next'};
+ };
+ const page=await p.request('/v1/chats/!room/messages?fresh=true');
+ assert.deepEqual(calls,[undefined,'next']);
+ assert.equal(page.items[0].reactions.length,4);
+});

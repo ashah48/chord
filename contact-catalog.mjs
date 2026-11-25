@@ -4,7 +4,7 @@ import path from 'node:path';
 // Read bridge-owned databases through read-only handles. Select only names,
 // identifiers, and activity counts; authentication columns are never read.
 export function readContactCatalog(dataDir, owner='@max:chord.local') {
- const identities=[],servers=[],rooms=new Map(),selfIds=new Set([owner]),slackEmoji=new Map();
+ const identities=[],servers=[],rooms=new Map(),selfIds=new Set([owner]),slackEmoji=new Map(),slackEmojiCatalog=new Map(),discordEmoji=new Map();
  const errors=[];
  for(const network of ['slack','discord','whatsapp']){
   let db;
@@ -17,6 +17,15 @@ export function readContactCatalog(dataDir, owner='@max:chord.local') {
     for(const p of query('SELECT id,name,global_name,username,is_bot FROM puppet'))identities.push({key:`@discord_${p.id}:chord.local`,source:network,name:p.global_name||p.name||p.username,isBot:!!p.is_bot,handle:p.username});
     for(const g of query("SELECT dcid,plain_name,name,mxid FROM guild"))servers.push({id:g.dcid,name:g.plain_name||g.name,imported:!!g.mxid});
     for(const r of query("SELECT p.dcid,p.receiver,p.mxid,p.plain_name,p.type,p.other_user_id,p.dc_guild_id,g.plain_name AS guild_name FROM portal p LEFT JOIN guild g ON g.dcid=p.dc_guild_id WHERE p.mxid IS NOT NULL AND p.mxid!='' AND p.type!=4"))rooms.set(r.mxid,{network,title:r.plain_name,direct:r.type===1,groupDM:r.type===3,serverID:r.dc_guild_id||null,serverName:r.guild_name||null,otherUser:r.other_user_id?`@discord_${r.other_user_id}:chord.local`:null,portalId:r.dcid,receiver:r.receiver});
+    try{
+     for(const emoji of query(`SELECT DISTINCT p.dc_guild_id AS guild,f.emoji_name AS name,f.mxc
+      FROM discord_file f JOIN reaction r ON r.dc_emoji_name=f.emoji_name||':'||f.id
+      JOIN portal p ON p.dcid=r.dc_chan_id AND p.receiver=r.dc_chan_receiver
+      WHERE f.emoji_name!='' AND p.dc_guild_id!='' AND f.mxc LIKE 'mxc://%'`)){
+      if(!discordEmoji.has(emoji.guild))discordEmoji.set(emoji.guild,new Map());
+      discordEmoji.get(emoji.guild).set(emoji.name,emoji.mxc);
+     }
+    }catch{}
    }else{
     mine=query('SELECT id FROM user_login WHERE user_mxid=?',owner).map(r=>r.id.toLowerCase());
     const workspaces=network==='slack'?new Map(query('SELECT id,remote_name FROM user_login').map(r=>[r.id.split('-')[0].toLowerCase(),r.remote_name?.split(' - ')[0]])):new Map();
@@ -26,11 +35,35 @@ export function readContactCatalog(dataDir, owner='@max:chord.local') {
     }
     if(network==='slack'){
      // A missing emoji table is an older bridge database. Names and rooms still load.
-     try{for(const e of query('SELECT team_id,emoji_id,image_mxc FROM emoji')){
-      if(typeof e.image_mxc!=='string'||!e.image_mxc.startsWith('mxc://')||!e.team_id||!e.emoji_id)continue;
-      let bucket=slackEmoji.get(e.team_id);if(!bucket){bucket=new Map();slackEmoji.set(e.team_id,bucket)}
-      bucket.set(e.emoji_id,e.image_mxc);
-     }}catch{}
+     try{
+      const columns=new Set(query('PRAGMA table_info(emoji)').map(column=>column.name));
+      const value=columns.has('value')?'value':'NULL AS value';
+      const alias=columns.has('alias')?'alias':'NULL AS alias';
+      for(const e of query(`SELECT team_id,emoji_id,image_mxc,${value},${alias} FROM emoji`)){
+       if(!e.team_id||!e.emoji_id)continue;
+       if(!slackEmojiCatalog.has(e.team_id))slackEmojiCatalog.set(e.team_id,new Map());
+       slackEmojiCatalog.get(e.team_id).set(e.emoji_id,{
+        mxc:e.image_mxc?.startsWith('mxc://')?e.image_mxc:null,
+        url:e.value?.startsWith('https://')?e.value:null,
+        alias:typeof e.alias==='string'?e.alias:null,
+       });
+      }
+      for(const [team,items] of slackEmojiCatalog){
+       const images=new Map();
+       for(const [name,item] of items){
+        let target=item;
+        const visited=new Set([name]);
+        while(target?.alias&&!visited.has(target.alias)){
+         visited.add(target.alias);
+         target=items.get(target.alias);
+        }
+        item.mxc||=target?.mxc||null;
+        item.url||=target?.url||null;
+        if(item.mxc)images.set(name,item.mxc);
+       }
+       slackEmoji.set(team,images);
+      }
+     }catch{}
     }
     for(const r of query("SELECT id,receiver,mxid,name,room_type,other_user_id FROM portal WHERE mxid IS NOT NULL AND mxid!='' AND room_type!='space'")){
      const team=String(r.id||'').split('-')[0];
@@ -79,5 +112,5 @@ export function readContactCatalog(dataDir, owner='@max:chord.local') {
    }
   }catch(e){errors.push({source:network,error:e.code||e.name})}finally{db?.close()}
  }
- return {identities,servers,rooms,selfIds,errors,slackEmoji};
+ return {identities,servers,rooms,selfIds,errors,slackEmoji,slackEmojiCatalog,discordEmoji};
 }

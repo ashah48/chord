@@ -226,10 +226,251 @@ pub fn paint_custom(
     }
 }
 
+pub fn icon(ui: &egui::Ui, key: &str, size: f32) -> Option<egui::Image<'static>> {
+    let index = lookup(key)?;
+    let texture = texture(ui.ctx());
+    Some(egui::Image::new((texture.id(), Vec2::splat(size))).uv(uv(index, &texture)))
+}
+
+pub const REACTION_SECTIONS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Common emoji",
+        &[
+            ("👍", "thumbs up +1 like"),
+            ("❤️", "red heart love"),
+            ("🔥", "fire lit"),
+            ("😂", "tears of joy laugh"),
+            ("🎉", "party popper celebration"),
+            ("👀", "eyes"),
+            ("🙏", "folded hands thanks pray"),
+            ("✅", "check mark yes"),
+            ("💯", "hundred points 100"),
+            ("💙", "blue heart"),
+            ("😮", "surprised open mouth"),
+            ("😢", "crying face sad"),
+        ],
+    ),
+    (
+        "Faces",
+        &[
+            ("😀", "grinning face"),
+            ("😄", "happy smile"),
+            ("😊", "smiling eyes blush"),
+            ("🤣", "rolling on the floor laughing rofl"),
+            ("😭", "loudly crying sob"),
+            ("😍", "heart eyes"),
+            ("🥰", "smiling face with hearts"),
+            ("🤩", "star struck"),
+            ("😎", "sunglasses cool"),
+            ("😉", "wink"),
+            ("🙂", "slight smile"),
+            ("🙃", "upside down face"),
+            ("🤔", "thinking face"),
+            ("🫡", "saluting face"),
+            ("😬", "grimacing face"),
+            ("😅", "smile sweat"),
+            ("😳", "flushed face"),
+            ("🥺", "pleading face"),
+            ("😐", "neutral face"),
+            ("🙄", "rolling eyes"),
+            ("😡", "angry face"),
+            ("😱", "screaming face"),
+            ("🤯", "exploding head"),
+            ("💀", "skull"),
+            ("🤡", "clown face"),
+            ("🫠", "melting face"),
+        ],
+    ),
+    (
+        "Hands",
+        &[
+            ("👎", "thumbs down -1 dislike"),
+            ("👏", "clapping hands applause"),
+            ("🙌", "raising hands hooray"),
+            ("👋", "waving hand hello"),
+            ("👌", "OK hand"),
+            ("✌️", "victory peace"),
+            ("🤝", "handshake"),
+            ("💪", "flexed biceps muscle"),
+            ("🫶", "heart hands"),
+            ("🤞", "crossed fingers"),
+            ("👆", "point up"),
+            ("👇", "point down"),
+            ("✍️", "writing hand"),
+        ],
+    ),
+    (
+        "Symbols and objects",
+        &[
+            ("✨", "sparkles"),
+            ("⭐", "star"),
+            ("💖", "sparkling heart"),
+            ("💔", "broken heart"),
+            ("💕", "two hearts"),
+            ("‼️", "double exclamation"),
+            ("❓", "question mark"),
+            ("❌", "cross mark no"),
+            ("⚠️", "warning"),
+            ("🚀", "rocket"),
+            ("💡", "light bulb idea"),
+            ("💎", "gem diamond"),
+            ("🏆", "trophy"),
+            ("🎶", "music notes"),
+            ("🏁", "checkered flag"),
+            ("🎂", "birthday cake"),
+            ("🍕", "pizza"),
+            ("☕", "coffee"),
+            ("🐈", "cat"),
+            ("🐕", "dog"),
+        ],
+    ),
+];
+
+fn common_name(key: &str) -> Option<&'static str> {
+    REACTION_SECTIONS
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .find_map(|(emoji, name)| (*emoji == key).then_some(*name))
+}
+
+pub fn reaction_name(key: &str) -> Option<&'static str> {
+    common_name(key).or_else(|| {
+        catalog()
+            .iter()
+            .flat_map(|(_, entries)| entries)
+            .find(|entry| entry.glyph == key)
+            .map(|entry| entry.name)
+    })
+}
+
+pub struct CatalogEmoji {
+    pub glyph: &'static str,
+    pub name: &'static str,
+    pub shortcode: String,
+}
+
+impl CatalogEmoji {
+    pub fn matches(&self, query: &str) -> bool {
+        query.is_empty()
+            || self.shortcode.contains(query)
+            || matches_search(self.glyph, self.name, query)
+            || common_name(self.glyph).is_some_and(|name| matches_search(self.glyph, name, query))
+    }
+}
+
+pub fn catalog() -> &'static [(&'static str, Vec<CatalogEmoji>)] {
+    static CATALOG: OnceLock<Vec<(&str, Vec<CatalogEmoji>)>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut groups = Vec::<(&str, Vec<CatalogEmoji>)>::new();
+        for line in include_str!("../../assets/emoji-catalog.tsv").lines() {
+            if let Some(group) = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+            {
+                groups.push((group, Vec::new()));
+            } else if let Some((glyph, name)) = line.split_once('\t') {
+                let shortcode = standard_shortcode(glyph, name);
+                groups
+                    .last_mut()
+                    .expect("emoji group")
+                    .1
+                    .push(CatalogEmoji {
+                        glyph,
+                        name,
+                        shortcode,
+                    });
+            }
+        }
+        groups
+    })
+}
+
+pub fn standard_shortcode(key: &str, name: &str) -> String {
+    let mut regional = key.chars();
+    if let (Some(first), Some(second), None) = (regional.next(), regional.next(), regional.next())
+        && [first, second].iter().all(|c| ('🇦'..='🇿').contains(c))
+    {
+        return format!(
+            "flag_{}{}",
+            (b'a' + (first as u32 - '🇦' as u32) as u8) as char,
+            (b'a' + (second as u32 - '🇦' as u32) as u8) as char
+        );
+    }
+    match key {
+        "👍" => "thumbsup",
+        "👎" => "thumbsdown",
+        "❤️" => "heart",
+        "😂" => "joy",
+        "🤣" => "rofl",
+        "🎉" => "tada",
+        "🙏" => "pray",
+        "✅" => "white_check_mark",
+        "😭" => "sob",
+        "😢" => "cry",
+        "100" | "💯" => "100",
+        "😀" => "grinning",
+        "😄" => "smile",
+        "😊" => "blush",
+        _ => {
+            return name
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join("_")
+                .to_lowercase();
+        }
+    }
+    .to_owned()
+}
+
+pub fn completion_token(text: &str, cursor: usize) -> Option<(std::ops::Range<usize>, &str)> {
+    completion_token_for(text, cursor, ':')
+}
+
+pub fn completion_token_for(
+    text: &str,
+    cursor: usize,
+    trigger: char,
+) -> Option<(std::ops::Range<usize>, &str)> {
+    let end = text
+        .char_indices()
+        .nth(cursor)
+        .map_or(text.len(), |(offset, _)| offset);
+    let start = text[..end].rfind(trigger)?;
+    if text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| !c.is_whitespace() && !"([{".contains(c))
+    {
+        return None;
+    }
+    let query = &text[start + 1..end];
+    let valid = |c: char| {
+        if trigger == '@' {
+            c.is_alphanumeric() || "_.-".contains(c)
+        } else {
+            c.is_ascii_alphanumeric() || "_+-~".contains(c)
+        }
+    };
+    if query.len() > 40 || !query.chars().all(valid) {
+        return None;
+    }
+    let suffix = &text[end..];
+    let token_end = end + suffix.find(|c: char| !valid(c)).unwrap_or(suffix.len());
+    let token_end = token_end + usize::from(trigger == ':' && text[token_end..].starts_with(':'));
+    Some((start..token_end, query))
+}
+
+pub fn matches_search(key: &str, name: &str, query: &str) -> bool {
+    let name = name.to_lowercase().replace(['_', '-'], " ");
+    query
+        .replace('_', " ")
+        .split_whitespace()
+        .all(|term| name.contains(term) || key.contains(term))
+}
+
 pub fn button(ui: &egui::Ui, key: &str, label: &str) -> egui::Button<'static> {
-    if let Some(index) = lookup(key) {
-        let texture = texture(ui.ctx());
-        let image = egui::Image::new((texture.id(), Vec2::splat(22.))).uv(uv(index, &texture));
+    if let Some(image) = icon(ui, key, 22.) {
         egui::Button::image_and_text(image, label.to_owned())
     } else {
         egui::Button::new(format!("{key} {label}"))
@@ -238,6 +479,53 @@ pub fn button(ui: &egui::Ui, key: &str, label: &str) -> egui::Button<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unicode_catalog_covers_the_standard_and_has_artwork() {
+        let entries: Vec<_> = catalog().iter().flat_map(|(_, entries)| entries).collect();
+        assert_eq!(entries.len(), 3953);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.glyph)
+                .collect::<HashSet<_>>()
+                .len(),
+            entries.len()
+        );
+        assert!(entries.iter().all(|entry| lookup(entry.glyph).is_some()));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.glyph == "🇲🇲" && entry.matches("flag_mm"))
+        );
+    }
+
+    #[test]
+    fn completion_token_uses_character_cursor_and_replaces_the_whole_shortcode() {
+        assert_eq!(completion_token("😀 :thum", 7), Some((5..10, "thum")));
+        assert_eq!(
+            completion_token(":thumbsup: later", 4),
+            Some((0..10, "thu"))
+        );
+        assert_eq!(completion_token(":", 1), Some((0..1, "")));
+        assert_eq!(completion_token("https://example.com", 6), None);
+        assert_eq!(completion_token("12:20", 5), None);
+        assert_eq!(completion_token(":thumbsup:", 10), None);
+    }
+    #[test]
+    fn reaction_search_matches_shortcodes_and_bundled_names() {
+        assert!(matches_search(
+            "123456789012345678",
+            "SDC_Buggy",
+            "sdc_buggy"
+        ));
+        assert!(matches_search("👍", "thumbs up +1 like", "thumb +1"));
+        assert!(!matches_search("👎", "thumbs down", "thumbs up"));
+        for (_, entries) in REACTION_SECTIONS {
+            for (key, name) in *entries {
+                assert!(lookup(key).is_some(), "missing picker icon for {name}");
+            }
+        }
+    }
     #[test]
     fn complete_sequences_and_new_emoji_are_bundled() {
         for emoji in ["👍🏽", "❤️", "🇺🇸", "👩‍💻", "👨‍👩‍👧‍👦", "🫠", "🩷", "✅", "🎉"]
